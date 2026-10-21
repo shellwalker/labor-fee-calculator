@@ -1,0 +1,19 @@
+[package]
+name = "labor-fee-batch"
+description = "劳务报酬批量反算：读取 xlsx/csv 的“到手金额”列，追加反算结果列"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+labor-fee-core = { path = "../core" }
+rust_decimal.workspace = true
+thiserror.workspace = true
+calamine = "0.30"
+rust_xlsxwriter = "0.89"
+csv = "1"
+encoding_rs = "0.8"
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true

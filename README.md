@@ -4,7 +4,8 @@
 
 - **正算**：企业总成本 → 不含税开票收入、增值税、附加税、个税（收入额、减除费用、应纳税所得额、预扣率、速算扣除数、代扣个税）、实际到手；
 - **反算**：实际到手 → 上述全部金额，并自动按分校准：反算出的总成本再正算，到手与目标完全一致；若因舍入/跳变不可达，取最接近的总成本并标记“不可精确达到”及差额；
-- 批量表格反算（xlsx/csv）、Web 页面：规划中（见“路线图”）。
+- **批量反算**：读取 xlsx/xls/ods/csv 首行标题为“到手金额”的列，在右侧追加反算结果列并输出新文件；
+- **两种使用方式**：命令行 `labor-fee`、简易 Web 页面 `labor-fee-web`（单笔计算 + 上传/下载）。
 
 金额全部使用 `rust_decimal` 十进制运算，不使用浮点数。所有税务口径与舍入规则均可配置，默认口径及待确认事项见 [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md)。
 
@@ -12,7 +13,10 @@
 
 ```
 crates/core   纯计算库（配置、正算、反算/校准）
+crates/batch  批量反算（calamine 读表格、rust_xlsxwriter 写 xlsx、csv）
 crates/cli    命令行工具 labor-fee
+crates/web    axum Web 服务 labor-fee-web
+examples/sample.csv   批量反算示例
 config/default.toml   默认口径配置（同时内置于程序）
 docs/ASSUMPTIONS.md   口径假设与待确认清单
 ```
@@ -23,7 +27,7 @@ docs/ASSUMPTIONS.md   口径假设与待确认清单
 
 ```bash
 cargo build --release
-# 可执行文件：target/release/labor-fee
+# 可执行文件：target/release/labor-fee、target/release/labor-fee-web
 ```
 
 ## 用法
@@ -43,7 +47,12 @@ labor-fee config > my.toml        # 导出当前配置后修改
 labor-fee -c my.toml forward 10100
 ```
 
-示例输出（默认口径）：
+# 批量反算（输出 sample_反算结果.csv；xlsx/xls/ods 输入则输出 xlsx）
+labor-fee batch examples/sample.csv
+labor-fee batch 名单.xlsx -o 结果.xlsx --column 到手金额
+```
+
+单笔正算示例输出（默认口径）：
 
 ```
 企业总成本                10100.00
@@ -60,6 +69,30 @@ labor-fee -c my.toml forward 10100
 代扣个税                   1600.00
 实际到手金额               8397.00
 ```
+
+## 批量反算说明
+
+- 只读第一个工作表；首行为标题行，按标题精确匹配（忽略首尾空格）找到“到手金额”列（可用 `--column` 指定其它标题）。
+- 金额单元格可为数值或文本，文本允许 `¥`、`元`、千分位逗号；超过两位小数、无法解析的行在“校准状态”列写“错误：…”，不中断其它行。空白行保留原样、结果列为空。
+- 追加列：企业总成本、不含税开票收入、增值税、（多税目时各附加税目）、附加税合计、收入额、减除费用、应纳税所得额、预扣率、速算扣除数、代扣个税、正算到手（校验）、校准状态、差额、反算备注。
+- CSV 输入自动识别 UTF-8（含 BOM）/GBK，输出 UTF-8 带 BOM（Excel 可直接打开）。表格输出为新的 xlsx，只保留原单元格的值，不保留原格式、公式与其它工作表。
+
+## Web 页面
+
+```bash
+labor-fee-web --listen 127.0.0.1:8080 [-c my.toml] [--max-upload-mb 20]
+```
+
+浏览器打开 `http://127.0.0.1:8080`：单笔正算/反算、上传表格批量反算并自动下载结果、查看当前口径配置。接口：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/forward?amount=10100` | 正算，返回 JSON |
+| GET | `/api/reverse?amount=8397` | 反算，返回 JSON（含 `exact`、`diff`、`other_solutions`） |
+| POST | `/api/batch` | multipart 字段 `file`（必填）、`column`（可选），返回结果文件；响应头 `x-batch-summary` 为统计 |
+| GET | `/api/config` | 当前配置（TOML） |
+
+服务没有登录鉴权，默认只监听本机；如需对外提供请放在带鉴权的反向代理之后。
 
 ## 配置说明
 
@@ -117,9 +150,11 @@ cargo test
 ```
 
 测试包括：各分段边界（收入 800/4000、应纳税所得额 20000/50000、起征点）单元测试；proptest 性质测试（正算单调性、正算→反算往返、目标→反算→正算往返）；
-0.01~200,000 元每隔 0.37 元的全量反算遍历；7 种口径组合下总成本 0~70,000 元逐分暴力表对比（验证反算取到的是最小总成本、不可达判断正确）。
+0.01~200,000 元每隔 0.37 元的全量反算遍历；7 种口径组合下总成本 0~70,000 元逐分暴力表对比（验证反算取到的是最小总成本、不可达判断正确）；
+批量 xlsx/csv（UTF-8/GBK/BOM）读写往返；Web 接口测试。
 
 ## 路线图
 
 - [x] 阶段一：core + CLI 正算/反算/校准 + 测试
-- [ ] 阶段二：批量反算（xlsx/csv，取标题为“到手金额”的列，追加结果列）、CLI 子命令与 axum Web 页面（上传/下载）
+- [x] 阶段二：批量反算（xlsx/csv，取标题为“到手金额”的列，追加结果列）、CLI 子命令与 axum Web 页面（上传/下载）
+- [ ] 后续：口径确认后固化默认配置；批量正算；Web 端在线编辑口径；部署（Docker/systemd）

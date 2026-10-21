@@ -257,6 +257,8 @@ impl Reverser {
             .map(|r| r.nearest)
             .min_by(|a, b| a.1.abs().cmp(&b.1.abs()).then(a.0.cmp(&b.0)))
             .expect("至少一个区间");
+        let mut diff = diff;
+        diff.rescale(cfg.rounding.scale);
         Ok(ReverseOutcome {
             target,
             breakdown: forward_unchecked(cfg, ctx.dec(ticks)),

@@ -37,6 +37,17 @@ enum Cmd {
         /// 实际到手金额（元，最多两位小数）
         take_home: String,
     },
+    /// 批量反算：读取 xlsx/xls/ods/csv 中标题为“到手金额”的列，追加反算结果列并输出新文件
+    Batch {
+        /// 输入文件
+        input: PathBuf,
+        /// 输出文件（缺省为 输入名_反算结果.xlsx/csv，与输入同目录）
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+        /// 读取的列标题
+        #[arg(long, default_value = labor_fee_batch::DEFAULT_COLUMN)]
+        column: String,
+    },
     /// 输出当前生效的配置（TOML）
     Config,
 }
@@ -126,6 +137,40 @@ fn run() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&b)?);
             } else {
                 print_breakdown(&b);
+            }
+        }
+        Cmd::Batch {
+            input,
+            output,
+            column,
+        } => {
+            let name = input.to_string_lossy().to_string();
+            let format = labor_fee_batch::Format::from_file_name(&name)?;
+            let bytes = std::fs::read(&input).with_context(|| format!("读取文件失败：{name}"))?;
+            let opts = labor_fee_batch::Options { column };
+            let out = labor_fee_batch::process(&cfg, &bytes, format, &opts)?;
+            let out_path = match output {
+                Some(p) => p,
+                None => input.with_file_name(labor_fee_batch::output_file_name(&name)?),
+            };
+            std::fs::write(&out_path, &out.bytes)
+                .with_context(|| format!("写出文件失败：{}", out_path.display()))?;
+            let s = &out.summary;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "output": out_path.display().to_string(),
+                        "rows": s.rows, "exact": s.exact, "inexact": s.inexact,
+                        "errors": s.errors, "empty": s.empty,
+                    })
+                );
+            } else {
+                println!("已输出：{}", out_path.display());
+                println!(
+                    "共 {} 行：精确 {}，不可精确达到 {}，错误 {}，空白 {}",
+                    s.rows, s.exact, s.inexact, s.errors, s.empty
+                );
             }
         }
         Cmd::Reverse { take_home } => {
