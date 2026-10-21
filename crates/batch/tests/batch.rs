@@ -137,11 +137,17 @@ fn total_cost_gap_notes() {
     let opts = Options {
         kind: InputKind::TotalCost,
         column: None,
+        preview_rows: 3,
     };
     let out = process(&cfg, text.as_bytes(), Format::Csv, &opts).unwrap();
     assert_eq!(out.summary.rows, 6);
     assert_eq!(out.summary.unreachable_cost, 3);
     assert_eq!(out.summary.exact, 3);
+    // 预览：标题 + 前 3 行，文本与 CSV 输出一致
+    assert_eq!(out.preview.len(), 4);
+    assert_eq!(out.preview[0][0], "企业总成本");
+    assert_eq!(out.preview[0].last().unwrap(), "备注");
+    assert!(out.preview[2].last().unwrap().contains("空白区间"));
     let s = String::from_utf8(out.bytes).unwrap();
     let s = s.trim_start_matches('\u{feff}');
     let mut rdr = csv::Reader::from_reader(s.as_bytes());
@@ -181,6 +187,7 @@ fn net_income_kind() {
     let opts = Options {
         kind: InputKind::NetIncome,
         column: None,
+        ..Options::default()
     };
     let out = process(&cfg, "不含税收入\n10000\n".as_bytes(), Format::Csv, &opts).unwrap();
     let s = String::from_utf8(out.bytes).unwrap();

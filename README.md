@@ -6,7 +6,7 @@
 - **反算**：实际到手 → 不含税收入 → 上述全部金额，正算回去与目标到分一致，多解取最小不含税收入；
 - **按企业总成本正算（辅助）**：内部求对应的不含税收入；总成本落在空位（1000 元门槛空白区间、逐分舍入空位）时报错，说明原因并给出两侧最近的有效总成本；
 - **批量**：读取 xlsx/xls/ods/csv 首行标题为“到手金额”的列（也可选“不含税收入”“企业总成本”列），在右侧追加结果列并输出新文件；
-- **两种使用方式**：命令行 `labor-fee`、简易 Web 页面 `labor-fee-web`（单笔计算 + 上传/下载）。
+- **三种使用方式**：原生桌面程序 `labor-fee-desktop`（Windows / macOS / Linux）、命令行 `labor-fee`、简易 Web 页面 `labor-fee-web`。
 
 金额全部使用 `rust_decimal` 十进制运算，不使用浮点数。所有税务口径与舍入规则均可配置，默认口径、个税规则出处及待确认事项见 [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md)。
 
@@ -26,6 +26,9 @@ crates/core   纯计算库（配置、正算、反算/校准）
 crates/batch  批量计算（calamine 读表格、rust_xlsxwriter 写 xlsx、csv）
 crates/cli    命令行工具 labor-fee
 crates/web    axum Web 服务 labor-fee-web
+crates/desktop eframe/egui 桌面程序 labor-fee-desktop（内嵌中文字体）
+scripts/      各平台构建脚本（产物输出到 dist/）
+samples/      测试用表格（到手样例.xlsx）
 examples/sample.csv   批量反算示例
 config/default.toml   默认口径配置（同时内置于程序）
 docs/ASSUMPTIONS.md   口径假设与待确认清单
@@ -129,6 +132,64 @@ labor-fee-web --listen 127.0.0.1:8080 [-c my.toml] [--max-upload-mb 20]
 
 服务没有登录鉴权，默认只监听本机；如需对外提供请放在带鉴权的反向代理之后。
 
+## 桌面程序
+
+`labor-fee-desktop` 是单个可执行文件，计算全部复用 `crates/core` 与 `crates/batch`。
+
+```bash
+labor-fee-desktop                   # 内置默认口径
+labor-fee-desktop --config my.toml  # 启动时加载自定义口径
+```
+
+界面（顶部为标题和页签栏，右上角显示当前口径来源）：
+
+| 页签 | 内容 |
+|---|---|
+| 正算 | 输入不含税收入，点“计算”或回车 |
+| 反算 | 输入实际到手 |
+| 按总成本 | 输入企业总成本；落在空白区间或舍入空位时用红字显示原因，两侧最近的有效总成本是按钮，点击即填入并重算 |
+| 批量 | 文件路径（“选择文件…”或直接粘贴路径）、输入列类型（到手金额 / 不含税收入 / 企业总成本）、列标题；“执行”后显示统计和前 50 行预览，可“另存为…”或“保存到输入文件旁” |
+| 口径 | 只读显示当前生效的 TOML；可“加载 TOML 文件…”、输入路径后“加载”、“恢复内置默认” |
+
+三个单笔页签都用表格显示：不含税收入、增值税、附加税、企业总成本、减除费用、应纳税所得额、预扣率、速算扣除数、个税、实际到手，最后一行是校验状态（正算：恒等式自检；反算：正算回去与输入一致、等效区间；按总成本：是否可达）。
+
+测试表格：[samples/到手样例.xlsx](samples/到手样例.xlsx)（到手 500、959.99、960、3360、20000、50000 和一个非法值）。
+
+### 中文字体与许可证
+
+程序内嵌 `crates/desktop/assets/fonts/LaborFeeSansSC-Regular.otf`（约 3 MB）。它是 [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk) 2.004 的子集，包含 ASCII、常用标点符号、全角字符和 GB2312 全部 6763 个汉字。原字体按 **SIL Open Font License 1.1** 授权，Copyright 2014-2021 Adobe。按 OFL 要求，子集已改名为 “LaborFee Sans SC”，许可证全文见 [assets/fonts/OFL.txt](crates/desktop/assets/fonts/OFL.txt)，各平台发布包都附带一份“字体许可证-OFL.txt”。OFL 允许把字体随软件分发（包括嵌入程序），但不允许单独出售字体。
+
+GB2312 以外的罕见字（例如个别人名用字）由 egui 的 `system_fonts` 按需从系统字体补齐。
+
+### 构建
+
+各平台在本机独立编译，产物都输出到 `dist/`。不需要 GitLab 流水线。桌面程序需要 Rust 1.95 及以上（eframe 0.37 的要求）。
+
+| 平台 | 命令 | 构建依赖 | 产物 |
+|---|---|---|---|
+| Linux | `scripts/build-linux.sh` | `build-essential pkg-config libgtk-3-dev`（Debian/Ubuntu），或 `gcc pkgconf-pkg-config gtk3-devel`（Fedora） | `dist/linux-<arch>/labor-fee-desktop` 等，以及 `.tar.gz` |
+| macOS | `scripts/build-macos.sh` | Xcode Command Line Tools（`xcode-select --install`） | `dist/macos-universal/LaborFee.app`（x86_64 + arm64 经 lipo 合并），以及 `.zip` |
+| Windows | `powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1` | Visual Studio 生成工具（C++ 桌面开发，MSVC） | `dist\windows-x86_64\labor-fee-desktop.exe` 等，以及 `.zip` |
+| 交叉构建（可选） | `scripts/cross-build-docker.sh linux\|windows\|macos\|all` | Docker 或 Podman；加 `--no-docker` 则在本机执行，例如本机装 mingw-w64 后构建 Windows 版 | `dist/linux-x86_64/`、`dist/windows-gnu-x86_64/`、`dist/macos-universal/` |
+
+说明：
+
+- **Linux**：
+  - 文件对话框默认用 GTK3 后端，不依赖 xdg-desktop-portal。可加 `--features portal` 改用 portal，这样不依赖 GTK。
+  - 渲染用 OpenGL（glow），虚拟机和远程桌面也能运行。
+  - 运行时需要 `libgl1`（Mesa）、`libxkbcommon0`，X11 下还需要 `libxkbcommon-x11-0`，GTK3 后端另需 `libgtk-3-0`。
+  - 其它参数：`--target aarch64-unknown-linux-gnu`、`--desktop-only`。
+- **macOS**：
+  - `--arch universal|x86_64|aarch64`，默认 universal。
+  - 默认对 .app 做 ad-hoc 签名，`--no-sign` 可跳过。
+  - 程序没有经过公证，首次打开需要右键“打开”，或在“隐私与安全性”中允许。
+- **Windows**：
+  - 发布构建的桌面程序是 Windows GUI 子系统程序（源码里设置了 `windows_subsystem = "windows"`），双击运行不会弹出控制台窗口。
+  - 可用 `-Target aarch64-pc-windows-msvc` 或 `-DesktopOnly`。
+- **交叉构建**：
+  - Windows 目标为 `x86_64-pc-windows-gnu`（mingw-w64），产物只依赖系统 DLL。
+  - macOS 使用 osxcross，需要用 `--macos-sdk <MacOSX*.sdk.tar.xz>` 自备 SDK（请自行确认 Apple SDK 的许可条款）；不提供 SDK 时跳过 macOS。
+
 ## 配置说明
 
 配置为 TOML，金额与比率请写成字符串（如 `"0.01"`）以保证精确。主要项：
@@ -192,11 +253,13 @@ cargo test
 - 自定义口径下的无解标记与不相连多解；
 - 按总成本正算：总成本 0～70,000 元逐分（可达则与正算一致，空位则报原因和两侧最近有效总成本；门槛空白区间正好 1030 个分）；
 - proptest：收入→到手→反算、目标→反算→正算、单调性、按总成本正算；
-- 批量 xlsx/csv（UTF-8/GBK/BOM）读写、按总成本批量时备注列原因；Web 接口（含 422 空位说明）。
+- 批量 xlsx/csv（UTF-8/GBK/BOM）读写、按总成本批量时备注列原因；Web 接口（含 422 空位说明）；
+- 桌面程序：状态逻辑（正算/反算/按总成本空位点击重算、口径加载与恢复、批量同步与后台线程、预览与保存、样例表格）及 egui_kittest 界面测试（页签、输入、回车、按钮点击、下拉框）；内嵌字体覆盖界面与核心模块中出现的全部中文字符（kittest 遇到缺字会直接失败）。
 
 ## 路线图
 
 - [x] 阶段一：core + CLI 正算/反算/校准 + 测试
 - [x] 阶段二：批量反算（xlsx/csv，取标题为“到手金额”的列，追加结果列）、CLI 子命令与 axum Web 页面（上传/下载）
 - [x] 以不含税收入为核心变量；按总成本正算的空位报错；批量正算/按总成本批量
-- [ ] 后续：Web 端在线编辑口径；部署（Docker/systemd）
+- [x] 原生桌面程序（eframe/egui，Windows / macOS / Linux）与各平台构建脚本
+- [ ] 后续：Web 端在线编辑口径；部署（Docker/systemd）；Windows/macOS 代码签名

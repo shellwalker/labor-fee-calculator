@@ -190,6 +190,7 @@ fn run() -> Result<()> {
             let opts = labor_fee_batch::Options {
                 kind: input_kind,
                 column,
+                ..Default::default()
             };
             let out = labor_fee_batch::process(&cfg, &bytes, format, &opts)?;
             let out_path = match output {

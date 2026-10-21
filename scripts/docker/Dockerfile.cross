@@ -1,0 +1,14 @@
+# 劳务报酬计算工具交叉构建镜像：Linux x86_64（GTK3）、Windows x86_64（mingw-w64）、可选 macOS（osxcross，需自备 SDK）。
+FROM rust:1-bookworm
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        pkg-config libgtk-3-dev \
+        gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 \
+        clang llvm lld cmake git patch python3 zip xz-utils bzip2 cpio \
+        libxml2-dev libssl-dev libbz2-dev zlib1g-dev uuid-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN rustup target add x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin \
+    && rustc --version
+
+WORKDIR /src

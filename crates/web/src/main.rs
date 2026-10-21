@@ -184,7 +184,11 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
         (Err(e), _) | (_, Err(e)) => return err(StatusCode::BAD_REQUEST, e),
     };
     let cfg = st.cfg.clone();
-    let opts = labor_fee_batch::Options { kind, column };
+    let opts = labor_fee_batch::Options {
+        kind,
+        column,
+        ..Default::default()
+    };
     let result =
         tokio::task::spawn_blocking(move || labor_fee_batch::process(&cfg, &bytes, format, &opts))
             .await;

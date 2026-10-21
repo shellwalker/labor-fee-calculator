@@ -1,0 +1,40 @@
+[package]
+name = "labor-fee-desktop"
+description = "劳务报酬计算桌面程序（eframe/egui）：正算、反算、按总成本、批量、口径查看"
+version.workspace = true
+edition.workspace = true
+# eframe/egui 0.37 要求 Rust 1.95+
+rust-version = "1.95"
+license.workspace = true
+
+[[bin]]
+name = "labor-fee-desktop"
+path = "src/main.rs"
+
+[features]
+default = ["gtk3"]
+# Linux 文件对话框后端：gtk3（默认，需要 libgtk-3；无需 xdg-desktop-portal）或 portal（xdg-desktop-portal，无 GTK 依赖）
+gtk3 = ["rfd/gtk3"]
+portal = ["rfd/xdg-portal", "rfd/wayland"]
+
+[dependencies]
+labor-fee-core = { path = "../core" }
+labor-fee-batch = { path = "../batch" }
+rust_decimal.workspace = true
+# glow（OpenGL）渲染器：对虚拟机、远程桌面、老显卡兼容性好于 wgpu
+eframe = { version = "0.37", default-features = false, features = [
+    "accesskit",
+    "clipboard",
+    "default_fonts",
+    "glow",
+    "system_fonts",
+    "wayland",
+    "x11",
+] }
+rfd = { version = "0.17", default-features = false }
+
+[dev-dependencies]
+egui_kittest = "0.37"
+rust_decimal_macros.workspace = true
+ttf-parser = "0.25"
+rust_xlsxwriter = "0.89"

@@ -136,6 +136,8 @@ pub struct Options {
     pub kind: InputKind,
     /// 读取的列标题（首行精确匹配，忽略首尾空白）；为空时用输入类型的默认列名。
     pub column: Option<String>,
+    /// 在 [`Output::preview`] 中返回的数据行数（不含标题行），0 表示不生成预览。
+    pub preview_rows: usize,
 }
 
 impl Options {
@@ -171,6 +173,9 @@ pub struct Output {
     pub bytes: Vec<u8>,
     pub format: Format,
     pub summary: Summary,
+    /// 结果表预览（文本形式，与 CSV 输出一致）：第一行为标题，其后为前 `preview_rows` 个数据行。
+    /// `preview_rows` 为 0 时为空。
+    pub preview: Vec<Vec<String>>,
 }
 
 /// 原表单元格。
@@ -360,6 +365,24 @@ fn read_spreadsheet(input: &[u8]) -> Result<Vec<Vec<Cell>>, BatchError> {
         .collect())
 }
 
+impl Out {
+    fn text(&self) -> String {
+        match self {
+            Out::Empty => String::new(),
+            Out::Money(d) => d.to_string(),
+            Out::Rate(d) => format!("{}%", (*d * Decimal::ONE_HUNDRED).normalize()),
+            Out::Text(s) => s.clone(),
+        }
+    }
+}
+
+fn row_text(orig: &[Cell], out: &[Out]) -> Vec<String> {
+    orig.iter()
+        .map(Cell::text)
+        .chain(out.iter().map(Out::text))
+        .collect()
+}
+
 fn write_csv(
     header: &[Cell],
     rows: &[(Vec<Cell>, Vec<Out>)],
@@ -378,16 +401,7 @@ fn write_csv(
         w.write_record(&h)
             .map_err(|e| BatchError::Write(e.to_string()))?;
         for (orig, out) in rows {
-            let rec: Vec<String> = orig
-                .iter()
-                .map(Cell::text)
-                .chain(out.iter().map(|o| match o {
-                    Out::Empty => String::new(),
-                    Out::Money(d) => d.to_string(),
-                    Out::Rate(d) => format!("{}%", (*d * Decimal::ONE_HUNDRED).normalize()),
-                    Out::Text(s) => s.clone(),
-                }))
-                .collect();
+            let rec = row_text(orig, out);
             w.write_record(&rec)
                 .map_err(|e| BatchError::Write(e.to_string()))?;
         }
@@ -578,10 +592,28 @@ pub fn process(
         Format::Csv => write_csv(&header, &rows, &extra)?,
         Format::Spreadsheet => write_xlsx(&header, &rows, &extra)?,
     };
+    let preview = if opts.preview_rows == 0 {
+        Vec::new()
+    } else {
+        std::iter::once(
+            header
+                .iter()
+                .map(Cell::text)
+                .chain(extra.iter().cloned())
+                .collect(),
+        )
+        .chain(
+            rows.iter()
+                .take(opts.preview_rows)
+                .map(|(orig, out)| row_text(orig, out)),
+        )
+        .collect()
+    };
     Ok(Output {
         bytes,
         format,
         summary,
+        preview,
     })
 }
 

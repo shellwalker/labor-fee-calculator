@@ -6,3 +6,7 @@
 .DS_Store
 /out/
 proptest-regressions/
+/dist/
+# 桌面程序“保存到输入文件旁”在样例目录生成的结果文件
+/samples/*_反算结果.*
+/samples/*_计算结果.*
