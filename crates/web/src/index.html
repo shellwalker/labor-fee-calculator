@@ -18,24 +18,30 @@
 </head>
 <body>
 <h1>劳务报酬计算工具</h1>
-<p class="muted">增值税、附加税、劳务报酬个税（预扣预缴）正算 / 反算 / 批量反算。口径以服务端配置为准（见页面底部），默认口径需业务确认。</p>
+<p class="muted">增值税、附加税、劳务报酬个税（预扣预缴）正算（以不含税收入为输入）/ 反算 / 批量。口径以服务端配置为准（见页面底部），默认口径需业务确认。</p>
 
 <h2>单笔计算</h2>
 <section>
   <input type="text" id="amount" placeholder="金额（元）">
-  <button onclick="calc('forward')">正算（输入企业总成本）</button>
+  <button onclick="calc('forward')">正算（输入不含税收入）</button>
   <button onclick="calc('reverse')">反算（输入实际到手）</button>
+  <button onclick="calc('from-cost')">按企业总成本正算（辅助）</button>
   <div id="single"></div>
 </section>
 
-<h2>批量反算（xlsx / xls / csv）</h2>
+<h2>批量计算（xlsx / xls / csv）</h2>
 <section>
   <form id="batchForm">
     <input type="file" name="file" accept=".xlsx,.xlsm,.xls,.ods,.csv" required>
-    列标题 <input type="text" name="column" value="到手金额" style="width:100px">
-    <button type="submit">上传并反算</button>
+    输入列 <select name="input_kind">
+      <option value="take-home">到手金额（反算）</option>
+      <option value="net-income">不含税收入（正算）</option>
+      <option value="total-cost">企业总成本（辅助正算）</option>
+    </select>
+    列标题 <input type="text" name="column" placeholder="缺省同输入列" style="width:110px">
+    <button type="submit">上传并计算</button>
   </form>
-  <p class="muted">读取首行标题为“到手金额”的列，在右侧追加企业总成本、各项税费、校准状态等列，结果文件自动下载。</p>
+  <p class="muted">读取首行标题为“到手金额”（或所选输入列）的列，在右侧追加不含税收入、各项税费、企业总成本、校准状态、备注等列，结果文件自动下载。企业总成本落在空位的行，备注列写明原因和两侧最近的有效总成本。</p>
   <div id="batch"></div>
 </section>
 
@@ -47,11 +53,11 @@ const fmtPct = r => (Number(r) * 100).toFixed(2).replace(/\.?0+$/, '') + '%';
 function row(k, v) { return `<tr><td>${k}</td><td class="v">${v}</td></tr>`; }
 function render(b) {
   let h = '<table>';
-  h += row('企业总成本', b.total_cost);
-  h += row('不含税开票收入', b.net_revenue + (b.vat_exempt ? '（不征增值税及附加税）' : ''));
+  h += row('不含税收入', b.net_income + (b.vat_exempt ? '（不征增值税及附加税）' : ''));
   h += row('增值税', b.vat);
   for (const s of b.surcharges) h += row(`${s.name}（${fmtPct(s.rate)}）`, s.amount);
   h += row('附加税合计', b.surcharge_total);
+  h += row('企业总成本', b.total_cost);
   h += row('收入额', b.iit.income);
   h += row('减除费用', b.iit.deduction);
   h += row('应纳税所得额', b.iit.taxable_income);
@@ -65,17 +71,27 @@ async function calc(kind) {
   const el = document.getElementById('single');
   const amount = document.getElementById('amount').value.trim();
   if (!amount) { el.innerHTML = '<p class="warn">请输入金额</p>'; return; }
-  const resp = await fetch(`/api/${kind}?amount=${encodeURIComponent(amount)}`);
+  const param = { 'forward': 'net_income', 'reverse': 'take_home', 'from-cost': 'total_cost' }[kind];
+  const resp = await fetch(`/api/${kind}?${param}=${encodeURIComponent(amount)}`);
   const data = await resp.json();
-  if (!resp.ok) { el.innerHTML = `<p class="warn">${data.error}</p>`; return; }
-  if (kind === 'forward') { el.innerHTML = render(data); return; }
+  if (!resp.ok) {
+    let h = `<p class="warn">${data.error}</p>`;
+    if (data.gap) {
+      const g = data.gap;
+      h += '<p class="muted">原因：' + (g.reason === 'threshold' ? `${g.threshold} 元增值税征收门槛形成的空白区间` : '增值税、附加税逐分舍入') + '</p>';
+      h += `<p>两侧最近的有效总成本：<a href="#" onclick="useCost('${g.lower.total_cost}');return false">${g.lower.total_cost}</a>（不含税收入 ${g.lower.net_income}）、<a href="#" onclick="useCost('${g.upper.total_cost}');return false">${g.upper.total_cost}</a>（不含税收入 ${g.upper.net_income}）</p>`;
+    }
+    el.innerHTML = h; return;
+  }
+  if (kind !== 'reverse') { el.innerHTML = render(data); return; }
   let head = data.exact
     ? '<p class="ok">精确：正算回去与目标到手完全一致</p>'
-    : `<p class="warn">不可精确达到，已取最接近的总成本，差额 ${data.diff}（正算到手 − 目标）</p>`;
+    : `<p class="warn">不可精确达到，已取最接近的不含税收入，差额 ${data.diff}（正算到手 − 目标）</p>`;
   if (data.other_solutions && data.other_solutions.length)
-    head += `<p class="muted">另有总成本 ${data.other_solutions.join('、')} 亦可精确达到（分段跳变导致多解）</p>`;
+    head += `<p class="muted">另有不含税收入 ${data.other_solutions.join('、')} 亦可精确达到（分段跳变导致多解）</p>`;
   el.innerHTML = head + render(data.breakdown);
 }
+function useCost(c) { document.getElementById('amount').value = c; calc('from-cost'); }
 document.getElementById('amount').addEventListener('keydown', e => { if (e.key === 'Enter') calc('reverse'); });
 document.getElementById('batchForm').addEventListener('submit', async e => {
   e.preventDefault();
@@ -89,7 +105,7 @@ document.getElementById('batchForm').addEventListener('submit', async e => {
   const blob = await resp.blob();
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
   const s = Object.fromEntries((resp.headers.get('x-batch-summary') || '').split(';').filter(Boolean).map(kv => kv.split('=')));
-  el.innerHTML = `<p class="ok">已下载 ${name}：共 ${s.rows} 行，精确 ${s.exact}，不可精确达到 ${s.inexact}，错误 ${s.errors}，空白 ${s.empty}</p>`;
+  el.innerHTML = `<p class="ok">已下载 ${name}：共 ${s.rows} 行，成功 ${s.exact}，不可精确达到 ${s.inexact}，总成本不可达 ${s.unreachable_cost}，错误 ${s.errors}，空白 ${s.empty}</p>`;
 });
 fetch('/api/config').then(r => r.text()).then(t => document.getElementById('cfg').textContent = t);
 </script>

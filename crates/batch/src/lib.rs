@@ -1,21 +1,57 @@
-//! 劳务报酬批量反算。
+//! 劳务报酬批量计算。
 //!
-//! 读取 xlsx/xls/ods（第一个工作表）或 csv，取首行标题为“到手金额”（可配置）的列，
-//! 对每一行反算，并在原表右侧追加各项结果列，输出新文件（表格输入输出 xlsx，csv 输入输出 csv）。
+//! 读取 xlsx/xls/ods（第一个工作表）或 csv，按输入类型取首行标题对应的列：
+//! - 默认“到手金额”（批量反算）；
+//! - 可选“不含税收入”（批量正算）或“企业总成本”（批量按总成本正算，落在空位的行在备注列写明原因）。
+//!
+//! 对每一行计算，并在原表右侧追加各项结果列，输出新文件（表格输入输出 xlsx，csv 输入输出 csv）。
 //!
 //! 计算全部使用十进制；仅在读取 Excel 数值单元格、写出 Excel 数值单元格这两个 I/O 边界上与 f64 互转
 //! （Excel 文件格式本身以浮点存储数值），读入时会校验小数位不超过两位。
 
-use labor_fee_core::{CalcError, Config, Decimal, ReverseOutcome, Reverser};
+use labor_fee_core::{forward, from_total_cost, Breakdown, CalcError, Config, Decimal, Reverser};
 use rust_decimal::prelude::ToPrimitive;
 use std::io::Cursor;
 use std::str::FromStr;
 use thiserror::Error;
 
-/// 默认读取的列标题。
+/// 默认读取的列标题（批量反算）。
 pub const DEFAULT_COLUMN: &str = "到手金额";
 
-/// 批量处理错误（文件级）。行级错误写入结果表的“校准状态”列，不中断处理。
+/// 输入列的含义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InputKind {
+    /// 实际到手 → 反算（默认）。
+    #[default]
+    TakeHome,
+    /// 不含税收入 → 正算。
+    NetIncome,
+    /// 企业总成本 → 辅助正算（空位报错）。
+    TotalCost,
+}
+
+impl InputKind {
+    /// 该输入类型默认读取的列标题。
+    pub fn default_column(self) -> &'static str {
+        match self {
+            InputKind::TakeHome => DEFAULT_COLUMN,
+            InputKind::NetIncome => "不含税收入",
+            InputKind::TotalCost => "企业总成本",
+        }
+    }
+
+    /// 由字符串解析：take-home / net-income / total-cost（也接受中文列名）。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "take-home" | "take_home" | "到手金额" => Some(InputKind::TakeHome),
+            "net-income" | "net_income" | "不含税收入" => Some(InputKind::NetIncome),
+            "total-cost" | "total_cost" | "企业总成本" => Some(InputKind::TotalCost),
+            _ => None,
+        }
+    }
+}
+
+/// 批量处理错误（文件级）。行级错误写入结果表的“校准状态”“备注”列，不中断处理。
 #[derive(Debug, Error)]
 pub enum BatchError {
     #[error("不支持的文件类型：{0}（支持 .xlsx/.xlsm/.xls/.ods/.csv）")]
@@ -75,27 +111,40 @@ impl Format {
 
 /// 根据输入文件名生成输出文件名：`原名_反算结果.xlsx/csv`。
 pub fn output_file_name(input_name: &str) -> Result<String, BatchError> {
+    output_file_name_for(input_name, InputKind::TakeHome)
+}
+
+/// 按输入类型生成输出文件名：反算为 `原名_反算结果`，正算为 `原名_计算结果`。
+pub fn output_file_name_for(input_name: &str, kind: InputKind) -> Result<String, BatchError> {
     let fmt = Format::from_file_name(input_name)?;
     let stem = input_name
         .rsplit_once('.')
         .map(|(s, _)| s)
         .unwrap_or(input_name);
     let stem = stem.rsplit(['/', '\\']).next().unwrap_or(stem);
-    Ok(format!("{stem}_反算结果.{}", fmt.output_extension()))
+    let suffix = match kind {
+        InputKind::TakeHome => "反算结果",
+        _ => "计算结果",
+    };
+    Ok(format!("{stem}_{suffix}.{}", fmt.output_extension()))
 }
 
 /// 批量处理选项。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Options {
-    /// 读取的列标题（首行精确匹配，忽略首尾空白）。
-    pub column: String,
+    /// 输入列的含义（默认实际到手 → 反算）。
+    pub kind: InputKind,
+    /// 读取的列标题（首行精确匹配，忽略首尾空白）；为空时用输入类型的默认列名。
+    pub column: Option<String>,
 }
 
-impl Default for Options {
-    fn default() -> Self {
-        Options {
-            column: DEFAULT_COLUMN.to_string(),
-        }
+impl Options {
+    /// 实际使用的列标题。
+    pub fn column_name(&self) -> String {
+        self.column
+            .clone()
+            .filter(|c| !c.trim().is_empty())
+            .unwrap_or_else(|| self.kind.default_column().to_string())
     }
 }
 
@@ -104,10 +153,12 @@ impl Default for Options {
 pub struct Summary {
     /// 数据行数（不含标题行）。
     pub rows: usize,
-    /// 精确反算行数。
+    /// 计算成功（反算精确）的行数。
     pub exact: usize,
-    /// 不可精确达到行数。
+    /// 反算不可精确达到的行数。
     pub inexact: usize,
+    /// 企业总成本落在空位、没有对应不含税收入的行数。
+    pub unreachable_cost: usize,
     /// 金额无法解析或计算出错的行数。
     pub errors: usize,
     /// 到手金额为空的行数。
@@ -184,7 +235,7 @@ fn parse_amount(cell: &Cell, scale: u32) -> Result<Option<Decimal>, String> {
 }
 
 fn result_headers(cfg: &Config) -> Vec<String> {
-    let mut h: Vec<String> = ["企业总成本", "不含税开票收入", "增值税"]
+    let mut h: Vec<String> = ["不含税收入", "增值税"]
         .iter()
         .map(|s| s.to_string())
         .collect();
@@ -194,16 +245,17 @@ fn result_headers(cfg: &Config) -> Vec<String> {
     h.extend(
         [
             "附加税合计",
+            "企业总成本",
             "收入额",
             "减除费用",
             "应纳税所得额",
             "预扣率",
             "速算扣除数",
             "代扣个税",
-            "正算到手（校验）",
+            "实际到手",
             "校准状态",
             "差额",
-            "反算备注",
+            "备注",
         ]
         .iter()
         .map(|s| s.to_string()),
@@ -211,18 +263,23 @@ fn result_headers(cfg: &Config) -> Vec<String> {
     h
 }
 
-fn result_values(cfg: &Config, r: &ReverseOutcome) -> Vec<Out> {
+/// 一行的计算结果。
+struct RowResult {
+    breakdown: Breakdown,
+    status: String,
+    diff: Option<Decimal>,
+    notes: Vec<String>,
+}
+
+fn result_values(cfg: &Config, r: &RowResult) -> Vec<Out> {
     let b = &r.breakdown;
-    let mut v = vec![
-        Out::Money(b.total_cost),
-        Out::Money(b.net_revenue),
-        Out::Money(b.vat),
-    ];
+    let mut v = vec![Out::Money(b.net_income), Out::Money(b.vat)];
     if cfg.surcharge.items.len() > 1 {
         v.extend(b.surcharges.iter().map(|l| Out::Money(l.amount)));
     }
     v.extend([
         Out::Money(b.surcharge_total),
+        Out::Money(b.total_cost),
         Out::Money(b.iit.income),
         Out::Money(b.iit.deduction),
         Out::Money(b.iit.taxable_income),
@@ -230,24 +287,14 @@ fn result_values(cfg: &Config, r: &ReverseOutcome) -> Vec<Out> {
         Out::Money(b.iit.quick_deduction),
         Out::Money(b.iit.tax),
         Out::Money(b.take_home),
-        Out::Text(
-            if r.exact {
-                "精确"
-            } else {
-                "不可精确达到"
-            }
-            .into(),
-        ),
-        Out::Money(r.diff),
+        Out::Text(r.status.clone()),
+        r.diff.map(Out::Money).unwrap_or(Out::Empty),
     ]);
     let mut notes = Vec::new();
     if b.vat_exempt {
         notes.push("不征增值税及附加税".to_string());
     }
-    if !r.other_solutions.is_empty() {
-        let s: Vec<String> = r.other_solutions.iter().map(|d| d.to_string()).collect();
-        notes.push(format!("另有总成本 {} 亦可精确达到", s.join("、")));
-    }
+    notes.extend(r.notes.iter().cloned());
     v.push(Out::Text(notes.join("；")));
     v
 }
@@ -358,7 +405,7 @@ fn write_xlsx(
     let werr = |e: rust_xlsxwriter::XlsxError| BatchError::Write(e.to_string());
     let mut wb = Workbook::new();
     let ws = wb.add_worksheet();
-    ws.set_name("反算结果").map_err(werr)?;
+    ws.set_name("计算结果").map_err(werr)?;
     let bold = XFormat::new().set_bold();
     let money = XFormat::new().set_num_format("0.00");
     let pct = XFormat::new().set_num_format("0%");
@@ -409,7 +456,7 @@ fn write_xlsx(
     wb.save_to_buffer().map_err(werr)
 }
 
-/// 批量反算：读取输入文件字节，返回追加结果列后的新文件。
+/// 批量计算：读取输入文件字节，返回追加结果列后的新文件。
 pub fn process(
     cfg: &Config,
     input: &[u8],
@@ -431,10 +478,11 @@ pub fn process(
         return Err(BatchError::Empty);
     }
     let header = table.remove(0);
+    let column = opts.column_name();
     let col = header
         .iter()
-        .position(|c| c.text().trim() == opts.column.trim())
-        .ok_or_else(|| BatchError::ColumnNotFound(opts.column.clone()))?;
+        .position(|c| c.text().trim() == column.trim())
+        .ok_or(BatchError::ColumnNotFound(column))?;
     // 原表列数：取标题与各数据行的最大宽度，结果列统一追加在其右侧
     let width = table
         .iter()
@@ -445,41 +493,84 @@ pub fn process(
     let mut header = header;
     header.resize(width, Cell::Empty);
 
-    let rev = Reverser::new(cfg)?;
+    let rev = match opts.kind {
+        InputKind::TakeHome => Some(Reverser::new(cfg)?),
+        _ => {
+            cfg.validate()?;
+            None
+        }
+    };
     let extra = result_headers(cfg);
+    let n = extra.len();
     let mut summary = Summary::default();
     let mut rows = Vec::with_capacity(table.len());
     for mut orig in table {
         orig.resize(width, Cell::Empty);
         summary.rows += 1;
-        let err_row = |msg: String| {
-            let mut v = vec![Out::Empty; extra.len()];
-            v[extra.len() - 3] = Out::Text(format!("错误：{msg}"));
+        // 出错行：校准状态写简短状态，备注写完整原因
+        let err_row = |status: &str, msg: String| {
+            let mut v = vec![Out::Empty; n];
+            v[n - 3] = Out::Text(status.to_string());
+            v[n - 1] = Out::Text(msg);
             v
         };
-        let out = match parse_amount(&orig[col], cfg.rounding.scale) {
+        let amount = match parse_amount(&orig[col], cfg.rounding.scale) {
             Ok(None) => {
                 summary.empty += 1;
-                vec![Out::Empty; extra.len()]
+                rows.push((orig, vec![Out::Empty; n]));
+                continue;
             }
             Err(e) => {
                 summary.errors += 1;
-                err_row(e)
+                rows.push((orig, err_row("错误", e)));
+                continue;
             }
-            Ok(Some(t)) => match rev.reverse(t) {
-                Ok(r) => {
-                    if r.exact {
-                        summary.exact += 1;
-                    } else {
-                        summary.inexact += 1;
-                    }
-                    result_values(cfg, &r)
+            Ok(Some(a)) => a,
+        };
+        let res: Result<RowResult, CalcError> = match (opts.kind, &rev) {
+            (InputKind::TakeHome, Some(rev)) => rev.reverse(amount).map(|r| {
+                let mut notes = Vec::new();
+                if !r.other_solutions.is_empty() {
+                    let s: Vec<String> = r.other_solutions.iter().map(|d| d.to_string()).collect();
+                    notes.push(format!("另有不含税收入 {} 亦可精确达到", s.join("、")));
                 }
-                Err(e) => {
-                    summary.errors += 1;
-                    err_row(e.to_string())
+                RowResult {
+                    status: r.status_text(),
+                    diff: Some(r.diff),
+                    breakdown: r.breakdown,
+                    notes,
                 }
-            },
+            }),
+            (InputKind::NetIncome, _) => forward(cfg, amount).map(|b| RowResult {
+                breakdown: b,
+                status: "正算".into(),
+                diff: None,
+                notes: Vec::new(),
+            }),
+            _ => from_total_cost(cfg, amount).map(|b| RowResult {
+                breakdown: b,
+                status: "正算".into(),
+                diff: None,
+                notes: Vec::new(),
+            }),
+        };
+        let out = match res {
+            Ok(r) => {
+                if r.status.starts_with("不可精确") {
+                    summary.inexact += 1;
+                } else {
+                    summary.exact += 1;
+                }
+                result_values(cfg, &r)
+            }
+            Err(e @ CalcError::CostUnreachable(_)) => {
+                summary.unreachable_cost += 1;
+                err_row("总成本不可达", e.to_string())
+            }
+            Err(e) => {
+                summary.errors += 1;
+                err_row("错误", e.to_string())
+            }
         };
         rows.push((orig, out));
     }

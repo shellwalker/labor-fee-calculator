@@ -48,59 +48,17 @@ pub struct RoundingConfig {
     pub surcharge: SurchargeRounding,
 }
 
-/// 企业总成本口径（假设 A）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CostBasis {
-    /// 总成本 = 价税合计 = 不含税收入 + 增值税。
-    VatInclusive,
-    /// 总成本 = 不含税收入 + 增值税 + 附加税。
-    VatAndSurchargeInclusive,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CostConfig {
-    pub basis: CostBasis,
-    /// 总成本含全部税费时，倒挤出的收入再算增值税与原值不等，是否在相邻一分钱内寻找自洽组合。
-    pub consistent_search: bool,
-}
-
-/// 门槛跳变段的处理方式（总成本按不征收时收入已达门槛，按征收倒挤后收入又低于门槛）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThresholdGap {
-    /// 按征收处理：倒挤出的不含税收入可能略低于门槛。
-    Levy,
-    /// 按不征收处理：不含税收入 = 总成本（已达到或超过门槛）。
-    Exempt,
-}
-
-/// 增值税/附加税征收门槛的判断基数。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ThresholdBasis {
-    /// 按不含税开票收入判断。
-    NetRevenue,
-    /// 按企业总成本判断（不征收时总成本 = 不含税收入）。
-    TotalCost,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VatConfig {
-    /// 增值税征收率。
+    /// 增值税征收率：增值税 = round(不含税收入 × 征收率)。
     pub rate: Decimal,
-    /// 是否启用征收门槛：低于门槛时增值税、附加税均为 0。
+    /// 是否启用征收门槛：不含税收入低于门槛时增值税、附加税均为 0。
     pub threshold_enabled: bool,
-    /// 门槛金额。
+    /// 门槛金额（按不含税收入判断）。
     pub threshold: Decimal,
-    /// 门槛判断基数。
-    pub threshold_basis: ThresholdBasis,
-    /// 金额恰好等于门槛时是否征收（true：≥ 门槛征收；false：> 门槛才征收）。
+    /// 不含税收入恰好等于门槛时是否征收（true：≥ 门槛征收；false：> 门槛才征收）。
     pub levy_at_threshold: bool,
-    /// 门槛跳变段的处理方式（仅门槛按不含税收入判断时有意义）。
-    pub threshold_gap: ThresholdGap,
 }
 
 /// 附加税计税基数（假设 B）。
@@ -128,16 +86,6 @@ pub struct SurchargeConfig {
     pub items: Vec<SurchargeItem>,
 }
 
-/// 个税收入额基数（假设 C）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IncomeBase {
-    /// 不含税收入（价税分离后）。
-    NetRevenue,
-    /// 企业总成本。
-    TotalCost,
-}
-
 /// 预扣率表一档。`upper` 为应纳税所得额上限（含本数），最后一档为 `None`。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,18 +99,10 @@ pub struct Bracket {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IitConfig {
-    pub income_base: IncomeBase,
-    pub deduct_surcharge: bool,
     pub fixed_deduction_limit: Decimal,
     pub fixed_deduction: Decimal,
     pub percent_deduction_rate: Decimal,
     pub brackets: Vec<Bracket>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TakeHomeConfig {
-    pub deduct_surcharge: bool,
 }
 
 /// 多解时的取值偏好。
@@ -176,9 +116,12 @@ pub enum Prefer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReverseConfig {
+    /// 多个不含税收入得到同一到手时取最小（默认）或最大。
     pub prefer: Prefer,
+    /// 二分定位后前后逐分扫描的范围（分）。
     pub search_window: u32,
-    pub max_cost: Decimal,
+    /// 反算搜索的不含税收入上限。
+    pub max_net_income: Decimal,
 }
 
 /// 全部税务口径与舍入规则。
@@ -186,11 +129,9 @@ pub struct ReverseConfig {
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub rounding: RoundingConfig,
-    pub cost: CostConfig,
     pub vat: VatConfig,
     pub surcharge: SurchargeConfig,
     pub iit: IitConfig,
-    pub take_home: TakeHomeConfig,
     pub reverse: ReverseConfig,
 }
 
@@ -259,8 +200,8 @@ impl Config {
                 }
             }
         }
-        if self.reverse.max_cost <= Decimal::ZERO {
-            return bad("reverse.max_cost 必须为正");
+        if self.reverse.max_net_income <= Decimal::ZERO {
+            return bad("reverse.max_net_income 必须为正");
         }
         Ok(())
     }
@@ -291,7 +232,7 @@ impl Config {
             .collect()
     }
 
-    /// 门槛判断金额为 `amount` 时是否征收增值税和附加税。
+    /// 不含税收入为 `amount` 时是否征收增值税和附加税。
     pub fn levied(&self, amount: Decimal) -> bool {
         if !self.vat.threshold_enabled {
             return true;

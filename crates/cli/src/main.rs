@@ -2,7 +2,9 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use labor_fee_core::{forward, Breakdown, Config, Decimal, ReverseOutcome, Reverser};
+use labor_fee_core::{
+    forward, from_total_cost, Breakdown, CalcError, Config, Decimal, ReverseOutcome, Reverser,
+};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -25,31 +27,44 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 正算：企业总成本 → 各项税费与实际到手
+    /// 正算（主入口）：不含税收入 → 增值税、附加税、企业总成本、个税、实际到手
     #[command(alias = "fwd")]
     Forward {
+        /// 不含税收入（元，最多两位小数）
+        net_income: String,
+    },
+    /// 辅助：按企业总成本正算（内部求不含税收入；落在空位时报错并给出原因和两侧最近的有效总成本）
+    FromCost {
         /// 企业总成本（元，最多两位小数）
         total_cost: String,
     },
-    /// 反算：实际到手 → 企业总成本及各项税费（自动按分校准）
+    /// 反算：实际到手 → 不含税收入及全部金额（多解取最小不含税收入）
     #[command(alias = "rev")]
     Reverse {
         /// 实际到手金额（元，最多两位小数）
         take_home: String,
     },
-    /// 批量反算：读取 xlsx/xls/ods/csv 中标题为“到手金额”的列，追加反算结果列并输出新文件
+    /// 批量：读取 xlsx/xls/ods/csv 中的金额列，追加计算结果列并输出新文件（默认按“到手金额”反算）
     Batch {
         /// 输入文件
         input: PathBuf,
-        /// 输出文件（缺省为 输入名_反算结果.xlsx/csv，与输入同目录）
+        /// 输出文件（缺省为 输入名_反算结果/计算结果.xlsx/csv，与输入同目录）
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// 读取的列标题
-        #[arg(long, default_value = labor_fee_batch::DEFAULT_COLUMN)]
-        column: String,
+        /// 输入列含义：take-home（到手金额，反算）| net-income（不含税收入，正算）| total-cost（企业总成本，辅助正算）
+        #[arg(long, default_value = "take-home", value_parser = parse_kind)]
+        input_kind: labor_fee_batch::InputKind,
+        /// 读取的列标题（缺省按输入列含义：到手金额 / 不含税收入 / 企业总成本）
+        #[arg(long)]
+        column: Option<String>,
     },
     /// 输出当前生效的配置（TOML）
     Config,
+}
+
+fn parse_kind(s: &str) -> std::result::Result<labor_fee_batch::InputKind, String> {
+    labor_fee_batch::InputKind::parse(s)
+        .ok_or_else(|| format!("未知输入列含义：{s}（可选 take-home / net-income / total-cost）"))
 }
 
 fn parse_amount(s: &str) -> Result<Decimal> {
@@ -73,10 +88,9 @@ fn pct(d: Decimal) -> String {
 }
 
 fn print_breakdown(b: &Breakdown) {
-    println!("企业总成本          {:>14}", b.total_cost);
     println!(
-        "不含税开票收入      {:>14}{}",
-        b.net_revenue,
+        "不含税收入          {:>14}{}",
+        b.net_income,
         if b.vat_exempt {
             "  （不征增值税及附加税）"
         } else {
@@ -93,6 +107,7 @@ fn print_breakdown(b: &Breakdown) {
         );
     }
     println!("附加税合计          {:>14}", b.surcharge_total);
+    println!("企业总成本          {:>14}", b.total_cost);
     println!("—— 劳务报酬个税（预扣预缴）——");
     println!("收入额              {:>14}", b.iit.income);
     println!("减除费用            {:>14}", b.iit.deduction);
@@ -107,14 +122,14 @@ fn print_reverse(r: &ReverseOutcome) {
     println!("目标到手            {:>14}", r.target);
     if r.exact {
         println!("校准结果            精确（正算到手与目标一致）");
-        if let Some((a, b)) = r.exact_cost_range {
+        if let Some((a, b)) = r.exact_net_income_range {
             if a != b {
-                println!("等效总成本区间      {a} ~ {b}（均得到相同到手，已取配置偏好值）");
+                println!("等效不含税收入区间  {a} ~ {b}（均得到相同到手，已取配置偏好值）");
             }
         }
         if !r.other_solutions.is_empty() {
             let s: Vec<String> = r.other_solutions.iter().map(|d| d.to_string()).collect();
-            println!("其它可行总成本      {}（分段跳变导致多解）", s.join(", "));
+            println!("其它可行不含税收入  {}（分段跳变导致多解）", s.join(", "));
         }
     } else {
         println!(
@@ -131,27 +146,57 @@ fn run() -> Result<()> {
     let cfg = load_config(cli.config.as_ref())?;
     match cli.cmd {
         Cmd::Config => print!("{}", cfg.to_toml_string()),
-        Cmd::Forward { total_cost } => {
-            let b = forward(&cfg, parse_amount(&total_cost)?)?;
+        Cmd::Forward { net_income } => {
+            let b = forward(&cfg, parse_amount(&net_income)?)?;
             if cli.json {
                 println!("{}", serde_json::to_string_pretty(&b)?);
             } else {
                 print_breakdown(&b);
             }
         }
+        Cmd::FromCost { total_cost } => match from_total_cost(&cfg, parse_amount(&total_cost)?) {
+            Ok(b) => {
+                if cli.json {
+                    println!("{}", serde_json::to_string_pretty(&b)?);
+                } else {
+                    print_breakdown(&b);
+                }
+            }
+            Err(CalcError::CostUnreachable(g)) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "error": "cost_unreachable",
+                            "message": g.to_string(),
+                            "gap": g,
+                        }))?
+                    );
+                    std::process::exit(2);
+                }
+                anyhow::bail!("{g}");
+            }
+            Err(e) => return Err(e.into()),
+        },
         Cmd::Batch {
             input,
             output,
+            input_kind,
             column,
         } => {
             let name = input.to_string_lossy().to_string();
             let format = labor_fee_batch::Format::from_file_name(&name)?;
             let bytes = std::fs::read(&input).with_context(|| format!("读取文件失败：{name}"))?;
-            let opts = labor_fee_batch::Options { column };
+            let opts = labor_fee_batch::Options {
+                kind: input_kind,
+                column,
+            };
             let out = labor_fee_batch::process(&cfg, &bytes, format, &opts)?;
             let out_path = match output {
                 Some(p) => p,
-                None => input.with_file_name(labor_fee_batch::output_file_name(&name)?),
+                None => {
+                    input.with_file_name(labor_fee_batch::output_file_name_for(&name, input_kind)?)
+                }
             };
             std::fs::write(&out_path, &out.bytes)
                 .with_context(|| format!("写出文件失败：{}", out_path.display()))?;
@@ -162,14 +207,15 @@ fn run() -> Result<()> {
                     serde_json::json!({
                         "output": out_path.display().to_string(),
                         "rows": s.rows, "exact": s.exact, "inexact": s.inexact,
+                        "unreachable_cost": s.unreachable_cost,
                         "errors": s.errors, "empty": s.empty,
                     })
                 );
             } else {
                 println!("已输出：{}", out_path.display());
                 println!(
-                    "共 {} 行：精确 {}，不可精确达到 {}，错误 {}，空白 {}",
-                    s.rows, s.exact, s.inexact, s.errors, s.empty
+                    "共 {} 行：成功 {}，不可精确达到 {}，总成本不可达 {}，错误 {}，空白 {}",
+                    s.rows, s.exact, s.inexact, s.unreachable_cost, s.errors, s.empty
                 );
             }
         }

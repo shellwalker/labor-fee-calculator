@@ -1,4 +1,10 @@
-//! 劳务报酬计算简易 Web 服务：正算/反算查询 + 批量反算上传下载。
+//! 劳务报酬计算简易 Web 服务：正算/反算查询 + 批量上传下载。
+//!
+//! API（金额均为字符串，单位元，最多两位小数）：
+//! - `GET /api/forward?net_income=`：正算（主入口），不含税收入 → 全部金额；
+//! - `GET /api/from-cost?total_cost=`：辅助，按企业总成本正算；落在空位返回 422 及原因、两侧最近有效总成本；
+//! - `GET /api/reverse?take_home=`：反算；
+//! - `POST /api/batch`：multipart，字段 file、input_kind（take-home/net-income/total-cost）、column。
 
 use anyhow::Context;
 use axum::{
@@ -9,7 +15,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use labor_fee_core::{forward, Config, Decimal, Reverser};
+use labor_fee_core::{forward, from_total_cost, CalcError, Config, Decimal, Reverser};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
 
@@ -53,8 +59,21 @@ fn parse_amount(s: &str) -> Result<Decimal, String> {
 }
 
 #[derive(Deserialize)]
-struct AmountQuery {
-    amount: String,
+struct ForwardQuery {
+    #[serde(alias = "amount")]
+    net_income: String,
+}
+
+#[derive(Deserialize)]
+struct CostQuery {
+    #[serde(alias = "amount")]
+    total_cost: String,
+}
+
+#[derive(Deserialize)]
+struct ReverseQuery {
+    #[serde(alias = "amount")]
+    take_home: String,
 }
 
 async fn index() -> Html<&'static str> {
@@ -68,8 +87,8 @@ async fn api_config(State(st): State<Shared>) -> impl IntoResponse {
     )
 }
 
-async fn api_forward(State(st): State<Shared>, Query(q): Query<AmountQuery>) -> Response {
-    let amount = match parse_amount(&q.amount) {
+async fn api_forward(State(st): State<Shared>, Query(q): Query<ForwardQuery>) -> Response {
+    let amount = match parse_amount(&q.net_income) {
         Ok(a) => a,
         Err(m) => return err(StatusCode::BAD_REQUEST, m),
     };
@@ -79,8 +98,29 @@ async fn api_forward(State(st): State<Shared>, Query(q): Query<AmountQuery>) -> 
     }
 }
 
-async fn api_reverse(State(st): State<Shared>, Query(q): Query<AmountQuery>) -> Response {
-    let amount = match parse_amount(&q.amount) {
+/// 辅助：按企业总成本正算。空位返回 422：`{ error, reason, gap: { total_cost, reason, lower, upper, threshold } }`。
+async fn api_from_cost(State(st): State<Shared>, Query(q): Query<CostQuery>) -> Response {
+    let amount = match parse_amount(&q.total_cost) {
+        Ok(a) => a,
+        Err(m) => return err(StatusCode::BAD_REQUEST, m),
+    };
+    match from_total_cost(&st.cfg, amount) {
+        Ok(b) => Json(b).into_response(),
+        Err(CalcError::CostUnreachable(g)) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(serde_json::json!({
+                "error": g.to_string(),
+                "reason": g.reason,
+                "gap": g,
+            })),
+        )
+            .into_response(),
+        Err(e) => err(StatusCode::BAD_REQUEST, e),
+    }
+}
+
+async fn api_reverse(State(st): State<Shared>, Query(q): Query<ReverseQuery>) -> Response {
+    let amount = match parse_amount(&q.take_home) {
         Ok(a) => a,
         Err(m) => return err(StatusCode::BAD_REQUEST, m),
     };
@@ -90,10 +130,12 @@ async fn api_reverse(State(st): State<Shared>, Query(q): Query<AmountQuery>) -> 
     }
 }
 
-/// 上传字段：file（必填），column（可选，默认“到手金额”）。
+/// 上传字段：file（必填）；input_kind（可选，take-home 默认 / net-income / total-cost）；
+/// column（可选，缺省按 input_kind 取“到手金额”/“不含税收入”/“企业总成本”）。
 async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
     let mut file: Option<(String, Vec<u8>)> = None;
-    let mut column = labor_fee_batch::DEFAULT_COLUMN.to_string();
+    let mut column: Option<String> = None;
+    let mut kind = labor_fee_batch::InputKind::default();
     loop {
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
@@ -113,7 +155,18 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
             Some("column") => {
                 if let Ok(t) = field.text().await {
                     if !t.trim().is_empty() {
-                        column = t.trim().to_string();
+                        column = Some(t.trim().to_string());
+                    }
+                }
+            }
+            Some("input_kind") => {
+                let t = field.text().await.unwrap_or_default();
+                if !t.trim().is_empty() {
+                    match labor_fee_batch::InputKind::parse(&t) {
+                        Some(k) => kind = k,
+                        None => {
+                            return err(StatusCode::BAD_REQUEST, format!("未知输入列含义：{t}"))
+                        }
                     }
                 }
             }
@@ -125,13 +178,13 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
     };
     let (format, out_name) = match (
         labor_fee_batch::Format::from_file_name(&name),
-        labor_fee_batch::output_file_name(&name),
+        labor_fee_batch::output_file_name_for(&name, kind),
     ) {
         (Ok(f), Ok(n)) => (f, n),
         (Err(e), _) | (_, Err(e)) => return err(StatusCode::BAD_REQUEST, e),
     };
     let cfg = st.cfg.clone();
-    let opts = labor_fee_batch::Options { column };
+    let opts = labor_fee_batch::Options { kind, column };
     let result =
         tokio::task::spawn_blocking(move || labor_fee_batch::process(&cfg, &bytes, format, &opts))
             .await;
@@ -142,8 +195,8 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
     };
     let s = &out.summary;
     let summary = format!(
-        "rows={};exact={};inexact={};errors={};empty={}",
-        s.rows, s.exact, s.inexact, s.errors, s.empty
+        "rows={};exact={};inexact={};unreachable_cost={};errors={};empty={}",
+        s.rows, s.exact, s.inexact, s.unreachable_cost, s.errors, s.empty
     );
     let disposition = format!(
         "attachment; filename=\"result.{}\"; filename*=UTF-8''{}",
@@ -179,6 +232,7 @@ fn app(cfg: Config, max_upload_mb: usize) -> anyhow::Result<Router> {
         .route("/", get(index))
         .route("/api/config", get(api_config))
         .route("/api/forward", get(api_forward))
+        .route("/api/from-cost", get(api_from_cost))
         .route("/api/reverse", get(api_reverse))
         .route("/api/batch", post(api_batch))
         .layer(DefaultBodyLimit::max(max_upload_mb * 1024 * 1024))
@@ -230,17 +284,19 @@ mod tests {
     async fn forward_and_reverse_api() {
         let resp = router()
             .oneshot(
-                Request::get("/api/forward?amount=10103")
+                Request::get("/api/forward?net_income=10000")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_json(resp).await["take_home"], "8400.00");
+        let v = body_json(resp).await;
+        assert_eq!(v["take_home"], "8400.00");
+        assert_eq!(v["total_cost"], "10103.00");
         let resp = router()
             .oneshot(
-                Request::get("/api/reverse?amount=8400")
+                Request::get("/api/reverse?take_home=8400")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -249,6 +305,7 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["exact"], true);
         assert_eq!(v["breakdown"]["total_cost"], "10103.00");
+        assert_eq!(v["breakdown"]["net_income"], "10000.00");
         let resp = router()
             .oneshot(
                 Request::get("/api/reverse?amount=-1")
@@ -258,6 +315,56 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn from_cost_api() {
+        let get = |q: &str| {
+            Request::get(format!("/api/from-cost?total_cost={q}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let resp = router().oneshot(get("10103")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_json(resp).await["net_income"], "10000.00");
+        let resp = router().oneshot(get("1005.00")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = body_json(resp).await;
+        assert_eq!(v["reason"], "threshold");
+        assert_eq!(v["gap"]["lower"]["total_cost"], "999.99");
+        assert_eq!(v["gap"]["upper"]["total_cost"], "1010.30");
+        assert_eq!(v["gap"]["upper"]["net_income"], "1000.00");
+        let msg = v["error"].as_str().unwrap();
+        assert!(msg.contains("1000 元增值税征收门槛形成的空白区间"), "{msg}");
+        assert!(
+            msg.contains("不含税收入 999.99 对应总成本 999.99，1000.00 对应 1010.30"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_upload_total_cost_gap_note() {
+        let boundary = "XB";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"input_kind\"\r\n\r\ntotal-cost\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"c.csv\"\r\nContent-Type: text/csv\r\n\r\n企业总成本\n10103\n1005\n\r\n--{boundary}--\r\n"
+        );
+        let req = Request::post("/api/batch")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()["x-batch-summary"],
+            "rows=2;exact=1;inexact=0;unreachable_cost=1;errors=0;empty=0"
+        );
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        let s = String::from_utf8(b.to_vec()).unwrap();
+        assert!(s.contains("总成本不可达"));
+        assert!(s.contains("1000 元增值税征收门槛形成的空白区间"));
     }
 
     #[tokio::test]
@@ -277,7 +384,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()["x-batch-summary"],
-            "rows=1;exact=1;inexact=0;errors=0;empty=0"
+            "rows=1;exact=1;inexact=0;unreachable_cost=0;errors=0;empty=0"
         );
         let cd = resp.headers()[header::CONTENT_DISPOSITION]
             .to_str()
