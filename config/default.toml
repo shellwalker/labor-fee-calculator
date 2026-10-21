@@ -15,6 +15,11 @@ surcharge = "per_item"
 #   vat_and_surcharge_inclusive  = 总成本 = 不含税收入 + 增值税 + 附加税（默认）
 #   vat_inclusive                = 总成本 = 价税合计 = 不含税收入 + 增值税（价税分离）
 basis = "vat_and_surcharge_inclusive"
+# 总成本拆分方法（vat_and_surcharge_inclusive 口径，待确认）：
+#   估算收入 = 总成本 / (1 + 征收率 × (1 + 附加税率))；增值税 = round(估算收入 × 征收率)；
+#   附加税 = round(增值税 × 附加税率)；不含税收入 = 总成本 − 增值税 − 附加税（倒挤，三项之和恒等于总成本）。
+# true：倒挤收入再算增值税与原值不等时，在增值税 ±0.01 范围内找自洽组合，找不到才按倒挤结果
+consistent_search = true
 
 [vat]
 # 增值税 = 不含税收入 × rate（用户已确认 1%）
@@ -27,6 +32,10 @@ threshold = "1000"
 threshold_basis = "net_revenue"
 # 恰好等于门槛时是否征收：true = “≥ 门槛征收”（含本数，默认）；false = “> 门槛才征收”
 levy_at_threshold = true
+# 门槛跳变段（如总成本 1000.00～1010.29：不征收则收入 ≥ 1000，征收则倒挤收入 < 1000）的处理（待确认）：
+#   levy   = 按征收处理（默认，倒挤收入可能略低于 1000；宁可略多缴，合规风险更小）
+#   exempt = 按不征收处理（不含税收入 = 总成本）
+threshold_gap = "levy"
 
 [surcharge]
 # 附加税计税基数（用户已确认：按增值税额）：vat（增值税额）| net_revenue（不含税开票收入）

@@ -1,20 +1,19 @@
 //! 反算：实际到手 → 企业总成本。
 //!
-//! 实际到手关于企业总成本是分段函数：个税各档（800/4000/20000/50000）处连续但斜率变化；
-//! 增值税起征点处存在向下跳变；逐步舍入到分又会造成局部 ±1 分的抖动和“多个总成本对应同一到手”的平台。
-//! 因此算法为：
-//! 1. 按跳变点（起征点）把总成本划分为若干近似单调的区间；
+//! 正算对任意总成本（精确到分）都给出完整拆分，因此反算在总成本的分位网格上搜索。
+//! 实际到手关于总成本是分段函数：个税各档（800/4000/20000/50000）处连续但斜率变化；
+//! 征收门槛处到手向下跳变（开始征收增值税和附加税）；逐步舍入到分又会造成局部 ±1 分的抖动和
+//! “多个总成本对应同一到手”的平台。算法：
+//! 1. 按分段键（是否征收 / 减除费用方式 / 预扣率档次）把总成本划分为若干近似单调的区间；
 //! 2. 在每个区间内对“分”做二分，定位到手首次 ≥ 目标的位置；
 //! 3. 以该位置为中心按 0.01 上下逐分扫描（窗口见 `reverse.search_window`），
 //!    正算校准：收集所有正算到手与目标完全相等的总成本；
 //! 4. 有精确解则按 `reverse.prefer` 取最小（默认）或最大总成本，其它区间的精确解列入 `other_solutions`；
 //!    无精确解则取正算到手与目标差额绝对值最小者（同差额取较小总成本），标记“不可精确达到”并给出差额。
 
-use crate::config::{Config, CostBasis, Prefer, ThresholdBasis};
+use crate::config::{Config, Prefer};
 use crate::error::CalcError;
-use crate::forward::{
-    eval_primary, from_ticks, last_unlevied_tick, to_ticks, validate_amount, Breakdown,
-};
+use crate::forward::{eval_cost, from_ticks, to_ticks, validate_amount, Breakdown};
 use rust_decimal::Decimal;
 use serde::Serialize;
 
@@ -31,7 +30,7 @@ pub struct ReverseOutcome {
     pub diff: Decimal,
     /// 选定解所在区间内，能精确得到目标的最小与最大总成本（仅精确时有值）。
     pub exact_cost_range: Option<(Decimal, Decimal)>,
-    /// 其它区间（如起征点另一侧）也能精确得到目标的总成本。
+    /// 其它区间（如征收门槛另一侧）也能精确得到目标的总成本。
     pub other_solutions: Vec<Decimal>,
 }
 
@@ -50,8 +49,7 @@ impl ReverseOutcome {
     }
 }
 
-/// 在“主变量”（见 `forward::eval_primary`：价税合计口径为总成本，含全部税费口径为不含税收入）
-/// 的分位网格上搜索。两种口径下总成本都随主变量单调递增，因此“最小主变量”即“最小总成本”。
+/// 在企业总成本的分位网格上搜索（每个分都是有效总成本）。
 struct Ctx<'a> {
     cfg: &'a Config,
 }
@@ -61,12 +59,12 @@ impl Ctx<'_> {
         from_ticks(self.cfg, ticks)
     }
     fn eval(&self, ticks: i64) -> Breakdown {
-        eval_primary(self.cfg, self.dec(ticks)).expect("搜索区间内主变量有效")
+        eval_cost(self.cfg, self.dec(ticks))
     }
     fn th(&self, ticks: i64) -> Decimal {
         self.eval(ticks).take_home
     }
-    /// 分段键：(是否征收增值税, 是否按比例减除费用, 预扣率档次)。随主变量按字典序单调不减。
+    /// 分段键：(是否征收增值税, 是否按比例减除费用, 预扣率档次)。随总成本按字典序（近似）单调不减。
     fn key(&self, ticks: i64) -> (bool, bool, usize) {
         let b = self.eval(ticks);
         let iit = &self.cfg.iit;
@@ -131,7 +129,7 @@ fn search_region(ctx: &Ctx, lo: i64, hi: i64, target: Decimal, window: i64) -> R
 #[derive(Debug, Clone)]
 pub struct Reverser {
     cfg: Config,
-    /// 分段区间（主变量，以最小金额单位计的闭区间）。
+    /// 分段区间（企业总成本，以最小金额单位计的闭区间）。
     regions: Vec<(i64, i64)>,
     max_ticks: i64,
 }
@@ -143,35 +141,8 @@ impl Reverser {
         let ctx = Ctx { cfg };
         let max_ticks = to_ticks(cfg, cfg.round(cfg.reverse.max_cost))?;
 
-        // 1. 主变量的有效区间。价税合计口径 + 门槛按不含税收入判断时，门槛附近一段总成本无效。
-        let mut valid: Vec<(i64, i64)> = Vec::new();
-        let gap = cfg.cost.basis == CostBasis::VatInclusive
-            && cfg.vat.threshold_enabled
-            && cfg.vat.threshold_basis == ThresholdBasis::NetRevenue;
-        if gap {
-            let e = last_unlevied_tick(cfg).min(max_ticks);
-            if e >= 0 {
-                valid.push((0, e));
-            }
-            // 第一个“征收”的总成本
-            let ok = |t: i64| eval_primary(cfg, from_ticks(cfg, t)).is_some_and(|b| !b.vat_exempt);
-            let (mut l, mut h) = (e.max(-1), max_ticks);
-            if ok(h) {
-                while h - l > 1 {
-                    let m = l + (h - l) / 2;
-                    if ok(m) {
-                        h = m;
-                    } else {
-                        l = m;
-                    }
-                }
-                valid.push((h, max_ticks));
-            }
-        } else {
-            valid.push((0, max_ticks));
-        }
-
-        // 2. 每个有效区间内按分段键再切分
+        let valid = [(0i64, max_ticks)];
+        // 按分段键切分区间
         let mut regions = Vec::new();
         for (vlo, vhi) in valid {
             let mut lo = vlo;
@@ -332,6 +303,8 @@ mod tests {
         let a = rev.reverse(dec!(959.99)).unwrap();
         assert!(a.exact && a.breakdown.vat_exempt);
         assert_eq!(a.breakdown.total_cost, dec!(999.99));
+        // 跳变段按征收处理时 1010.29 也能得到 959.99，取最小总成本
+        assert_eq!(a.other_solutions, vec![dec!(1010.29)]);
         let b = rev.reverse(dec!(960.00)).unwrap();
         assert!(b.exact && !b.breakdown.vat_exempt);
         assert_eq!(b.breakdown.net_revenue, dec!(1000.00));
@@ -425,12 +398,12 @@ mod tests {
     #[test]
     fn segments_default() {
         let rev = Reverser::new(&Config::default()).unwrap();
-        // 0 起；收入达到 1000（开始征收）、超过 4000、应纳税所得额超过 20000、50000 处分段
+        // 0 起；总成本达到 1000（开始征收）、收入超过 4000、应纳税所得额超过 20000、50000 处分段
         assert_eq!(
             rev.segment_starts(),
             vec![
                 dec!(0.00),
-                dec!(1010.30),
+                dec!(1000.00),
                 dec!(4041.21),
                 dec!(25257.51),
                 dec!(63143.76)

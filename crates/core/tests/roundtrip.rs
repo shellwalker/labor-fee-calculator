@@ -2,7 +2,7 @@
 
 use labor_fee_core::{
     forward, Config, CostBasis, IncomeBase, Reverser, RoundingMode, SurchargeItem,
-    SurchargeRounding, ThresholdBasis,
+    SurchargeRounding, ThresholdBasis, ThresholdGap,
 };
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -31,6 +31,8 @@ fn configs() -> Vec<(&'static str, Config)> {
     let base = Config::default();
     let mut not_equal = base.clone();
     not_equal.vat.levy_at_threshold = false;
+    let mut gap_exempt = base.clone();
+    gap_exempt.vat.threshold_gap = ThresholdGap::Exempt;
     let mut itemized = base.clone();
     itemized.vat.rate = dec!(0.03);
     itemized.surcharge.halve = true;
@@ -67,6 +69,7 @@ fn configs() -> Vec<(&'static str, Config)> {
     vec![
         ("默认（企业承担税费，门槛1000含本数）", base),
         ("门槛不含本数", not_equal),
+        ("跳变段按不征收", gap_exempt),
         ("3%分项减半合计舍入", itemized),
         ("个税基数=总成本+银行家舍入", gross),
         ("到手扣附加税+门槛按总成本", worker_pays),
@@ -82,7 +85,6 @@ fn check(rev: &Reverser, target: Decimal) -> labor_fee_core::ReverseOutcome {
     let r = rev.reverse(target).unwrap();
     let fwd = forward(cfg, r.breakdown.total_cost).unwrap();
     assert_eq!(fwd, r.breakdown, "反算结果再正算应完全一致");
-    assert!(r.breakdown.unallocated.is_zero());
     assert_eq!(fwd.take_home - target, r.diff, "目标 {target}");
     assert_eq!(r.exact, r.diff.is_zero(), "目标 {target}");
     r
@@ -104,44 +106,61 @@ fn default_config_all_targets_exact_up_to_200k() {
 }
 
 #[test]
+fn split_identity_every_cent_to_70k() {
+    // 总成本 0 ~ 70000 逐分正算：三项之和恒等于总成本
+    for (name, cfg) in configs().into_iter().take(3) {
+        for c in 0..=7_000_000i64 {
+            let b = forward(&cfg, cents(c)).unwrap();
+            assert_eq!(
+                b.net_revenue + b.vat + b.surcharge_total,
+                cents(c),
+                "[{name}] 总成本 {}",
+                cents(c)
+            );
+            assert_eq!(b.total_cost, cents(c));
+        }
+    }
+}
+
+#[test]
 fn default_threshold_every_cent() {
     let cfg = Config::default();
     let rev = Reverser::new(&cfg).unwrap();
-    // 到手 900.00 ~ 1100.00 逐分：全部精确可达、唯一（无其它分段解）
+    // 到手 900.00 ~ 1100.00 逐分：全部精确可达；有两解时取最小总成本（不征收一侧）
     for t in 90_000..=110_000 {
         let r = check(&rev, cents(t));
         assert!(r.exact, "到手 {} 应可达", cents(t));
-        assert!(r.other_solutions.is_empty(), "到手 {} 不应多解", cents(t));
         let b = &r.breakdown;
-        assert_eq!(b.vat_exempt, b.net_revenue < dec!(1000));
+        if t <= 95_999 {
+            assert!(b.vat_exempt, "到手 {} 应取不征收一侧", cents(t));
+        }
+        for o in &r.other_solutions {
+            assert!(*o > b.total_cost);
+            assert_eq!(forward(&cfg, *o).unwrap().take_home, cents(t));
+        }
     }
-    // 总成本 990.00 ~ 1030.00 逐分正算：门槛跳变区间 [1000.00, 1010.29] 退回 999.99
+    // 总成本 990.00 ~ 1030.00 逐分正算：跳变段 [1000.00, 1010.29] 按征收、收入 < 1000
     for c in 99_000..=103_000 {
         let b = forward(&cfg, cents(c)).unwrap();
+        assert_eq!(b.net_revenue + b.vat + b.surcharge_total, cents(c));
+        assert_eq!(b.vat_exempt, c < 100_000, "总成本 {}", cents(c));
         if (100_000..=101_029).contains(&c) {
-            assert_eq!(b.total_cost, dec!(999.99), "总成本 {}", cents(c));
-            assert!(b.vat_exempt);
-        } else {
-            assert!(b.unallocated < dec!(0.03), "总成本 {}", cents(c));
+            assert!(b.net_revenue < dec!(1000), "总成本 {}", cents(c));
+        } else if c >= 101_030 {
+            assert!(b.net_revenue >= dec!(1000), "总成本 {}", cents(c));
         }
-        assert_eq!(b.total_cost + b.unallocated, cents(c));
-        // 正算到手 → 反算，得到不超过它的有效总成本
         let r = check(&rev, b.take_home);
         assert!(r.exact);
         assert!(r.breakdown.total_cost <= b.total_cost);
     }
 }
 
-/// 暴力表：总成本 0..=max（逐分）中“有效”（无未分配差额）的总成本的到手；
-/// 返回每个到手（分）对应的最小有效总成本，以及可安全比较的到手上限。
+/// 暴力表：总成本 0..=max（逐分）的到手；
+/// 返回每个到手（分）对应的最小总成本，以及可安全比较的到手上限。
 fn brute_min_cost(cfg: &Config, max_cost_cents: i64) -> (Vec<Option<i64>>, i64) {
-    let mut ths: Vec<(i64, i64)> = Vec::new();
-    for c in 0..=max_cost_cents {
-        let b = forward(cfg, cents(c)).unwrap();
-        if b.unallocated.is_zero() {
-            ths.push((c, to_cents(b.take_home)));
-        }
-    }
+    let ths: Vec<(i64, i64)> = (0..=max_cost_cents)
+        .map(|c| (c, to_cents(forward(cfg, cents(c)).unwrap().take_home)))
+        .collect();
     let max_th = ths.iter().map(|x| x.1).max().unwrap();
     let mut table = vec![None; (max_th + 1) as usize];
     for &(c, t) in &ths {
@@ -181,7 +200,11 @@ fn brute_force_minimal_cost_all_configs() {
                         cents(t)
                     );
                 }
-                None => assert!(!r.exact, "[{name}] 到手 {} 不可达却报精确", cents(t)),
+                None => {
+                    assert!(!r.exact, "[{name}] 到手 {} 不可达却报精确", cents(t));
+                    // 默认口径下任意到手都必须可达
+                    assert!(i != 0, "[默认] 到手 {} 不可达", cents(t));
+                }
             }
         }
     }
@@ -189,7 +212,7 @@ fn brute_force_minimal_cost_all_configs() {
 
 #[test]
 fn boundary_costs_every_cent() {
-    // 收入 800/1000/4000、应纳税所得额 20000/50000、起征点附近：逐分正算 → 反算
+    // 收入 800/1000/4000、应纳税所得额 20000/50000、征收门槛附近：逐分正算 → 反算
     for (name, cfg) in configs() {
         let rev = Reverser::new(&cfg).unwrap();
         let mut centers: Vec<i64> = rev.segment_starts().into_iter().map(to_cents).collect();
@@ -215,12 +238,12 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(2000))]
 
     #[test]
-    fn prop_roundtrip_from_cost(c in 0i64..1_000_000_000, idx in 0usize..8) {
+    fn prop_roundtrip_from_cost(c in 0i64..1_000_000_000, idx in 0usize..9) {
         // 任取总成本 → 到手 → 反算，必须精确，且所选总成本不大于正算采用的有效总成本（取最小解）
         let (_, cfg) = configs().swap_remove(idx);
         let rev = Reverser::new(&cfg).unwrap();
         let b = forward(&cfg, cents(c)).unwrap();
-        prop_assert_eq!(b.total_cost + b.unallocated, cents(c));
+        prop_assert_eq!(b.total_cost, cents(c));
         let r = check(&rev, b.take_home);
         prop_assert!(r.exact);
         prop_assert!(r.breakdown.total_cost <= b.total_cost);
@@ -235,7 +258,7 @@ proptest! {
     }
 
     #[test]
-    fn prop_monotonic(a in 0i64..1_000_000_000, gap in 0i64..10_000_000, idx in 0usize..8) {
+    fn prop_monotonic(a in 0i64..1_000_000_000, gap in 0i64..10_000_000, idx in 0usize..9) {
         let (_, cfg) = configs().swap_remove(idx);
         let b = a + gap;
         let fa = forward(&cfg, cents(a)).unwrap();
@@ -253,11 +276,19 @@ proptest! {
     }
 
     #[test]
-    fn prop_default_strictly_follows_net(n in 0i64..1_000_000_000) {
-        // 默认口径：到手 = 不含税收入 − 个税，且只取决于不含税收入
-        let cfg = Config::default();
+    fn prop_default_split(n in 0i64..1_000_000_000, idx in 0usize..9) {
+        // 任意总成本完整拆分；默认口径到手 = 不含税收入 − 个税，总成本 ≥ 1000 即征收
+        let (_, cfg) = configs().swap_remove(idx);
         let b = forward(&cfg, cents(n)).unwrap();
-        prop_assert_eq!(b.take_home, b.net_revenue - b.iit.tax);
-        prop_assert_eq!(b.vat_exempt, b.net_revenue < dec!(1000));
+        let sum = if cfg.cost.basis == CostBasis::VatInclusive {
+            b.net_revenue + b.vat
+        } else {
+            b.net_revenue + b.vat + b.surcharge_total
+        };
+        prop_assert_eq!(sum, cents(n));
+        if idx == 0 {
+            prop_assert_eq!(b.take_home, b.net_revenue - b.iit.tax);
+            prop_assert_eq!(b.vat_exempt, n < 100_000);
+        }
     }
 }

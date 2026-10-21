@@ -62,6 +62,18 @@ pub enum CostBasis {
 #[serde(deny_unknown_fields)]
 pub struct CostConfig {
     pub basis: CostBasis,
+    /// 总成本含全部税费时，倒挤出的收入再算增值税与原值不等，是否在相邻一分钱内寻找自洽组合。
+    pub consistent_search: bool,
+}
+
+/// 门槛跳变段的处理方式（总成本按不征收时收入已达门槛，按征收倒挤后收入又低于门槛）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdGap {
+    /// 按征收处理：倒挤出的不含税收入可能略低于门槛。
+    Levy,
+    /// 按不征收处理：不含税收入 = 总成本（已达到或超过门槛）。
+    Exempt,
 }
 
 /// 增值税/附加税征收门槛的判断基数。
@@ -87,6 +99,8 @@ pub struct VatConfig {
     pub threshold_basis: ThresholdBasis,
     /// 金额恰好等于门槛时是否征收（true：≥ 门槛征收；false：> 门槛才征收）。
     pub levy_at_threshold: bool,
+    /// 门槛跳变段的处理方式（仅门槛按不含税收入判断时有意义）。
+    pub threshold_gap: ThresholdGap,
 }
 
 /// 附加税计税基数（假设 B）。

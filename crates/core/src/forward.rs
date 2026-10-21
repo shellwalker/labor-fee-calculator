@@ -1,5 +1,5 @@
 use crate::config::{
-    Config, CostBasis, IncomeBase, SurchargeBase, SurchargeRounding, ThresholdBasis,
+    Config, CostBasis, IncomeBase, SurchargeBase, SurchargeRounding, ThresholdBasis, ThresholdGap,
 };
 use crate::error::CalcError;
 use rust_decimal::Decimal;
@@ -36,7 +36,7 @@ pub struct IitBreakdown {
 pub struct Breakdown {
     /// 企业总成本。
     pub total_cost: Decimal,
-    /// 是否因未达征收门槛而不征增值税和附加税。
+    /// 是否不征增值税和附加税（未达征收门槛，或门槛跳变段按不征收处理）。
     pub vat_exempt: bool,
     /// 不含税开票收入。
     pub net_revenue: Decimal,
@@ -50,12 +50,6 @@ pub struct Breakdown {
     pub iit: IitBreakdown,
     /// 实际到手金额。
     pub take_home: Decimal,
-    /// 未分配差额 = 输入的企业总成本 − 实际采用的有效总成本。
-    ///
-    /// 总成本含全部税费时，并非每个“分”都能恰好分解为 不含税收入 + 增值税 + 附加税
-    /// （逐项舍入造成 1~2 分的跳档，征收门槛处跳变更大）。此时按不超过输入的最大有效总成本计算，
-    /// 剩余部分记在这里。反算结果中恒为 0。
-    pub unallocated: Decimal,
 }
 
 fn check_amount(cfg: &Config, amount: Decimal) -> Result<Decimal, CalcError> {
@@ -86,20 +80,6 @@ pub(crate) fn to_ticks(cfg: &Config, d: Decimal) -> Result<i64, CalcError> {
 /// 最小单位整数（分）→ 金额。
 pub(crate) fn from_ticks(cfg: &Config, t: i64) -> Decimal {
     Decimal::new(t, cfg.rounding.scale)
-}
-
-/// 门槛判断金额“不征收”的最大值（以分计）；未启用门槛时返回 -1。
-pub(crate) fn last_unlevied_tick(cfg: &Config) -> i64 {
-    if !cfg.vat.threshold_enabled {
-        return -1;
-    }
-    let t = cfg.vat.threshold * Decimal::from(10i64.pow(cfg.rounding.scale));
-    let k = if cfg.vat.levy_at_threshold {
-        t.ceil() - Decimal::ONE
-    } else {
-        t.floor()
-    };
-    i64::try_from(k).unwrap_or(i64::MAX).max(-1)
 }
 
 fn surcharges(cfg: &Config, vat: Decimal, net: Decimal) -> (Vec<SurchargeLine>, Decimal) {
@@ -228,131 +208,85 @@ fn compose(
             ..iit
         },
         take_home: fix(take_home),
-        unallocated: fix(Decimal::ZERO),
     }
 }
 
-/// 计算主变量取值 `p` 对应的完整结果。
-///
-/// - `cost.basis = vat_inclusive`：主变量是企业总成本（价税分离得到不含税收入）。
-///   门槛按不含税收入判断时，门槛附近有一段总成本既不满足“征收”也不满足“不征收”，返回 `None`。
-/// - `cost.basis = vat_and_surcharge_inclusive`：主变量是不含税收入，
-///   增值税 = 不含税收入 × 征收率，附加税按配置计算，总成本 = 三者之和。总成本随主变量严格递增。
-pub(crate) fn eval_primary(cfg: &Config, p: Decimal) -> Option<Breakdown> {
+/// 总成本含全部税费口径下，把应征收的总成本拆成 (不含税收入, 增值税, 附加税)，三项之和恒等于总成本。
+fn split_taxed(cfg: &Config, cost: Decimal) -> (Decimal, Decimal, (Vec<SurchargeLine>, Decimal)) {
     let rate = cfg.vat.rate;
-    match cfg.cost.basis {
-        CostBasis::VatInclusive => {
-            let cost = p;
-            // 价税分离：不含税收入 = 总成本 / (1 + 征收率)，增值税 = 总成本 − 不含税收入
-            let net_t = cfg.round(cost / (Decimal::ONE + rate));
-            let taxed = match cfg.vat.threshold_basis {
-                ThresholdBasis::TotalCost => cfg.levied(cost),
-                ThresholdBasis::NetRevenue => cfg.levied(net_t),
-            };
-            if taxed {
-                let vat = cost - net_t;
-                let sur = surcharges(cfg, vat, net_t);
-                Some(compose(cfg, cost, net_t, vat, sur, false))
-            } else if !cfg.levied(cost) {
-                Some(compose(
-                    cfg,
-                    cost,
-                    cost,
-                    Decimal::ZERO,
-                    zero_surcharges(cfg),
-                    true,
-                ))
-            } else {
-                None
-            }
+    let sr: Decimal = cfg.effective_surcharge_rates().iter().copied().sum();
+    let k = rate
+        + match cfg.surcharge.base {
+            SurchargeBase::Vat => rate * sr,
+            SurchargeBase::NetRevenue => sr,
+        };
+    let est = cost / (Decimal::ONE + k);
+    // 给定增值税 v：附加税按估算收入取，收入倒挤
+    let candidate = |v: Decimal| {
+        let sur = surcharges(cfg, v, cfg.round(est));
+        let net = cost - v - sur.1;
+        (net, v, sur)
+    };
+    let consistent = |(net, v, sur): &(Decimal, Decimal, (Vec<SurchargeLine>, Decimal))| {
+        *net >= Decimal::ZERO
+            && cfg.round(*net * rate) == *v
+            && surcharges(cfg, *v, *net).1 == sur.1
+    };
+    let v0 = cfg.round(est * rate);
+    let first = candidate(v0);
+    if consistent(&first) || !cfg.cost.consistent_search {
+        return first;
+    }
+    let u = cfg.unit();
+    for v in [v0 - u, v0 + u] {
+        if v < Decimal::ZERO {
+            continue;
         }
-        CostBasis::VatAndSurchargeInclusive => {
-            let net = p;
-            let vat = cfg.round(net * rate);
-            let (lines, st) = surcharges(cfg, vat, net);
-            let cost = net + vat + st;
-            let taxed = match cfg.vat.threshold_basis {
-                ThresholdBasis::NetRevenue => cfg.levied(net),
-                ThresholdBasis::TotalCost => cfg.levied(cost),
-            };
-            if taxed {
-                Some(compose(cfg, cost, net, vat, (lines, st), false))
-            } else {
-                Some(compose(
-                    cfg,
-                    net,
-                    net,
-                    Decimal::ZERO,
-                    zero_surcharges(cfg),
-                    true,
-                ))
-            }
+        let c = candidate(v);
+        if consistent(&c) {
+            let (net, v, _) = c;
+            // 自洽时附加税按最终收入重算（基数为收入时才可能有差别，自洽已保证合计相等）
+            return (net, v, surcharges(cfg, v, net));
         }
     }
+    first
+}
+
+/// 计算总成本 `cost` 对应的完整结果（`cost` 已校验）。
+pub(crate) fn eval_cost(cfg: &Config, cost: Decimal) -> Breakdown {
+    let rate = cfg.vat.rate;
+    // 不征收时 不含税收入 = 总成本，此时门槛判断金额就是总成本
+    let exempt_by_cost = !cfg.levied(cost);
+    let exempt = || compose(cfg, cost, cost, Decimal::ZERO, zero_surcharges(cfg), true);
+    if exempt_by_cost {
+        return exempt();
+    }
+    let (net, vat, sur) = match cfg.cost.basis {
+        CostBasis::VatInclusive => {
+            // 价税分离：不含税收入 = 总成本 / (1 + 征收率)，增值税 = 总成本 − 不含税收入
+            let net = cfg.round(cost / (Decimal::ONE + rate));
+            let vat = cost - net;
+            (net, vat, surcharges(cfg, vat, net))
+        }
+        CostBasis::VatAndSurchargeInclusive => split_taxed(cfg, cost),
+    };
+    // 门槛跳变段：按不征收时收入已达门槛，按征收拆分后收入又低于门槛
+    if cfg.vat.threshold_basis == ThresholdBasis::NetRevenue
+        && cfg.vat.threshold_gap == ThresholdGap::Exempt
+        && !cfg.levied(net)
+    {
+        return exempt();
+    }
+    compose(cfg, cost, net, vat, sur, false)
 }
 
 /// 正算：企业总成本 → 各项税费与实际到手。
 ///
 /// `total_cost` 必须非负，且小数位不超过 `rounding.scale`。
-/// 若输入总成本无法恰好分解（见 [`Breakdown::unallocated`]），按不超过它的最大有效总成本计算。
+/// 结果恒满足 不含税收入 + 增值税 + 附加税 = 总成本（价税合计口径下附加税不计入总成本）。
 pub fn forward(cfg: &Config, total_cost: Decimal) -> Result<Breakdown, CalcError> {
     let cost = check_amount(cfg, total_cost)?;
-    let mut b = match cfg.cost.basis {
-        CostBasis::VatInclusive => match eval_primary(cfg, cost) {
-            Some(b) => b,
-            None => {
-                // 门槛跳变区间：退回到“不征收”的最大总成本
-                let k = last_unlevied_tick(cfg).min(to_ticks(cfg, cost)?);
-                eval_primary(cfg, from_ticks(cfg, k.max(0))).expect("不征收区间有效")
-            }
-        },
-        CostBasis::VatAndSurchargeInclusive => {
-            // 求满足 总成本(不含税收入) ≤ 输入 的最大不含税收入（总成本随其严格递增，且 ≥ 不含税收入）
-            let hi_t = to_ticks(cfg, cost)?;
-            let cost_of = |t: i64| {
-                eval_primary(cfg, from_ticks(cfg, t))
-                    .expect("该口径下恒有效")
-                    .total_cost
-            };
-            // 快速路径：按综合税率估算后逐分微调
-            let sr: Decimal = cfg.effective_surcharge_rates().iter().copied().sum();
-            let k = cfg.vat.rate
-                + match cfg.surcharge.base {
-                    SurchargeBase::Vat => cfg.vat.rate * sr,
-                    SurchargeBase::NetRevenue => sr,
-                };
-            let est = to_ticks(cfg, cost / (Decimal::ONE + k))?.clamp(0, hi_t);
-            let mut n = est;
-            let mut steps = 0;
-            while n > 0 && cost_of(n) > cost && steps < 8 {
-                n -= 1;
-                steps += 1;
-            }
-            while n < hi_t && cost_of(n + 1) <= cost && steps < 8 {
-                n += 1;
-                steps += 1;
-            }
-            let settled = cost_of(n) <= cost && (n == hi_t || cost_of(n + 1) > cost);
-            if !settled {
-                // 门槛跳变区间等情况：二分兜底
-                let (mut lo, mut hi) = (0i64, hi_t);
-                while lo < hi {
-                    let m = lo + (hi - lo + 1) / 2;
-                    if cost_of(m) <= cost {
-                        lo = m;
-                    } else {
-                        hi = m - 1;
-                    }
-                }
-                n = lo;
-            }
-            eval_primary(cfg, from_ticks(cfg, n)).expect("该口径下恒有效")
-        }
-    };
-    let mut u = cost - b.total_cost;
-    u.rescale(cfg.rounding.scale);
-    b.unallocated = u;
-    Ok(b)
+    Ok(eval_cost(cfg, cost))
 }
 
 #[cfg(test)]
@@ -392,7 +326,6 @@ pub(crate) mod tests {
     fn at_net(net: Decimal) -> Breakdown {
         let b = forward(&cfg(), cost_for_net(net)).unwrap();
         assert_eq!(b.net_revenue, net, "构造的总成本应对应指定收入");
-        assert_eq!(b.unallocated, dec!(0));
         b
     }
 
@@ -408,7 +341,6 @@ pub(crate) mod tests {
         assert_eq!(b.iit.rate, dec!(0.2));
         assert_eq!(b.iit.tax, dec!(1600.00));
         assert_eq!(b.take_home, dec!(8400.00), "附加税由企业承担，不从到手扣");
-        assert_eq!(b.unallocated, dec!(0));
     }
 
     #[test]
@@ -433,40 +365,89 @@ pub(crate) mod tests {
         assert!(!forward(&c, dec!(1010.31)).unwrap().vat_exempt);
     }
 
+    fn split(c: &Config, cost: Decimal) -> (Decimal, Decimal, Decimal, bool) {
+        let b = forward(c, cost).unwrap();
+        assert_eq!(b.net_revenue + b.vat + b.surcharge_total, cost);
+        (b.net_revenue, b.vat, b.surcharge_total, b.vat_exempt)
+    }
+
     #[test]
-    fn threshold_gap_costs_fall_back() {
-        // 总成本 1000.00 ~ 1010.29 没有对应的不含税收入，按 999.99 计算并记录未分配差额
-        for (cost, un) in [
-            (dec!(1000.00), dec!(0.01)),
-            (dec!(1005), dec!(5.01)),
-            (dec!(1010.29), dec!(10.30)),
-        ] {
-            let b = forward(&cfg(), cost).unwrap();
-            assert_eq!(b.total_cost, dec!(999.99));
-            assert_eq!(b.unallocated, un);
-            assert_eq!(b.total_cost + b.unallocated, cost);
-        }
+    fn threshold_gap_default_levy() {
+        // 跳变段 1000.00 ~ 1010.29 默认按征收处理，倒挤收入略低于 1000
+        let c = cfg();
         assert_eq!(
-            forward(&cfg(), dec!(1010.31)).unwrap().net_revenue,
-            dec!(1000.01)
+            split(&c, dec!(999.99)),
+            (dec!(999.99), dec!(0), dec!(0), true)
+        );
+        assert_eq!(
+            split(&c, dec!(1000.00)),
+            (dec!(989.80), dec!(9.90), dec!(0.30), false)
+        );
+        assert_eq!(
+            split(&c, dec!(1005.00)),
+            (dec!(994.75), dec!(9.95), dec!(0.30), false)
+        );
+        assert_eq!(
+            split(&c, dec!(1010.29)),
+            (dec!(999.99), dec!(10.00), dec!(0.30), false)
+        );
+        assert_eq!(
+            split(&c, dec!(1010.30)),
+            (dec!(1000.00), dec!(10.00), dec!(0.30), false)
+        );
+    }
+
+    #[test]
+    fn threshold_gap_exempt_option() {
+        let mut c = cfg();
+        c.vat.threshold_gap = ThresholdGap::Exempt;
+        assert_eq!(
+            split(&c, dec!(1000.00)),
+            (dec!(1000.00), dec!(0), dec!(0), true)
+        );
+        assert_eq!(
+            split(&c, dec!(1005.00)),
+            (dec!(1005.00), dec!(0), dec!(0), true)
+        );
+        assert_eq!(
+            split(&c, dec!(1010.29)),
+            (dec!(1010.29), dec!(0), dec!(0), true)
+        );
+        assert_eq!(
+            split(&c, dec!(1010.30)),
+            (dec!(1000.00), dec!(10.00), dec!(0.30), false)
         );
     }
 
     #[test]
     fn cost_identity_and_vat_formula() {
+        let mut inconsistent = 0;
         for c in 0..300_000i64 {
             let cost = Decimal::new(c * 7 + 3, 2);
             let b = forward(&cfg(), cost).unwrap();
-            assert_eq!(
-                b.net_revenue + b.vat + b.surcharge_total + b.unallocated,
-                cost
-            );
-            if !b.vat_exempt {
-                assert_eq!(b.vat, r2(b.net_revenue * dec!(0.01)));
-                assert_eq!(b.surcharge_total, r2(b.vat * dec!(0.03)));
-                assert!(b.unallocated < dec!(0.03), "门槛以外跳档不超过 2 分");
-            }
+            assert_eq!(b.net_revenue + b.vat + b.surcharge_total, cost);
             assert_eq!(b.take_home, b.net_revenue - b.iit.tax);
+            if !b.vat_exempt {
+                let v = r2(b.net_revenue * dec!(0.01));
+                assert!((v - b.vat).abs() <= dec!(0.01));
+                if v != b.vat {
+                    inconsistent += 1;
+                }
+                assert_eq!(b.surcharge_total, r2(b.vat * dec!(0.03)));
+            }
+        }
+        // 逐分舍入导致的不自洽只占极少数
+        assert!(inconsistent < 300_000 / 50, "不自洽 {inconsistent} 个");
+    }
+
+    #[test]
+    fn consistent_search_off() {
+        let mut c = cfg();
+        c.cost.consistent_search = false;
+        for cents in 100_000..200_000i64 {
+            let cost = Decimal::new(cents, 2);
+            let b = forward(&c, cost).unwrap();
+            assert_eq!(b.net_revenue + b.vat + b.surcharge_total, cost);
         }
     }
 
@@ -570,19 +551,22 @@ pub(crate) mod tests {
 
     #[test]
     fn legacy_net_threshold_gap() {
-        // 价税合计口径 + 门槛按不含税收入：总成本 1000.00 ~ 1009.99 价税分离后收入 < 1000 → 无效
+        // 价税合计口径 + 门槛按不含税收入：总成本 1000.00 ~ 1009.99 价税分离后收入 < 1000
         let mut c = legacy();
         c.vat.threshold_enabled = true;
         c.vat.threshold = dec!(1000);
         c.vat.threshold_basis = ThresholdBasis::NetRevenue;
         let b = forward(&c, dec!(1005)).unwrap();
-        assert_eq!(b.total_cost, dec!(999.99));
-        assert_eq!(b.unallocated, dec!(5.01));
-        assert_eq!(forward(&c, dec!(1009.99)).unwrap().total_cost, dec!(999.99));
+        assert!(!b.vat_exempt, "默认按征收处理");
+        assert_eq!(b.net_revenue, dec!(995.05));
+        assert_eq!(b.vat, dec!(9.95));
+        c.vat.threshold_gap = ThresholdGap::Exempt;
+        let b = forward(&c, dec!(1005)).unwrap();
+        assert!(b.vat_exempt);
+        assert_eq!(b.net_revenue, dec!(1005.00));
         let b = forward(&c, dec!(1010.00)).unwrap();
         assert!(!b.vat_exempt);
         assert_eq!(b.net_revenue, dec!(1000.00));
-        assert_eq!(b.unallocated, dec!(0));
     }
 
     #[test]
