@@ -7,7 +7,15 @@
 - **批量反算**：读取 xlsx/xls/ods/csv 首行标题为“到手金额”的列，在右侧追加反算结果列并输出新文件；
 - **两种使用方式**：命令行 `labor-fee`、简易 Web 页面 `labor-fee-web`（单笔计算 + 上传/下载）。
 
-金额全部使用 `rust_decimal` 十进制运算，不使用浮点数。所有税务口径与舍入规则均可配置，默认口径及待确认事项见 [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md)。
+金额全部使用 `rust_decimal` 十进制运算，不使用浮点数。所有税务口径与舍入规则均可配置，默认口径、个税规则出处及待确认事项见 [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md)。
+
+## 默认口径（用户已确认）
+
+- 企业总成本 = 不含税收入 + 增值税 + 附加税，三项都由企业承担；
+- 增值税 = 不含税收入 × 1%，附加税 = 增值税额 × 3%；
+- **征收门槛**：不含税收入 ≥ 1000 元（含本数）才征收增值税和附加税，低于 1000 元两者都为 0（这是业务口径，不是法定起征点；个税不受此门槛影响）；
+- 个税：居民个人劳务报酬预扣预缴（国家税务总局公告 2018 年第 61 号），每次收入 ≤ 4000 减除 800、> 4000 减除 20%，预扣率表二 20%/0、30%/2000、40%/7000；
+- 实际到手 = 不含税收入 − 代扣个税。
 
 ## 目录结构
 
@@ -33,18 +41,18 @@ cargo build --release
 ## 用法
 
 ```bash
-# 正算：企业总成本 10100 元
-labor-fee forward 10100
+# 正算：企业总成本 10103 元
+labor-fee forward 10103
 
-# 反算：希望实际到手 8397 元
-labor-fee reverse 8397
+# 反算：希望实际到手 8400 元
+labor-fee reverse 8400
 
 # JSON 输出
-labor-fee reverse 8397 --json
+labor-fee reverse 8400 --json
 
 # 使用自定义口径
 labor-fee config > my.toml        # 导出当前配置后修改
-labor-fee -c my.toml forward 10100
+labor-fee -c my.toml forward 10103
 ```
 
 # 批量反算（输出 sample_反算结果.csv；xlsx/xls/ods 输入则输出 xlsx）
@@ -55,7 +63,7 @@ labor-fee batch 名单.xlsx -o 结果.xlsx --column 到手金额
 单笔正算示例输出（默认口径）：
 
 ```
-企业总成本                10100.00
+企业总成本                10103.00
 不含税开票收入            10000.00
 增值税                      100.00
   附加税                         3.00  （税率 3%）
@@ -67,8 +75,17 @@ labor-fee batch 名单.xlsx -o 结果.xlsx --column 到手金额
 预扣率                         20%
 速算扣除数                    0.00
 代扣个税                   1600.00
-实际到手金额               8397.00
+实际到手金额               8400.00
 ```
+
+门槛附近（默认口径）：
+
+| 实际到手 | 不含税收入 | 增值税 | 附加税 | 企业总成本 | 代扣个税 |
+|---|---|---|---|---|---|
+| 959.99 | 999.99 | 0.00 | 0.00 | 999.99 | 40.00 |
+| 960.00 | 1000.00 | 10.00 | 0.30 | 1010.30 | 40.00 |
+
+总成本在门槛处从 999.99 跳到 1010.30。正算输入 1000.00～1010.29 这样不对应任何不含税收入的总成本时，按不超过它的最大有效总成本（999.99）计算，并输出“未分配差额”。
 
 ## 批量反算说明
 
@@ -87,8 +104,8 @@ labor-fee-web --listen 127.0.0.1:8080 [-c my.toml] [--max-upload-mb 20]
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/api/forward?amount=10100` | 正算，返回 JSON |
-| GET | `/api/reverse?amount=8397` | 反算，返回 JSON（含 `exact`、`diff`、`other_solutions`） |
+| GET | `/api/forward?amount=10103` | 正算，返回 JSON |
+| GET | `/api/reverse?amount=8400` | 反算，返回 JSON（含 `exact`、`diff`、`other_solutions`） |
 | POST | `/api/batch` | multipart 字段 `file`（必填）、`column`（可选），返回结果文件；响应头 `x-batch-summary` 为统计 |
 | GET | `/api/config` | 当前配置（TOML） |
 
@@ -101,11 +118,11 @@ labor-fee-web --listen 127.0.0.1:8080 [-c my.toml] [--max-upload-mb 20]
 | 段 | 关键项 | 含义 |
 |---|---|---|
 | `[rounding]` | `scale`、`mode`、`surcharge` | 小数位；舍入方式 `half_up`/`half_even`/`down`/`up`；附加税逐项或合计舍入 |
-| `[cost]` | `basis` | 企业总成本口径：`vat_inclusive`（价税合计）或 `vat_and_surcharge_inclusive` |
-| `[vat]` | `rate`、`threshold_enabled`、`threshold`、`threshold_inclusive` | 征收率与起征点 |
+| `[cost]` | `basis` | 企业总成本口径：`vat_and_surcharge_inclusive`（含增值税和附加税，默认）或 `vat_inclusive`（价税合计） |
+| `[vat]` | `rate`、`threshold_enabled`、`threshold`、`threshold_basis`、`levy_at_threshold` | 征收率；征收门槛金额、判断基数（不含税收入/总成本）、等于门槛时是否征收 |
 | `[surcharge]` | `base`、`halve`、`[[surcharge.items]]` | 计税基数（增值税额/不含税收入）、是否减半、税目列表 |
 | `[iit]` | `income_base`、`deduct_surcharge`、减除费用参数、`[[iit.brackets]]` | 个税收入额基数与预扣率表 |
-| `[take_home]` | `deduct_surcharge` | 到手是否扣附加税 |
+| `[take_home]` | `deduct_surcharge` | 到手是否扣附加税（默认否，由企业承担） |
 | `[reverse]` | `prefer`、`search_window`、`max_cost` | 多解取值偏好、校准扫描窗口、搜索上限 |
 
 分项附加税示例（城建 7% + 教育 3% + 地方教育 2%，减半）：
@@ -135,10 +152,10 @@ use labor_fee_core::{forward, Config, Reverser};
 use rust_decimal_macros::dec;
 
 let cfg = Config::default();
-let b = forward(&cfg, dec!(10100))?;
+let b = forward(&cfg, dec!(10103))?;
 let rev = Reverser::new(&cfg)?;          // 批量反算时复用
-let r = rev.reverse(dec!(8397))?;
-assert!(r.exact && r.breakdown.take_home == dec!(8397));
+let r = rev.reverse(dec!(8400))?;
+assert!(r.exact && r.breakdown.take_home == dec!(8400));
 ```
 
 ## 测试
@@ -149,8 +166,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-测试包括：各分段边界（收入 800/4000、应纳税所得额 20000/50000、起征点）单元测试；proptest 性质测试（正算单调性、正算→反算往返、目标→反算→正算往返）；
-0.01~200,000 元每隔 0.37 元的全量反算遍历；7 种口径组合下总成本 0~70,000 元逐分暴力表对比（验证反算取到的是最小总成本、不可达判断正确）；
+测试包括：各分段边界（收入 800/1000/4000、应纳税所得额 20000/50000、征收门槛）单元测试；proptest 性质测试（正算单调性、正算→反算往返、目标→反算→正算往返、默认口径到手 = 收入 − 个税）；
+0.01~200,000 元每隔 0.37 元的全量反算遍历；门槛前后到手 900~1100、总成本 990~1030 逐分测试；8 种口径组合下逐分暴力表对比（默认口径总成本 0~70,000，其它 0~30,000；验证反算取到的是最小总成本、不可达判断正确）；
 批量 xlsx/csv（UTF-8/GBK/BOM）读写往返；Web 接口测试。
 
 ## 路线图

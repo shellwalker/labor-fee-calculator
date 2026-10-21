@@ -13,7 +13,7 @@ fn make_xlsx() -> Vec<u8> {
     ws.write_string(0, 1, "身份证号").unwrap();
     ws.write_string(0, 2, "到手金额").unwrap();
     let data: [(&str, Option<f64>, Option<&str>); 6] = [
-        ("张三", Some(8397.0), None),
+        ("张三", Some(8400.0), None),
         ("李四", Some(3360.0), None),
         ("王五", None, Some("12,345.67")),
         ("赵六", None, None),
@@ -63,7 +63,7 @@ fn xlsx_roundtrip() {
     // 身份证号保持文本
     assert_eq!(rows[1][1], Data::String("110101199001011234".into()));
     for (r, expect) in [
-        (1, dec!(8397)),
+        (1, dec!(8400)),
         (2, dec!(3360)),
         (3, dec!(12345.67)),
         (6, dec!(0.30)),
@@ -73,7 +73,7 @@ fn xlsx_roundtrip() {
         assert_eq!(money(&rows[r][col("正算到手（校验）")]), expect);
         assert_eq!(rows[r][col("校准状态")], Data::String("精确".into()));
     }
-    assert_eq!(money(&rows[1][col("企业总成本")]), dec!(10100));
+    assert_eq!(money(&rows[1][col("企业总成本")]), dec!(10103));
     assert!(rows[5][col("校准状态")].to_string().starts_with("错误"));
     assert_eq!(rows[4][col("企业总成本")], Data::Empty);
 }
@@ -81,7 +81,7 @@ fn xlsx_roundtrip() {
 #[test]
 fn csv_utf8_and_gbk() {
     let cfg = Config::default();
-    let text = "序号,到手金额,备注\n1,8397,a\n2,\"1,000.00\",b\n3,,c\n";
+    let text = "序号,到手金额,备注\n1,8400,a\n2,\"1,000.00\",b\n3,,c\n";
     for bytes in [
         text.as_bytes().to_vec(),
         encoding_rs::GBK.encode(text).0.into_owned(),
@@ -97,7 +97,7 @@ fn csv_utf8_and_gbk() {
         assert_eq!(&h[0], "序号");
         assert_eq!(&h[3], "企业总成本");
         let recs: Vec<_> = rdr.records().map(|r| r.unwrap()).collect();
-        assert_eq!(&recs[0][3], "10100.00");
+        assert_eq!(&recs[0][3], "10103.00");
         let ci = h.iter().position(|x| x == "预扣率").unwrap();
         assert_eq!(&recs[0][ci], "20%");
         let cost = Decimal::from_str(&recs[1][3]).unwrap();

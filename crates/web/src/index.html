@@ -48,7 +48,7 @@ function row(k, v) { return `<tr><td>${k}</td><td class="v">${v}</td></tr>`; }
 function render(b) {
   let h = '<table>';
   h += row('企业总成本', b.total_cost);
-  h += row('不含税开票收入', b.net_revenue + (b.vat_exempt ? '（未达起征点免税）' : ''));
+  h += row('不含税开票收入', b.net_revenue + (b.vat_exempt ? '（未达征收门槛，不征增值税及附加税）' : ''));
   h += row('增值税', b.vat);
   for (const s of b.surcharges) h += row(`${s.name}（${fmtPct(s.rate)}）`, s.amount);
   h += row('附加税合计', b.surcharge_total);
@@ -59,7 +59,9 @@ function render(b) {
   h += row('速算扣除数', b.iit.quick_deduction);
   h += row('代扣个税', b.iit.tax);
   h += row('<b>实际到手金额</b>', `<b>${b.take_home}</b>`);
-  return h + '</table>';
+  h += '</table>';
+  if (Number(b.unallocated) !== 0) h += `<p class="warn">输入总成本无法恰好分解，已按最大有效总成本 ${b.total_cost} 计算，未分配差额 ${b.unallocated}</p>`;
+  return h;
 }
 async function calc(kind) {
   const el = document.getElementById('single');

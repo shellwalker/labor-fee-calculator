@@ -230,17 +230,17 @@ mod tests {
     async fn forward_and_reverse_api() {
         let resp = router()
             .oneshot(
-                Request::get("/api/forward?amount=10100")
+                Request::get("/api/forward?amount=10103")
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(body_json(resp).await["take_home"], "8397.00");
+        assert_eq!(body_json(resp).await["take_home"], "8400.00");
         let resp = router()
             .oneshot(
-                Request::get("/api/reverse?amount=8397")
+                Request::get("/api/reverse?amount=8400")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -248,7 +248,7 @@ mod tests {
             .unwrap();
         let v = body_json(resp).await;
         assert_eq!(v["exact"], true);
-        assert_eq!(v["breakdown"]["total_cost"], "10100.00");
+        assert_eq!(v["breakdown"]["total_cost"], "10103.00");
         let resp = router()
             .oneshot(
                 Request::get("/api/reverse?amount=-1")
@@ -264,7 +264,7 @@ mod tests {
     async fn batch_upload_csv() {
         let boundary = "XBOUNDARY";
         let body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"名单.csv\"\r\nContent-Type: text/csv\r\n\r\n到手金额\n8397\n\r\n--{boundary}--\r\n"
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"名单.csv\"\r\nContent-Type: text/csv\r\n\r\n到手金额\n8400\n\r\n--{boundary}--\r\n"
         );
         let req = Request::post("/api/batch")
             .header(
@@ -286,7 +286,7 @@ mod tests {
         assert!(cd.contains("filename*=UTF-8''"));
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         let s = String::from_utf8(b.to_vec()).unwrap();
-        assert!(s.contains("10100.00"));
+        assert!(s.contains("10103.00"));
     }
 
     #[tokio::test]

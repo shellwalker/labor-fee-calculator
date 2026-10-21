@@ -11,37 +11,40 @@ mode = "half_up"
 surcharge = "per_item"
 
 [cost]
-# 企业总成本口径（假设 A，需确认）：
-#   vat_inclusive                = 总成本 = 价税合计 = 不含税收入 + 增值税
-#   vat_and_surcharge_inclusive  = 总成本 = 不含税收入 + 增值税 + 附加税
-basis = "vat_inclusive"
+# 企业总成本口径（用户已确认：增值税、附加税均由企业承担）：
+#   vat_and_surcharge_inclusive  = 总成本 = 不含税收入 + 增值税 + 附加税（默认）
+#   vat_inclusive                = 总成本 = 价税合计 = 不含税收入 + 增值税（价税分离）
+basis = "vat_and_surcharge_inclusive"
 
 [vat]
-# 增值税征收率（需确认：3% 或减按 1%）
+# 增值税 = 不含税收入 × rate（用户已确认 1%）
 rate = "0.01"
-# 起征点（需确认）：默认不启用
-threshold_enabled = false
-# 起征点金额（按次或按月由使用方决定，本工具按“每次计算的销售额”判断）
-threshold = "500"
-# false：销售额 < 起征点 免征（“未达到起征点”）；true：销售额 ≤ 起征点 免征
-threshold_inclusive = false
+# 增值税/附加税征收门槛（用户指定口径，不是增值税法定起征点）：
+# 不含税收入 ≥ 1000 才征收增值税和附加税，低于 1000 两者都为 0。个税不受此门槛影响。
+threshold_enabled = true
+threshold = "1000"
+# 门槛判断基数：net_revenue（不含税收入，默认）| total_cost（企业总成本）
+threshold_basis = "net_revenue"
+# 恰好等于门槛时是否征收：true = “≥ 门槛征收”（含本数，默认）；false = “> 门槛才征收”
+levy_at_threshold = true
 
 [surcharge]
-# 附加税计税基数（假设 B，需确认）：vat（增值税额，法定口径）| net_revenue（不含税开票收入）
+# 附加税计税基数（用户已确认：按增值税额）：vat（增值税额）| net_revenue（不含税开票收入）
 base = "vat"
 # 是否对所有附加税目减半征收（“六税两费”减征，需确认）
 halve = false
 
-# 附加税目列表。默认按统筹方要求用一个合计税率 3%（需确认）。
+# 附加税目列表。用户已确认：附加税 = 增值税额 × 3%（一个合计税率）。
 # 如需分项，可改为：城市维护建设税 0.07/0.05/0.01、教育费附加 0.03、地方教育附加 0.02。
 [[surcharge.items]]
 name = "附加税"
 rate = "0.03"
 
 [iit]
-# 个税收入额基数（假设 C，需确认）：net_revenue（不含税收入）| total_cost（企业总成本）
+# 劳务报酬个税（居民个人预扣预缴，依据国家税务总局公告 2018 年第 61 号第八条及预扣率表二）
+# 个税收入基数：net_revenue（不含税收入，默认）| total_cost（企业总成本）
 income_base = "net_revenue"
-# 计算个税收入时是否先扣除附加税（需确认）
+# 计算个税收入时是否先扣除附加税（附加税由企业承担，默认不扣）
 deduct_surcharge = false
 # 劳务报酬预扣预缴：每次收入 ≤ 4000 元减除费用 800 元；> 4000 元减除 20%
 fixed_deduction_limit = "4000"
@@ -64,13 +67,13 @@ rate = "0.4"
 quick_deduction = "7000"
 
 [take_home]
-# 实际到手 = 不含税收入 − 附加税（若 deduct_surcharge）− 代扣个税（假设 D，需确认）
-deduct_surcharge = true
+# 实际到手 = 不含税收入 − 代扣个税；附加税由企业承担，不从到手扣（用户已确认）
+deduct_surcharge = false
 
 [reverse]
 # 多个企业总成本都能精确得到同一到手金额时的取值：min_cost（取最小总成本）| max_cost
 prefer = "min_cost"
 # 二分定位后在其前后各扫描多少个最小单位（分）做校准
 search_window = 20
-# 反算搜索的企业总成本上限
+# 反算搜索上限（总成本含全部税费口径下为不含税收入的上限）
 max_cost = "10000000000"

@@ -10,9 +10,11 @@
 //! 4. 有精确解则按 `reverse.prefer` 取最小（默认）或最大总成本，其它区间的精确解列入 `other_solutions`；
 //!    无精确解则取正算到手与目标差额绝对值最小者（同差额取较小总成本），标记“不可精确达到”并给出差额。
 
-use crate::config::{Config, Prefer};
+use crate::config::{Config, CostBasis, Prefer, ThresholdBasis};
 use crate::error::CalcError;
-use crate::forward::{forward_unchecked, validate_amount, Breakdown};
+use crate::forward::{
+    eval_primary, from_ticks, last_unlevied_tick, to_ticks, validate_amount, Breakdown,
+};
 use rust_decimal::Decimal;
 use serde::Serialize;
 
@@ -48,25 +50,25 @@ impl ReverseOutcome {
     }
 }
 
+/// 在“主变量”（见 `forward::eval_primary`：价税合计口径为总成本，含全部税费口径为不含税收入）
+/// 的分位网格上搜索。两种口径下总成本都随主变量单调递增，因此“最小主变量”即“最小总成本”。
 struct Ctx<'a> {
     cfg: &'a Config,
-    scale: u32,
 }
 
 impl Ctx<'_> {
     fn dec(&self, ticks: i64) -> Decimal {
-        Decimal::new(ticks, self.scale)
+        from_ticks(self.cfg, ticks)
     }
-    fn ticks(&self, d: Decimal) -> Result<i64, CalcError> {
-        let m = d * Decimal::from(10i64.pow(self.scale));
-        i64::try_from(m.trunc()).map_err(|_| CalcError::Overflow)
+    fn eval(&self, ticks: i64) -> Breakdown {
+        eval_primary(self.cfg, self.dec(ticks)).expect("搜索区间内主变量有效")
     }
     fn th(&self, ticks: i64) -> Decimal {
-        forward_unchecked(self.cfg, self.dec(ticks)).take_home
+        self.eval(ticks).take_home
     }
-    /// 分段键：(是否应税, 是否按比例减除费用, 预扣率档次)。随总成本按字典序单调不减。
+    /// 分段键：(是否征收增值税, 是否按比例减除费用, 预扣率档次)。随主变量按字典序单调不减。
     fn key(&self, ticks: i64) -> (bool, bool, usize) {
-        let b = forward_unchecked(self.cfg, self.dec(ticks));
+        let b = self.eval(ticks);
         let iit = &self.cfg.iit;
         let pct = b.iit.income > iit.fixed_deduction_limit;
         let idx = iit
@@ -129,7 +131,7 @@ fn search_region(ctx: &Ctx, lo: i64, hi: i64, target: Decimal, window: i64) -> R
 #[derive(Debug, Clone)]
 pub struct Reverser {
     cfg: Config,
-    /// 分段区间（以最小金额单位计的闭区间）。
+    /// 分段区间（主变量，以最小金额单位计的闭区间）。
     regions: Vec<(i64, i64)>,
     max_ticks: i64,
 }
@@ -138,31 +140,59 @@ impl Reverser {
     /// 校验配置并计算分段区间。
     pub fn new(cfg: &Config) -> Result<Self, CalcError> {
         cfg.validate()?;
-        let ctx = Ctx {
-            cfg,
-            scale: cfg.rounding.scale,
-        };
-        let max_ticks = ctx.ticks(cfg.round(cfg.reverse.max_cost))?;
-        let mut regions = Vec::new();
-        let mut lo = 0i64;
-        loop {
-            let k = ctx.key(lo);
-            if ctx.key(max_ticks) <= k {
-                regions.push((lo, max_ticks));
-                break;
+        let ctx = Ctx { cfg };
+        let max_ticks = to_ticks(cfg, cfg.round(cfg.reverse.max_cost))?;
+
+        // 1. 主变量的有效区间。价税合计口径 + 门槛按不含税收入判断时，门槛附近一段总成本无效。
+        let mut valid: Vec<(i64, i64)> = Vec::new();
+        let gap = cfg.cost.basis == CostBasis::VatInclusive
+            && cfg.vat.threshold_enabled
+            && cfg.vat.threshold_basis == ThresholdBasis::NetRevenue;
+        if gap {
+            let e = last_unlevied_tick(cfg).min(max_ticks);
+            if e >= 0 {
+                valid.push((0, e));
             }
-            // 二分找第一个分段键大于 k 的位置
-            let (mut l, mut h) = (lo, max_ticks);
-            while h - l > 1 {
-                let m = l + (h - l) / 2;
-                if ctx.key(m) > k {
-                    h = m;
-                } else {
-                    l = m;
+            // 第一个“征收”的总成本
+            let ok = |t: i64| eval_primary(cfg, from_ticks(cfg, t)).is_some_and(|b| !b.vat_exempt);
+            let (mut l, mut h) = (e.max(-1), max_ticks);
+            if ok(h) {
+                while h - l > 1 {
+                    let m = l + (h - l) / 2;
+                    if ok(m) {
+                        h = m;
+                    } else {
+                        l = m;
+                    }
                 }
+                valid.push((h, max_ticks));
             }
-            regions.push((lo, h - 1));
-            lo = h;
+        } else {
+            valid.push((0, max_ticks));
+        }
+
+        // 2. 每个有效区间内按分段键再切分
+        let mut regions = Vec::new();
+        for (vlo, vhi) in valid {
+            let mut lo = vlo;
+            loop {
+                let k = ctx.key(lo);
+                if ctx.key(vhi) <= k {
+                    regions.push((lo, vhi));
+                    break;
+                }
+                let (mut l, mut h) = (lo, vhi);
+                while h - l > 1 {
+                    let m = l + (h - l) / 2;
+                    if ctx.key(m) > k {
+                        h = m;
+                    } else {
+                        l = m;
+                    }
+                }
+                regions.push((lo, h - 1));
+                lo = h;
+            }
         }
         Ok(Reverser {
             cfg: cfg.clone(),
@@ -176,11 +206,12 @@ impl Reverser {
         &self.cfg
     }
 
-    /// 分段区间的起点（企业总成本），用于诊断与测试。
+    /// 各分段区间起点对应的企业总成本，用于诊断与测试。
     pub fn segment_starts(&self) -> Vec<Decimal> {
+        let ctx = Ctx { cfg: &self.cfg };
         self.regions
             .iter()
-            .map(|r| Decimal::new(r.0, self.cfg.rounding.scale))
+            .map(|r| ctx.eval(r.0).total_cost)
             .collect()
     }
 
@@ -188,15 +219,13 @@ impl Reverser {
     pub fn reverse(&self, take_home: Decimal) -> Result<ReverseOutcome, CalcError> {
         let cfg = &self.cfg;
         let target = validate_amount(cfg, take_home)?;
-        let ctx = Ctx {
-            cfg,
-            scale: cfg.rounding.scale,
-        };
-        let max_take_home = ctx.th(self.max_ticks);
+        let ctx = Ctx { cfg };
+        let last = self.regions.last().map(|r| r.1).unwrap_or(self.max_ticks);
+        let max_take_home = ctx.th(last);
         if target > max_take_home {
             return Err(CalcError::TargetTooLarge {
                 target,
-                max_cost: ctx.dec(self.max_ticks),
+                max_cost: ctx.eval(last).total_cost,
                 max_take_home,
             });
         }
@@ -208,6 +237,7 @@ impl Reverser {
             .collect();
 
         let exact: Vec<&RegionResult> = results.iter().filter(|r| r.exact_min.is_some()).collect();
+        let cost_at = |t: i64| ctx.eval(t).total_cost;
         if !exact.is_empty() {
             let pick = |r: &RegionResult| match cfg.reverse.prefer {
                 Prefer::MinCost => r.exact_min.unwrap_or_default(),
@@ -237,17 +267,17 @@ impl Reverser {
                     rmin = rmin.min(a);
                     rmax = rmax.max(b);
                 } else {
-                    others.push(ctx.dec(pick(r)));
+                    others.push(cost_at(pick(r)));
                 }
             }
-            let breakdown = forward_unchecked(cfg, ctx.dec(ticks));
+            let breakdown = ctx.eval(ticks);
             debug_assert_eq!(breakdown.take_home, target);
             return Ok(ReverseOutcome {
                 target,
                 breakdown,
                 exact: true,
-                diff: Decimal::ZERO,
-                exact_cost_range: Some((ctx.dec(rmin), ctx.dec(rmax))),
+                diff: Decimal::new(0, cfg.rounding.scale),
+                exact_cost_range: Some((cost_at(rmin), cost_at(rmax))),
                 other_solutions: others,
             });
         }
@@ -261,7 +291,7 @@ impl Reverser {
         diff.rescale(cfg.rounding.scale);
         Ok(ReverseOutcome {
             target,
-            breakdown: forward_unchecked(cfg, ctx.dec(ticks)),
+            breakdown: ctx.eval(ticks),
             exact: false,
             diff,
             exact_cost_range: None,
@@ -279,20 +309,34 @@ pub fn reverse(cfg: &Config, take_home: Decimal) -> Result<ReverseOutcome, CalcE
 mod tests {
     use super::*;
     use crate::forward;
+    use crate::forward::tests::legacy;
     use rust_decimal_macros::dec;
 
     #[test]
-    fn reverse_simple() {
+    fn reverse_default() {
         let cfg = Config::default();
-        let r = reverse(&cfg, dec!(8397)).unwrap();
+        let r = reverse(&cfg, dec!(8400)).unwrap();
         assert!(r.exact);
+        assert_eq!(r.breakdown.total_cost, dec!(10103.00));
+        assert_eq!(r.breakdown.net_revenue, dec!(10000.00));
         assert_eq!(
             forward(&cfg, r.breakdown.total_cost).unwrap().take_home,
-            dec!(8397)
+            dec!(8400)
         );
-        // 取最小总成本
-        let below = r.breakdown.total_cost - dec!(0.01);
-        assert_ne!(forward(&cfg, below).unwrap().take_home, dec!(8397));
+    }
+
+    #[test]
+    fn reverse_around_threshold() {
+        let cfg = Config::default();
+        let rev = Reverser::new(&cfg).unwrap();
+        let a = rev.reverse(dec!(959.99)).unwrap();
+        assert!(a.exact && a.breakdown.vat_exempt);
+        assert_eq!(a.breakdown.total_cost, dec!(999.99));
+        let b = rev.reverse(dec!(960.00)).unwrap();
+        assert!(b.exact && !b.breakdown.vat_exempt);
+        assert_eq!(b.breakdown.net_revenue, dec!(1000.00));
+        assert_eq!(b.breakdown.total_cost, dec!(1010.30));
+        assert!(b.other_solutions.is_empty());
     }
 
     #[test]
@@ -322,11 +366,24 @@ mod tests {
     }
 
     #[test]
-    fn threshold_jump_multi_solution() {
-        let mut cfg = Config::default();
+    fn legacy_simple_min_cost() {
+        let cfg = legacy();
+        let r = reverse(&cfg, dec!(8397)).unwrap();
+        assert!(r.exact);
+        assert_eq!(
+            forward(&cfg, r.breakdown.total_cost).unwrap().take_home,
+            dec!(8397)
+        );
+        let below = r.breakdown.total_cost - dec!(0.01);
+        assert_ne!(forward(&cfg, below).unwrap().take_home, dec!(8397));
+    }
+
+    #[test]
+    fn legacy_cost_threshold_multi_solution() {
+        let mut cfg = legacy();
         cfg.vat.threshold_enabled = true;
         cfg.vat.threshold = dec!(500);
-        // 免税区最大到手 499.99；应税区从 494.90 起。两区间重叠 => 多解；
+        // 不征收区间到手最高 499.99；征收区间从 494.90 起，两区间重叠 => 多解
         let r = reverse(&cfg, dec!(495.00)).unwrap();
         assert!(r.exact);
         assert_eq!(r.breakdown.total_cost, dec!(495.00));
@@ -335,16 +392,6 @@ mod tests {
             forward(&cfg, r.other_solutions[0]).unwrap().take_home,
             dec!(495.00)
         );
-        // 高征收率 + 低起征点
-        let mut c2 = Config::default();
-        c2.vat.threshold_enabled = true;
-        c2.vat.threshold = dec!(1);
-        c2.vat.rate = dec!(0.5);
-        c2.surcharge.items[0].rate = dec!(0);
-        // 免税区 [0, 0.99] 到手 0..0.99；应税区从 1.00 → 不含税 0.67 起
-        let r = reverse(&c2, dec!(0.99)).unwrap();
-        assert!(r.exact);
-        assert_eq!(r.breakdown.total_cost, dec!(0.99));
     }
 
     #[test]
@@ -378,7 +425,16 @@ mod tests {
     #[test]
     fn segments_default() {
         let rev = Reverser::new(&Config::default()).unwrap();
-        // 0 起；收入超过 4000、应纳税所得额超过 20000、50000 处分段
-        assert_eq!(rev.segment_starts().len(), 4);
+        // 0 起；收入达到 1000（开始征收）、超过 4000、应纳税所得额超过 20000、50000 处分段
+        assert_eq!(
+            rev.segment_starts(),
+            vec![
+                dec!(0.00),
+                dec!(1010.30),
+                dec!(4041.21),
+                dec!(25257.51),
+                dec!(63143.76)
+            ]
+        );
     }
 }

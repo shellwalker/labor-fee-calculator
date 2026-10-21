@@ -13,7 +13,7 @@ mod reverse;
 pub use config::{
     Bracket, Config, CostBasis, CostConfig, IitConfig, IncomeBase, Prefer, ReverseConfig,
     RoundingConfig, RoundingMode, SurchargeBase, SurchargeConfig, SurchargeItem, SurchargeRounding,
-    TakeHomeConfig, VatConfig, DEFAULT_CONFIG_TOML,
+    TakeHomeConfig, ThresholdBasis, VatConfig, DEFAULT_CONFIG_TOML,
 };
 pub use error::CalcError;
 pub use forward::{forward, Breakdown, IitBreakdown, SurchargeLine};

@@ -242,7 +242,7 @@ fn result_values(cfg: &Config, r: &ReverseOutcome) -> Vec<Out> {
     ]);
     let mut notes = Vec::new();
     if b.vat_exempt {
-        notes.push("未达起征点，免增值税及附加税".to_string());
+        notes.push("未达征收门槛，不征增值税及附加税".to_string());
     }
     if !r.other_solutions.is_empty() {
         let s: Vec<String> = r.other_solutions.iter().map(|d| d.to_string()).collect();

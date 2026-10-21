@@ -64,13 +64,29 @@ pub struct CostConfig {
     pub basis: CostBasis,
 }
 
+/// 增值税/附加税征收门槛的判断基数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThresholdBasis {
+    /// 按不含税开票收入判断。
+    NetRevenue,
+    /// 按企业总成本判断（不征收时总成本 = 不含税收入）。
+    TotalCost,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VatConfig {
+    /// 增值税征收率。
     pub rate: Decimal,
+    /// 是否启用征收门槛：低于门槛时增值税、附加税均为 0。
     pub threshold_enabled: bool,
+    /// 门槛金额。
     pub threshold: Decimal,
-    pub threshold_inclusive: bool,
+    /// 门槛判断基数。
+    pub threshold_basis: ThresholdBasis,
+    /// 金额恰好等于门槛时是否征收（true：≥ 门槛征收；false：> 门槛才征收）。
+    pub levy_at_threshold: bool,
 }
 
 /// 附加税计税基数（假设 B）。
@@ -261,15 +277,15 @@ impl Config {
             .collect()
     }
 
-    /// 给定企业总成本（视为未税销售额）时是否免征增值税。
-    pub fn vat_exempt(&self, cost: Decimal) -> bool {
+    /// 门槛判断金额为 `amount` 时是否征收增值税和附加税。
+    pub fn levied(&self, amount: Decimal) -> bool {
         if !self.vat.threshold_enabled {
-            return false;
+            return true;
         }
-        if self.vat.threshold_inclusive {
-            cost <= self.vat.threshold
+        if self.vat.levy_at_threshold {
+            amount >= self.vat.threshold
         } else {
-            cost < self.vat.threshold
+            amount > self.vat.threshold
         }
     }
 }

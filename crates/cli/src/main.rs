@@ -101,6 +101,12 @@ fn print_breakdown(b: &Breakdown) {
     println!("速算扣除数          {:>14}", b.iit.quick_deduction);
     println!("代扣个税            {:>14}", b.iit.tax);
     println!("实际到手金额        {:>14}", b.take_home);
+    if !b.unallocated.is_zero() {
+        println!(
+            "注意：输入总成本无法恰好分解为 不含税收入+增值税+附加税，已按不超过它的最大有效总成本 {} 计算，未分配差额 {}",
+            b.total_cost, b.unallocated
+        );
+    }
 }
 
 fn print_reverse(r: &ReverseOutcome) {
