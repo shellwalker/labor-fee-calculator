@@ -1,0 +1,17 @@
+[package]
+name = "labor-fee-core"
+description = "劳务报酬计算核心库：增值税、附加税、劳务报酬个税正算/反算"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+rust_decimal.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+rust_decimal_macros.workspace = true
+proptest.workspace = true
