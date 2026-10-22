@@ -43,8 +43,8 @@ fn spec(tab: Tab) -> PageSpec {
         },
         _ => PageSpec {
             input_label: "企业总支出",
-            hint: "例如 10103",
-            examples: &["999.99", "1005", "1010.30", "10103", "50500"],
+            hint: "例如 10101.50",
+            examples: &["999.99", "1005", "1010.15", "10101.50", "50500"],
             page_note: "本页根据企业总支出测算不含增值税收入；金额不可达时，说明原因并给出两侧最近的有效金额。",
         },
     }
@@ -226,6 +226,15 @@ fn history_card(ui: &mut Ui, st: &mut AppState, tab: Tab) {
 
 // ---------------- 结果列 ----------------
 
+/// 附加税费项目的费率说明：未减征为“3%”，减征时为“3% × 减征 50% = 1.5%”。
+fn rate_label(statutory: Decimal, relief: Decimal) -> String {
+    if relief.is_zero() {
+        rules::pct(statutory)
+    } else {
+        format!("{}，减征 {}", rules::pct(statutory), rules::pct(relief))
+    }
+}
+
 fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
     let p = palette(ui);
     let outcome = tab_state(st, tab).outcome.clone();
@@ -234,12 +243,10 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
         _ => None,
     };
     let vat_rate = rules::pct(st.config().vat.rate);
-    let item_labels: Vec<(String, String)> = st
-        .config()
-        .surcharge
+    let sc = &st.config().surcharge;
+    let item_labels: Vec<(String, String)> = sc
         .enabled_items()
-        .zip(st.config().effective_surcharge_rates())
-        .map(|(i, r)| (i.name.clone(), rules::pct(r)))
+        .map(|i| (i.name.clone(), rate_label(i.rate, sc.applied_relief())))
         .collect();
     if !st.show_rules && width >= 700.0 {
         ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
@@ -367,8 +374,39 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
                     for l in &b.surcharges {
                         amount_row(
                             ui,
-                            &format!("　{}（{}）", l.name, rules::pct(l.rate)),
+                            &format!(
+                                "　{}（{}）",
+                                l.name,
+                                rate_label(l.statutory_rate, l.relief_rate)
+                            ),
                             &money(l.amount),
+                            "元",
+                            false,
+                            p.text,
+                        );
+                        if !l.relief_rate.is_zero() {
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 16.0),
+                                Layout::right_to_left(Align::Center),
+                                |ui| {
+                                    ui.add_space(22.0);
+                                    small(
+                                        ui,
+                                        format!(
+                                            "减征前 {} 元，减征 {} 元",
+                                            money(l.amount_before_relief),
+                                            money(l.relief_amount)
+                                        ),
+                                    );
+                                },
+                            );
+                        }
+                    }
+                    if !b.surcharge_relief.is_zero() {
+                        amount_row(
+                            ui,
+                            "附加税费减征额",
+                            &money(b.surcharge_relief),
                             "元",
                             false,
                             p.text,

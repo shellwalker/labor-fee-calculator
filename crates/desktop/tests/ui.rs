@@ -31,10 +31,11 @@ fn status(o: &Outcome) -> (Level, String) {
     }
 }
 
-const ALL_FIELDS: [&str; 11] = [
+const ALL_FIELDS: [&str; 12] = [
     "不含增值税收入",
     "增值税税额",
-    "  教育费附加（3%）",
+    "  教育费附加（3%，减征 50%）",
+    "附加税费减征额",
     "增值税附加税费合计",
     "企业总支出",
     "减除费用",
@@ -58,8 +59,10 @@ fn forward_fields() {
     }
     assert_eq!(value(o, "不含增值税收入"), "10000.00");
     assert_eq!(value(o, "增值税税额"), "100.00");
-    assert_eq!(value(o, "增值税附加税费合计"), "3.00");
-    assert_eq!(value(o, "企业总支出"), "10103.00");
+    assert_eq!(value(o, "  教育费附加（3%，减征 50%）"), "1.50");
+    assert_eq!(value(o, "附加税费减征额"), "1.50");
+    assert_eq!(value(o, "增值税附加税费合计"), "1.50");
+    assert_eq!(value(o, "企业总支出"), "10101.50");
     assert_eq!(value(o, "减除费用"), "2000.00");
     assert_eq!(value(o, "预扣预缴应纳税所得额"), "8000.00");
     assert_eq!(value(o, "预扣率"), "20%");
@@ -100,10 +103,10 @@ fn reverse_examples() {
     let mut st = AppState::with_default_config();
     for (th, net, cost) in [
         ("959.99", "999.99", "999.99"),
-        ("960", "1000.00", "1010.30"),
-        ("3360", "4000.00", "4041.20"),
-        ("20000", "23809.52", "24054.76"),
-        ("50000", "63235.29", "63886.61"),
+        ("960", "1000.00", "1010.15"),
+        ("3360", "4000.00", "4040.60"),
+        ("20000", "23809.52", "24051.19"),
+        ("50000", "63235.29", "63877.13"),
     ] {
         st.reverse.input = th.into();
         st.calc_reverse();
@@ -130,16 +133,16 @@ fn from_cost_gap_and_click() {
     assert_eq!(g.reason, CostGapReason::Threshold);
     assert_eq!(
         (g.lower.total_cost, g.upper.total_cost),
-        (dec!(999.99), dec!(1010.30))
+        (dec!(999.99), dec!(1010.15))
     );
     assert!(labor_fee_desktop::state::gap_reason_text(&g).contains("增值税起征点（1000 元）"));
     // 点击上侧有效值：填入并重算
     st.use_cost(g.upper.total_cost);
-    assert_eq!(st.from_cost.input, "1010.30");
+    assert_eq!(st.from_cost.input, "1010.15");
     assert_eq!(value(&st.from_cost.outcome, "不含增值税收入"), "1000.00");
     assert!(status(&st.from_cost.outcome).1.starts_with("校验通过"));
 
-    st.from_cost.input = "1061.32".into();
+    st.from_cost.input = "1061.16".into();
     st.calc_from_cost();
     match &st.from_cost.outcome {
         Outcome::Gap(g) => {
@@ -191,61 +194,107 @@ fn config_load_and_reset() {
 fn settings_surcharge_items_prefilled() {
     let cfg = labor_fee_core::Config::default();
     let mut d = SettingsDraft::from_config(&cfg, ThemeChoice::System);
-    // 默认：城市维护建设税、地方教育附加不计征，但费率已预填 7%、2%
+    // 默认：城市维护建设税、地方教育附加不征收，但费率已预填 7%、2%
     assert_eq!((d.items[0].enabled, d.items[0].rate.as_str()), (false, "7"));
     assert_eq!((d.items[2].enabled, d.items[2].rate.as_str()), (false, "2"));
     assert_eq!(d.modified_count(), 0);
-    // 只需勾选即可生效
+    // “是否征收”改为“是”即按预填费率征收；默认享受减半征收：7%/3%/2% → 3.5%/1.5%/1%
     d.items[0].enabled = true;
     d.items[2].enabled = true;
     let c = d.build().unwrap();
     let b = labor_fee_core::forward(&c, dec!(10000)).unwrap();
     let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
-    assert_eq!(amts, vec![dec!(7.00), dec!(3.00), dec!(2.00)]);
-    assert_eq!(b.surcharge_total, dec!(12.00));
-    assert_eq!(b.total_cost, dec!(10112.00));
+    assert_eq!(amts, vec![dec!(3.50), dec!(1.50), dec!(1.00)]);
+    let before: Vec<_> = b
+        .surcharges
+        .iter()
+        .map(|l| l.amount_before_relief)
+        .collect();
+    assert_eq!(before, vec![dec!(7.00), dec!(3.00), dec!(2.00)]);
+    assert_eq!(b.surcharge_total, dec!(6.00));
+    assert_eq!(b.total_cost, dec!(10106.00));
     assert_eq!(d.modified_count(), 2);
+    // 合计比例：减征前 12%，减征后 6%
+    let sum = d.surcharge_summary().unwrap();
+    assert_eq!(
+        (sum.statutory_total, sum.actual_total),
+        (dec!(0.12), dec!(0.06))
+    );
+    assert_eq!(sum.lines.len(), 3);
+    assert_eq!(
+        (
+            sum.lines[0].statutory,
+            sum.lines[0].relief,
+            sum.lines[0].actual
+        ),
+        (dec!(0.07), dec!(0.5), dec!(0.035))
+    );
+    // 不享受减征：12.00，企业总支出 10112.00
+    let mut nr = d.clone();
+    nr.relief_enabled = false;
+    let b2 = labor_fee_core::forward(&nr.build().unwrap(), dec!(10000)).unwrap();
+    assert_eq!(
+        (b2.surcharge_total, b2.total_cost),
+        (dec!(12.00), dec!(10112.00))
+    );
+    assert_eq!(nr.surcharge_summary().unwrap().actual_total, dec!(0.12));
+    assert_eq!(nr.modified_count(), 3);
+    // 城市维护建设税按纳税人所在地选择税率
+    assert_eq!(settings::urban_region("7"), Some(0));
+    assert_eq!(settings::urban_region("5.0"), Some(1));
+    assert_eq!(settings::urban_region("1"), Some(2));
+    assert_eq!(settings::urban_region("6"), None);
     assert!(!settings::item_same(&d.items[0], &d.defaults().items[0]));
-    // 规则说明动态列出计征的项目
+    // 规则说明动态列出征收的项目
     let text: String = rules::rule_groups(&c)
         .into_iter()
         .flat_map(|g| g.lines)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        text.contains("城市维护建设税 = 实际缴纳的增值税税额 × 7%"),
+        text.contains("城市维护建设税 = 实际缴纳的增值税税额 × 7% × (1 − 减征 50%) = 实际缴纳的增值税税额 × 3.5%"),
         "{text}"
     );
     assert!(text.contains("增值税附加税费 = 城市维护建设税 + 教育费附加 + 地方教育附加"));
-    assert!(!text.contains("减征"), "{text}");
+    assert!(
+        text.contains("附加税费合计比例：减征前 12%，减征后 6%"),
+        "{text}"
+    );
+    let text2: String = rules::rule_groups(&nr.build().unwrap())
+        .into_iter()
+        .flat_map(|g| g.lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text2.contains("减征"), "{text2}");
+    assert!(text2.contains("附加税费合计比例 12%"), "{text2}");
     // 取消勾选、费率写法不同（7.0）均视为恢复默认
     d.items[0].enabled = false;
     d.items[2].enabled = false;
     d.items[0].rate = "7.0".into();
     assert_eq!(d.modified_count(), 0);
-    // 改为 5%（县城、镇）但不勾选：记为已修改，但不参与计算
+    // 改为 5%（县城、镇）但不征收：记为已修改，但不参与计算
     d.items[0].rate = "5".into();
     assert_eq!(d.modified_count(), 1);
     let c = d.build().unwrap();
     assert_eq!(
         labor_fee_core::forward(&c, dec!(10000)).unwrap().total_cost,
-        dec!(10103.00)
+        dec!(10101.50)
     );
-    // 默认规则说明列出未计征项目及预填费率
+    // 默认规则说明列出不征收项目及预填费率
     let text: String = rules::rule_groups(&labor_fee_core::Config::default())
         .into_iter()
         .flat_map(|g| g.lines)
         .collect::<Vec<_>>()
         .join("\n");
     assert!(
-        text.contains("未计征：城市维护建设税（7%）、地方教育附加（2%）"),
+        text.contains("不征收：城市维护建设税（7%）、地方教育附加（2%）"),
         "{text}"
     );
 }
 
 #[test]
 fn legacy_rules_file_loads_as_default() {
-    // 旧版设置文件（单一“附加税”项目、已不再支持的 halve 减征字段）读入后与内置默认一致
+    // 旧版设置文件（单一“附加税”项目、旧的 halve = true 减征字段）读入后与内置默认一致（减半征收）
     let dir = tmp_dir("legacy");
     let store = SettingsStore::at(dir.clone());
     let legacy = labor_fee_core::DEFAULT_CONFIG_TOML.replace(
@@ -370,9 +419,23 @@ fn settings_confirm_persist_and_reload() {
     st3.close_settings();
     assert_eq!(st3.config().vat.rate, dec!(0.03));
 
-    // 单项恢复默认：直接生效
+    // 单项“默认”：只把输入填为默认值、进入未生效状态，不弹框、不保存
     st3.open_settings();
     assert!(st3.reset_setting(key::VAT_RATE));
+    {
+        let w = st3.settings.as_ref().unwrap();
+        assert_eq!(w.dialog, None);
+        assert_eq!(w.edit.vat_rate, "1");
+        assert_eq!(w.pending_rows(), vec![key::VAT_RATE.to_string()]);
+    }
+    assert_eq!(st3.config().vat.rate, dec!(0.03), "未点击 ✔ 不生效");
+    assert!(store.rules_path().exists());
+    // ✖ 放弃：恢复为生效值
+    st3.discard_setting(key::VAT_RATE);
+    assert_eq!(st3.settings.as_ref().unwrap().edit.vat_rate, "3");
+    // 再次填入默认并 ✔ 生效
+    assert!(st3.reset_setting(key::VAT_RATE));
+    assert!(st3.confirm_setting(key::VAT_RATE));
     assert!(st3.is_default_config());
     assert!(
         !store.rules_path().exists(),
@@ -425,14 +488,15 @@ fn rules_panel_follows_config() {
     for s in [
         "增值税税额 = 不含增值税收入 × 征收率 1%",
         "不含增值税收入达到 1000 元 的征收",
-        "教育费附加 = 实际缴纳的增值税税额 × 3%",
+        "教育费附加 = 实际缴纳的增值税税额 × 3% × (1 − 减征 50%) = 实际缴纳的增值税税额 × 1.5%",
+        "附加税费合计比例：减征前 3%，减征后 1.5%",
         "增值税附加税费 = 教育费附加（各项分别按分舍入）",
-        "未计征：城市维护建设税（7%）、地方教育附加（2%）",
+        "不征收：城市维护建设税（7%）、地方教育附加（2%）",
         "企业承担",
         "每次收入不超过 4000 元 的，减除费用 800 元；4000 元 以上的，减除费用按 20% 计算",
         "四舍五入",
         "取最小不含增值税收入",
-        "企业总支出 1000.00～1010.29 无对应的不含增值税收入",
+        "企业总支出 1000.00～1010.14 无对应的不含增值税收入",
     ] {
         assert!(text.contains(s), "规则缺少：{s}\n{text}");
     }
@@ -497,11 +561,11 @@ fn batch_blocking_preview_and_save() {
     st.save_batch(&out);
     assert_eq!(st.batch.message.as_ref().unwrap().level, Level::Ok);
     let saved = std::fs::read_to_string(&out).unwrap();
-    assert!(saved.contains("10103.00"));
+    assert!(saved.contains("10101.50"));
 
     // 按总成本：空位行写原因
     let p = dir.join("cost.csv");
-    std::fs::write(&p, "企业总支出\n1005\n10103\n").unwrap();
+    std::fs::write(&p, "企业总支出\n1005\n10101.50\n").unwrap();
     st.batch.path = p.display().to_string();
     st.batch.kind = InputKind::TotalCost;
     st.run_batch_blocking();
@@ -602,7 +666,9 @@ fn ui_forward_tab() {
     assert_eq!(value(&h.state().forward.outcome, "税后实发金额"), "8400.00");
     for f in [
         "增值税税额（1%）",
-        "　教育费附加（3%）",
+        "　教育费附加（3%，减征 50%）",
+        "减征前 3.00 元，减征 1.50 元",
+        "附加税费减征额",
         "增值税附加税费合计",
         "减除费用",
         "预扣预缴应纳税所得额",
@@ -617,7 +683,7 @@ fn ui_forward_tab() {
     h.get_by_label("不含增值税收入（输入）");
     h.get_by_label("增值税及附加税费");
     h.get_by_label("个人所得税");
-    assert!(has(&h, "10,103.00"), "千分位金额");
+    assert!(has(&h, "10,101.50"), "千分位金额");
     assert!(has(&h, "8,400.00"));
     h.get_by_label("校验状态");
     h.get_by_label_contains("校验通过");
@@ -653,7 +719,7 @@ fn ui_reverse_tab_enter_key() {
         value(&h.state().reverse.outcome, "不含增值税收入"),
         "4000.00"
     );
-    assert!(has(&h, "4,041.20"));
+    assert!(has(&h, "4,040.60"));
     h.get_by_label("税后实发金额（输入）");
     h.get_by_label_contains("精确匹配");
     h.get_by_label_contains("根据税后实发金额测算不含增值税收入");
@@ -671,9 +737,9 @@ fn ui_from_cost_gap_click() {
     h.get_by_label_contains("原因：增值税起征点（1000 元）形成的不可达区间");
     h.get_by_label_contains("其间的企业总支出均无对应收入");
     h.get_by_label("← 999.99（收入 999.99）");
-    h.get_by_label("1010.30（收入 1000.00）→").click();
+    h.get_by_label("1010.15（收入 1000.00）→").click();
     h.run();
-    assert_eq!(h.state().from_cost.input, "1010.30");
+    assert_eq!(h.state().from_cost.input, "1010.15");
     assert_eq!(value(&h.state().from_cost.outcome, "增值税税额"), "10.00");
     h.get_by_label_contains("对应的企业总支出与输入一致");
 }
@@ -717,7 +783,7 @@ fn ui_batch_tab_preview() {
     h.get_by_label("样例_测算结果.csv");
     h.get_by_label_contains("共 4 行");
     h.get_by_label("甲");
-    assert!(has(&h, "10,103.00"));
+    assert!(has(&h, "10,101.50"));
     h.get_by_label_contains("无法解析金额");
     // 切换输入列类型
     h.get_by_label("输入列").click();
@@ -869,8 +935,27 @@ fn ui_settings_confirm_applies_and_persists() {
     assert_eq!(modified_tags(&h), 1);
     h.get_by_label("与内置默认不同 1 项");
     assert!(h.query_by_label("未生效").is_none());
-    // 单项“默认”：直接生效，提示消失
+    // 单项“默认”：不弹框，只填入默认值并进入未生效状态；✔ 才生效落盘
     h.get_by_label("🔃 默认").click();
+    h.run();
+    assert_eq!(
+        h.state().settings.as_ref().unwrap().dialog,
+        None,
+        "单项默认不弹框"
+    );
+    assert_eq!(h.state().settings.as_ref().unwrap().edit.vat_rate, "1");
+    h.get_by_label("未生效");
+    assert_eq!(h.state().config().vat.rate, dec!(0.03), "未点击 ✔ 不生效");
+    assert!(store.rules_path().exists());
+    // ✖：放弃，输入恢复为生效值 3
+    h.get_by_label("✖").click();
+    h.run();
+    assert_eq!(h.state().settings.as_ref().unwrap().edit.vat_rate, "3");
+    assert!(h.query_by_label("未生效").is_none());
+    // 再次“默认”后 ✔：生效并保存，提示消失
+    h.get_by_label("🔃 默认").click();
+    h.run();
+    h.get_by_role_and_label(Role::Button, "✔").click();
     h.run();
     assert_eq!(h.state().config().vat.rate, dec!(0.01));
     assert!(h.query_by_label_contains("当前值与默认值不同").is_none());
@@ -1236,9 +1321,138 @@ fn modified_badge_count_matches_row_tags() {
     let mut h = harness(window_with(d));
     h.run();
     assert_eq!(modified_tags(&h), 1);
-    // 恢复默认项目：直接生效
+    // 恢复默认项目：填入默认项目、进入未生效状态，确认后生效
+    h.get_by_label("🔃 默认").scroll_to_me();
+    h.run();
     h.get_by_label("🔃 默认").click();
     h.run();
-    assert_eq!(modified_tags(&h), 0);
     assert_eq!(h.state().settings.as_ref().unwrap().edit.items.len(), 3);
+    assert_eq!(h.state().settings.as_ref().unwrap().applied.items.len(), 2);
+    assert!(h
+        .state()
+        .settings
+        .as_ref()
+        .unwrap()
+        .is_pending(settings::key::ITEMS_REMOVED));
+    assert!(h.state_mut().confirm_setting(settings::key::ITEMS_REMOVED));
+    h.run();
+    assert_eq!(modified_tags(&h), 0);
+    let w = h.state().settings.as_ref().unwrap();
+    assert_eq!((w.applied.items.len(), w.pending_count()), (3, 0));
+}
+
+/// 先滚动到控件再点击（设置页内容较长，超出可视区域的控件需滚动后才能点到）。
+fn tap(h: &mut Harness<'_, AppState>, label: &str) {
+    h.get_by_label(label).scroll_to_me();
+    h.run();
+    h.get_by_label(label).click();
+    h.run();
+}
+
+fn tap_ok(h: &mut Harness<'_, AppState>) {
+    h.get_by_role_and_label(Role::Button, "✔").scroll_to_me();
+    h.run();
+    h.get_by_role_and_label(Role::Button, "✔").click();
+    h.run();
+}
+
+#[test]
+fn ui_settings_surcharge_radio_and_summary() {
+    use settings::key;
+    let dir = tmp_dir("ui-surcharge");
+    let store = SettingsStore::at(dir.join("labor-fee-desktop"));
+    let mut st = AppState::with_store(store.clone());
+    st.open_settings();
+    st.settings.as_mut().unwrap().edit.section = settings::Section::Surcharge;
+    let mut h = harness_sized(st, 1280.0, 1600.0);
+    h.run();
+    // 默认：减征“是”（展开减征比例）、城建与地方教育附加“否”（隐藏具体配置）、教育费附加“是”
+    h.get_by_label("享受减征优惠：否");
+    h.get_by_label("享受减征优惠：是");
+    h.get_by_label("减征比例");
+    h.get_by_label("城市维护建设税是否征收：否");
+    h.get_by_label("地方教育附加是否征收：是");
+    assert!(h
+        .query_by_label("纳税人所在地（城市维护建设税法第四条）")
+        .is_none());
+    assert_eq!(
+        h.query_all_by_label("征收比例").count(),
+        1,
+        "仅教育费附加展开"
+    );
+    // 政策来源小字与链接
+    h.get_by_label("财政部 税务总局公告2023年第12号");
+    h.get_by_label("国家税务总局“六税两费”减免政策问答第10问");
+    // 合计比例卡片：3% → 1.5%
+    h.get_by_label("附加税费合计比例");
+    h.get_by_label("减征前 3% → 减征 50% 后 1.5%");
+    for s in ["税费项目", "法定费率", "减征", "实际征收率", "合计"] {
+        assert!(has(&h, s), "缺少 {s}");
+    }
+
+    // 城建选“是”：展开纳税人所在地（预填市区 7%），进入未生效状态，不改参数、不落盘
+    tap(&mut h, "城市维护建设税是否征收：是");
+    h.get_by_label("纳税人所在地（城市维护建设税法第四条）");
+    h.get_by_label("纳税人所在地在市区：税率 7%");
+    h.get_by_label("未生效");
+    assert!(!h.state().config().surcharge.items[0].enabled);
+    assert!(!store.rules_path().exists());
+    h.get_by_label_contains("含未生效修改的预览：合计 10% → 减征后 5%");
+    // 改选县城、镇 5% 后 ✔：生效并保存
+    tap(&mut h, "纳税人所在地在县城、镇：税率 5%");
+    assert_eq!(h.state().settings.as_ref().unwrap().edit.items[0].rate, "5");
+    tap_ok(&mut h);
+    let it = &h.state().config().surcharge.items[0];
+    assert!(it.enabled);
+    assert_eq!(it.rate, dec!(0.05));
+    assert!(store.rules_path().exists());
+    h.get_by_label("减征前 8% → 减征 50% 后 4%");
+    assert!(h.query_by_label_contains("含未生效修改的预览").is_none());
+
+    // 选“是”后再改回“否”：恢复为生效值，不留下看不见的修改
+    tap(&mut h, "地方教育附加是否征收：是");
+    assert_eq!(h.query_all_by_label("征收比例").count(), 2);
+    tap(&mut h, "地方教育附加是否征收：否");
+    assert_eq!(h.state().settings.as_ref().unwrap().pending_count(), 0);
+
+    // 减征改为“否”：隐藏减征比例；✔ 后合计比例不再减征
+    tap(&mut h, "享受减征优惠：否");
+    assert!(h.query_by_label("减征比例").is_none());
+    assert!(
+        h.state().config().surcharge.relief_enabled,
+        "未点击 ✔ 不生效"
+    );
+    tap_ok(&mut h);
+    assert!(!h.state().config().surcharge.relief_enabled);
+    h.get_by_label("未享受减征优惠");
+    assert!(std::fs::read_to_string(store.rules_path())
+        .unwrap()
+        .contains("relief_enabled = false"));
+
+    // 单项“默认”：不弹框，只填入默认值（是，50%）并进入未生效状态；✖ 放弃
+    h.get_by_label_contains("当前值与默认值不同（默认：是，减征 50%）");
+    let n = h.query_all_by_label("🔃 默认").count();
+    assert_eq!(n, 2, "城建与减征两行各一个");
+    h.state_mut().reset_setting(key::RELIEF);
+    h.run();
+    assert_eq!(h.state().settings.as_ref().unwrap().dialog, None);
+    assert!(h.state().settings.as_ref().unwrap().is_pending(key::RELIEF));
+    h.get_by_label("减征比例");
+    assert!(!h.state().config().surcharge.relief_enabled);
+    tap(&mut h, "✖");
+    assert!(!h.state().settings.as_ref().unwrap().edit.relief_enabled);
+    // 再次“默认”并 ✔：恢复减半征收
+    h.state_mut().reset_setting(key::RELIEF);
+    h.run();
+    tap_ok(&mut h);
+    assert!(h.state().config().surcharge.relief_enabled);
+
+    // 减征比例非法：✔ 不可用
+    edit(&mut h).relief_rate = "120".into();
+    h.run();
+    assert!(h
+        .get_by_role_and_label(Role::Button, "✔")
+        .accesskit_node()
+        .is_disabled());
+    h.get_by_label_contains("减征比例请输入 0～100 之间的百分数");
 }

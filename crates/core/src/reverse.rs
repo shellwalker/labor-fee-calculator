@@ -276,7 +276,7 @@ mod tests {
         let r = reverse(&cfg, dec!(8400)).unwrap();
         assert!(r.exact);
         assert_eq!(r.breakdown.net_income, dec!(10000.00));
-        assert_eq!(r.breakdown.total_cost, dec!(10103.00));
+        assert_eq!(r.breakdown.total_cost, dec!(10101.50));
         assert_eq!(forward(&cfg, r.breakdown.net_income).unwrap(), r.breakdown);
     }
 
@@ -291,7 +291,7 @@ mod tests {
         let b = rev.reverse(dec!(960.00)).unwrap();
         assert!(b.exact && !b.breakdown.vat_exempt);
         assert_eq!(b.breakdown.net_income, dec!(1000.00));
-        assert_eq!(b.breakdown.total_cost, dec!(1010.30));
+        assert_eq!(b.breakdown.total_cost, dec!(1010.15));
         assert!(b.other_solutions.is_empty());
     }
 

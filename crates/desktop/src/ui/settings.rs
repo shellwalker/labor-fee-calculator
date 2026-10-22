@@ -1,6 +1,6 @@
 //! 设置窗口：左侧分组导航，右侧逐项编辑。每项修改后处于“未生效”状态，
 //! 点击 √（或 Enter）生效并立即保存，点击 ×（或 Esc）放弃本项修改；
-//! 另有单项“默认”（直接生效）与“全部恢复默认”（二次确认后生效）。
+//! 另有单项“默认”（填入默认值、进入未生效状态，仍须点击 √ 生效）与“全部恢复默认”（二次确认后生效）。
 
 use super::widgets::{badge, danger_button, primary_button, secondary_button, small};
 use crate::icons;
@@ -156,7 +156,7 @@ impl Form {
             ui.add_space(2.0);
             if ui
                 .small_button(format!("{} 默认", icons::RESET))
-                .on_hover_text("恢复本项的内置默认值（立即生效）")
+                .on_hover_text("填入本项的内置默认值；点击 ✔ 生效，点击 ✖ 放弃")
                 .clicked()
             {
                 self.acts.push(Act::Default(k.to_string()));
@@ -700,88 +700,403 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
     );
 }
 
+/// “是否征收”等是非选择：否在前、是在后（单选按钮）。
+///
+/// 无障碍名称为“{name}：否”“{name}：是”，便于读屏与测试区分各行。
+fn yes_no(ui: &mut Ui, v: &mut bool, name: &str) -> Response {
+    let p = palette(ui);
+    // 未选中的单选圈加深描边，浅色主题下也清晰可辨
+    ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::new(1.0, p.text_weak);
+    ui.visuals_mut().widgets.hovered.bg_stroke = Stroke::new(1.0, p.primary);
+    let mut out: Option<Response> = None;
+    for (val, text) in [(false, "否"), (true, "是")] {
+        let r = ui.radio_value(v, val, text);
+        let sel = *v == val;
+        r.widget_info(|| {
+            egui::WidgetInfo::selected(
+                egui::Role::RadioButton,
+                true,
+                sel,
+                format!("{name}：{text}"),
+            )
+        });
+        out = Some(match out {
+            Some(a) => a.union(r),
+            None => r,
+        });
+    }
+    out.expect("两个选项")
+}
+
+/// 行首的标签格（与 `row` 的标签列对齐），返回标签的 Id（供控件 labelled_by）。
+fn label_cell(ui: &mut Ui, text: &str) -> Id {
+    let p = palette(ui);
+    ui.allocate_ui_with_layout(
+        Vec2::new(LABEL_W, 30.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_width(LABEL_W);
+            ui.label(RichText::new(text).color(p.text)).id
+        },
+    )
+    .inner
+}
+
+/// 控件格（与 `row` 的控件列对齐）。
+fn control_cell(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> Response) -> Response {
+    ui.allocate_ui_with_layout(
+        Vec2::new(CTRL_W + 60.0, 30.0),
+        Layout::left_to_right(Align::Center),
+        |ui| {
+            ui.set_width(CTRL_W + 60.0);
+            add(ui)
+        },
+    )
+    .inner
+}
+
+/// 附加税费合计比例卡片：按已生效设置列出各征收项目的法定费率、减征比例与实际征收率；
+/// 本页有未生效的修改时，另附含未生效修改的预览。
+fn surcharge_summary_card(ui: &mut Ui, applied: &SettingsDraft, edit: &SettingsDraft, f: &Form) {
+    let p = palette(ui);
+    let pct = crate::rules::pct;
+    let page_pending = f
+        .pending
+        .iter()
+        .any(|k| Section::of_key(k) == Some(Section::Surcharge));
+    Frame::new()
+        .fill(p.surface_alt)
+        .stroke(Stroke::new(1.0, p.border))
+        .corner_radius(CornerRadius::same(theme::RADIUS_CARD))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("附加税费合计比例")
+                        .size(theme::FS_SECTION)
+                        .strong()
+                        .color(p.text),
+                );
+                small(
+                    ui,
+                    format!(
+                        "占计税依据（{}），按已生效的设置",
+                        surcharge_base_text(applied.surcharge_base)
+                    ),
+                );
+            });
+            let Some(sum) = applied.surcharge_summary() else {
+                return;
+            };
+            ui.horizontal(|ui| {
+                if sum.relief.is_zero() {
+                    ui.label(
+                        RichText::new(pct(sum.actual_total))
+                            .size(theme::FS_DISPLAY)
+                            .strong()
+                            .color(p.primary),
+                    );
+                    small(ui, "未享受减征优惠");
+                } else {
+                    ui.label(
+                        RichText::new(pct(sum.statutory_total))
+                            .size(theme::FS_TITLE)
+                            .strikethrough()
+                            .color(p.text_weak),
+                    );
+                    ui.label(
+                        RichText::new(icons::RIGHT)
+                            .size(theme::FS_TITLE)
+                            .color(p.text_weak),
+                    );
+                    ui.label(
+                        RichText::new(pct(sum.actual_total))
+                            .size(theme::FS_DISPLAY)
+                            .strong()
+                            .color(p.primary),
+                    );
+                    small(
+                        ui,
+                        format!(
+                            "减征前 {} → 减征 {} 后 {}",
+                            pct(sum.statutory_total),
+                            pct(sum.relief),
+                            pct(sum.actual_total)
+                        ),
+                    );
+                }
+            });
+            if sum.lines.is_empty() {
+                small(ui, "未征收任何附加税费项目");
+            } else {
+                egui::Grid::new("surcharge_summary")
+                    .striped(true)
+                    .num_columns(4)
+                    .min_col_width(96.0)
+                    .spacing(Vec2::new(24.0, 4.0))
+                    .show(ui, |ui| {
+                        for h in ["税费项目", "法定费率", "减征", "实际征收率"] {
+                            ui.label(
+                                RichText::new(h)
+                                    .size(theme::FS_SMALL)
+                                    .strong()
+                                    .color(p.text_weak),
+                            );
+                        }
+                        ui.end_row();
+                        let relief = |r: labor_fee_core::Decimal| {
+                            if r.is_zero() {
+                                "—".to_string()
+                            } else {
+                                pct(r)
+                            }
+                        };
+                        for l in &sum.lines {
+                            ui.label(RichText::new(&l.name).color(p.text));
+                            ui.label(RichText::new(pct(l.statutory)).font(theme::mono(14.0)));
+                            ui.label(RichText::new(relief(l.relief)).font(theme::mono(14.0)));
+                            ui.label(
+                                RichText::new(pct(l.actual))
+                                    .font(theme::mono(14.0))
+                                    .color(p.primary),
+                            );
+                            ui.end_row();
+                        }
+                        ui.label(RichText::new("合计").strong().color(p.text));
+                        ui.label(
+                            RichText::new(pct(sum.statutory_total))
+                                .font(theme::mono(14.0))
+                                .strong(),
+                        );
+                        ui.label(RichText::new(relief(sum.relief)).font(theme::mono(14.0)));
+                        ui.label(
+                            RichText::new(pct(sum.actual_total))
+                                .font(theme::mono(14.0))
+                                .strong()
+                                .color(p.primary),
+                        );
+                        ui.end_row();
+                    });
+            }
+            if page_pending {
+                if let Some(prev) = edit.surcharge_summary().filter(|x| *x != sum) {
+                    ui.add_space(theme::SP1);
+                    ui.label(
+                        RichText::new(format!(
+                            "{} 含未生效修改的预览：合计 {} → 减征后 {}（点击 ✔ 生效后计入）",
+                            icons::INFO,
+                            pct(prev.statutory_total),
+                            pct(prev.actual_total)
+                        ))
+                        .size(theme::FS_SMALL)
+                        .color(p.warning),
+                    );
+                }
+            }
+        });
+    ui.add_space(theme::SP1);
+}
+
+/// 减征政策来源（小字，附链接）。
+fn relief_source(ui: &mut Ui) {
+    use crate::rules::{
+        RELIEF_POLICY_NAME, RELIEF_POLICY_URL, RELIEF_POLICY_URL_TAX, RELIEF_QA_NAME, RELIEF_QA_URL,
+    };
+    let p = palette(ui);
+    let t = |s: &str| RichText::new(s).size(theme::FS_SMALL).color(p.text_weak);
+    let link = |s: &str| RichText::new(s).size(theme::FS_SMALL);
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W + 8.0);
+        ui.vertical(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.label(t("政策依据："));
+                ui.hyperlink_to(link(RELIEF_POLICY_NAME), RELIEF_POLICY_URL)
+                    .on_hover_text(RELIEF_POLICY_URL);
+                ui.label(t("第二条（"));
+                ui.hyperlink_to(link("国家税务总局政策法规库"), RELIEF_POLICY_URL_TAX)
+                    .on_hover_text(RELIEF_POLICY_URL_TAX);
+                ui.label(t("）"));
+            });
+            ui.label(t(
+                "2023 年 1 月 1 日至 2027 年 12 月 31 日，对增值税小规模纳税人减半征收城市维护建设税、教育费附加、地方教育附加。",
+            ));
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing.x = 2.0;
+                ui.label(t("自然人按小规模纳税人享受，可在代开发票环节适用（"));
+                ui.hyperlink_to(link(RELIEF_QA_NAME), RELIEF_QA_URL)
+                    .on_hover_text(RELIEF_QA_URL);
+                ui.label(t("）"));
+            });
+        });
+    });
+    ui.add_space(2.0);
+}
+
+/// 行下方的展开内容（缩进到控件列）。
+fn indented<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
+    ui.horizontal(|ui| {
+        ui.add_space(LABEL_W + 8.0);
+        add(ui)
+    })
+    .inner
+}
+
 fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft, f: &mut Form) {
     let def = d.defaults();
     let p = palette(ui);
-    group_title(ui, "增值税附加税费");
     small(
         ui,
-        "各项目以计税依据乘以费率，分别按分舍入，合计为增值税附加税费。未勾选“计征”的项目不参与计算；城市维护建设税、地方教育附加已预填法定费率，勾选即可生效。",
+        "各项附加税费 = 计税依据 × 法定费率 × (1 − 减征比例)。“是否征收”选“是”后显示具体配置；所有修改点击 ✔ 后生效并保存。",
     );
     ui.add_space(theme::SP1);
-    row(
-        ui,
-        f,
-        key::BASE,
-        "计税依据",
-        "依法以实际缴纳的增值税税额为计税依据",
-        Tag::Confirmed,
-        surcharge_base_text(def.surcharge_base),
-        |ui, l| {
-            ComboBox::from_id_salt("surcharge_base")
-                .selected_text(surcharge_base_text(d.surcharge_base))
-                .width(CTRL_W)
-                .show_ui(ui, |ui| {
-                    for b in [SurchargeBase::Vat, SurchargeBase::NetRevenue] {
-                        ui.selectable_value(&mut d.surcharge_base, b, surcharge_base_text(b));
-                    }
-                })
-                .response
-                .labelled_by(l)
-        },
-    );
-    group_title(ui, "计征项目");
+    surcharge_summary_card(ui, applied, d, f);
+
+    // ---- 减征优惠（全局） ----
+    group_title(ui, "减征优惠");
+    {
+        let k = key::RELIEF;
+        let pending = f.pending(k);
+        let can = f.row_error(k).is_none();
+        let bg = field_bg(ui, !can && pending, pending);
+        let was = d.relief_enabled;
+        ui.horizontal(|ui| {
+            label_cell(ui, "享受减征优惠");
+            let r = control_cell(ui, |ui| yes_no(ui, &mut d.relief_enabled, "享受减征优惠"));
+            mark_pending(ui, &r, pending);
+            f.keys(ui, k, &r, can);
+            f.actions(ui, k, Some(Tag::Verified), true);
+        });
+        if was && !d.relief_enabled {
+            // 改为“否”时，隐藏的减征比例恢复为生效值，避免看不见的修改
+            d.relief_rate = applied.relief_rate.clone();
+        }
+        if d.relief_enabled {
+            indented(ui, |ui| {
+                let lid = ui.label(RichText::new("减征比例").color(p.text)).id;
+                let r = text_field(ui, lid, &mut d.relief_rate, "%", bg, true);
+                mark_pending(ui, &r, pending);
+                f.keys(ui, k, &r, can);
+                small(ui, "统一适用于全部征收项目；50% 即减半征收");
+            });
+        }
+        let default_text = if def.relief_enabled {
+            format!("是，减征 {}%", def.relief_rate)
+        } else {
+            "否".to_string()
+        };
+        if f.modified(k) || (pending && !can) {
+            f.notes(ui, k, "", Some(&default_text));
+        }
+        relief_source(ui);
+    }
+
+    // ---- 征收项目 ----
+    group_title(ui, "征收项目");
     for i in 0..d.items.len() {
         let k = format!("{}.{i}", key::ITEMS);
         let standard = d.standard_item(i, &def).cloned();
         let pending = f.pending(&k);
-        let bg = field_bg(ui, f.row_error(&k).is_some(), pending);
+        let can = f.row_error(&k).is_none();
+        let bg = field_bg(ui, !can && pending, pending);
+        let applied_rate = applied.items.get(i).map(|x| x.rate.clone());
         let it = &mut d.items[i];
+        let was = it.enabled;
         match standard {
             Some(std_item) => {
-                let help = match std_item.name.as_str() {
+                let name = it.name.clone();
+                ui.horizontal(|ui| {
+                    label_cell(ui, &name);
+                    let r = control_cell(ui, |ui| {
+                        ui.label(RichText::new("是否征收").color(p.text_weak));
+                        yes_no(ui, &mut it.enabled, &format!("{name}是否征收"))
+                    });
+                    mark_pending(ui, &r, pending);
+                    f.keys(ui, &k, &r, can);
+                    f.actions(ui, &k, Some(Tag::Confirmed), true);
+                });
+                if was && !it.enabled {
+                    if let Some(r) = &applied_rate {
+                        it.rate = r.clone();
+                    }
+                }
+                let urban = name == labor_fee_core::URBAN_CONSTRUCTION_TAX;
+                if it.enabled {
+                    if urban {
+                        indented(ui, |ui| {
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.visuals_mut().widgets.inactive.bg_stroke =
+                                    Stroke::new(1.0, p.text_weak);
+                                ui.label(
+                                    RichText::new("纳税人所在地（城市维护建设税法第四条）")
+                                        .size(theme::FS_SMALL)
+                                        .color(p.text_weak),
+                                );
+                                let cur = crate::settings::urban_region(&it.rate);
+                                let mut all: Option<Response> = None;
+                                for (idx, (region, rate)) in
+                                    labor_fee_core::URBAN_CONSTRUCTION_RATES.iter().enumerate()
+                                {
+                                    let r = ui.radio(
+                                        cur == Some(idx),
+                                        format!("{region}：税率 {}", crate::rules::pct(*rate)),
+                                    );
+                                    if r.clicked() {
+                                        it.rate = crate::settings::pct_text(*rate);
+                                    }
+                                    all = Some(match all {
+                                        Some(a) => a.union(r),
+                                        None => r,
+                                    });
+                                }
+                                if let Some(r) = &all {
+                                    mark_pending(ui, r, pending);
+                                    f.keys(ui, &k, r, can);
+                                }
+                                if cur.is_none() {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} 当前税率 {}% 不是法定税率，请选择纳税人所在地",
+                                            icons::WARN,
+                                            it.rate.trim()
+                                        ))
+                                        .size(theme::FS_SMALL)
+                                        .color(p.warning),
+                                    );
+                                }
+                            });
+                        });
+                    } else {
+                        indented(ui, |ui| {
+                            let lid = ui.label(RichText::new("征收比例").color(p.text)).id;
+                            let r = text_field(ui, lid, &mut it.rate, "%", bg, true);
+                            mark_pending(ui, &r, pending);
+                            f.keys(ui, &k, &r, can);
+                        });
+                    }
+                }
+                let help = match name.as_str() {
                     labor_fee_core::URBAN_CONSTRUCTION_TAX => {
-                        "默认不计征，费率预填 7%。法定税率按纳税人所在地：市区 7%、县城或镇 5%、其他地区 1%（城市维护建设税法第四条）"
+                        "税率按纳税人所在地：市区 7%、县城或镇 5%、其他地区 1%（《中华人民共和国城市维护建设税法》第四条）"
                     }
                     labor_fee_core::EDUCATION_SURCHARGE => {
-                        "费率 3%（《征收教育费附加的暂行规定》第三条）"
+                        "征收率 3%（《征收教育费附加的暂行规定》第三条）"
                     }
                     labor_fee_core::LOCAL_EDUCATION_SURCHARGE => {
-                        "默认不计征，费率预填征收标准 2%（财综〔2010〕98号）"
+                        "征收标准 2%（《财政部关于统一地方教育附加政策有关问题的通知》财综〔2010〕98号）"
                     }
                     _ => "",
                 };
-                let name = it.name.clone();
-                let default_text = format!(
-                    "{}，费率 {}%",
-                    on_off(std_item.enabled, "计征", "不计征"),
-                    std_item.rate
-                );
-                row(
-                    ui,
-                    f,
-                    &k,
-                    &name,
-                    help,
-                    Tag::Confirmed,
-                    &default_text,
-                    |ui, l| {
-                        let a = ui.checkbox(&mut it.enabled, "计征").labelled_by(l);
-                        ui.add_space(theme::SP1);
-                        let en = it.enabled;
-                        let b = ui
-                            .add_enabled(
-                                en,
-                                TextEdit::singleline(&mut it.rate)
-                                    .font(theme::mono(14.0))
-                                    .desired_width(CTRL_W - 110.0)
-                                    .background_color(bg),
-                            )
-                            .labelled_by(l);
-                        ui.label(RichText::new("%").color(p.text_weak));
-                        a.union(b)
-                    },
-                );
+                let default_text = if std_item.enabled {
+                    format!("征收，{}%", std_item.rate)
+                } else if urban {
+                    format!("不征收；选“是”时预填市区 {}%", std_item.rate)
+                } else {
+                    format!("不征收；选“是”时预填 {}%", std_item.rate)
+                };
+                f.notes(ui, &k, help, Some(&default_text));
             }
             None => {
                 let is_new = i >= applied.items.len();
@@ -801,31 +1116,13 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
                             },
                         )
                         .inner;
-                    let r = ui
-                        .allocate_ui_with_layout(
-                            Vec2::new(CTRL_W + 60.0, 30.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.set_width(CTRL_W + 60.0);
-                                let c = ui.checkbox(&mut it.enabled, "计征");
-                                let rid = ui.label(RichText::new("费率").color(p.text_weak)).id;
-                                let b = ui
-                                    .add_enabled(
-                                        it.enabled,
-                                        TextEdit::singleline(&mut it.rate)
-                                            .font(theme::mono(14.0))
-                                            .desired_width(CTRL_W - 130.0)
-                                            .background_color(bg),
-                                    )
-                                    .labelled_by(rid);
-                                ui.label(RichText::new("%").color(p.text_weak));
-                                c.union(b)
-                            },
-                        )
-                        .inner;
+                    let acc = format!("{}是否征收", it.name.trim());
+                    let r = control_cell(ui, |ui| {
+                        ui.label(RichText::new("是否征收").color(p.text_weak));
+                        yes_no(ui, &mut it.enabled, &acc)
+                    });
                     let all = a.union(r);
                     mark_pending(ui, &all, pending);
-                    let can = f.row_error(&k).is_none();
                     f.keys(ui, &k, &all, can);
                     f.actions(ui, &k, Some(Tag::Confirmed), false);
                     if !is_new
@@ -837,16 +1134,29 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
                         f.acts.push(Act::DeleteItem(i));
                     }
                 });
+                if was && !it.enabled {
+                    if let Some(r) = &applied_rate {
+                        it.rate = r.clone();
+                    }
+                }
+                if it.enabled {
+                    indented(ui, |ui| {
+                        let lid = ui.label(RichText::new("征收比例").color(p.text)).id;
+                        let r = text_field(ui, lid, &mut it.rate, "%", bg, true);
+                        mark_pending(ui, &r, pending);
+                        f.keys(ui, &k, &r, can);
+                    });
+                }
                 let help = if is_new {
-                    "新增的项目：填写名称和费率后点击 ✔ 生效"
+                    "新增的项目：填写名称和征收比例后点击 ✔ 生效"
                 } else {
-                    "自行添加的项目（内置默认无此项）"
+                    "自行添加的项目（内置默认无此项）；减征优惠同样适用"
                 };
                 f.notes(ui, &k, help, None);
             }
         }
     }
-    if f.modified(key::ITEMS_REMOVED) {
+    if f.modified(key::ITEMS_REMOVED) || f.pending(key::ITEMS_REMOVED) {
         // 删除或调整了默认项目：单独一行标记，计入“与内置默认不同”的项数
         ui.horizontal(|ui| {
             ui.add_space(LABEL_W + 8.0);
@@ -874,6 +1184,30 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
             });
         }
     });
+
+    // ---- 计税依据 ----
+    group_title(ui, "计税依据");
+    row(
+        ui,
+        f,
+        key::BASE,
+        "计税依据",
+        "依法以实际缴纳的增值税税额为计税依据",
+        Tag::Confirmed,
+        surcharge_base_text(def.surcharge_base),
+        |ui, l| {
+            ComboBox::from_id_salt("surcharge_base")
+                .selected_text(surcharge_base_text(d.surcharge_base))
+                .width(CTRL_W)
+                .show_ui(ui, |ui| {
+                    for b in [SurchargeBase::Vat, SurchargeBase::NetRevenue] {
+                        ui.selectable_value(&mut d.surcharge_base, b, surcharge_base_text(b));
+                    }
+                })
+                .response
+                .labelled_by(l)
+        },
+    );
 }
 
 fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
@@ -1139,7 +1473,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         f,
         key::SURCHARGE_ROUNDING,
         "附加税费舍入方式",
-        "计征多个项目时适用；默认各项目分别按分舍入",
+        "征收多个项目时适用；默认各项目分别按分舍入",
         Tag::Pending,
         surcharge_rounding_text(def.surcharge_rounding),
         |ui, l| {

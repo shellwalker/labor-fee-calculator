@@ -1,7 +1,7 @@
 //! 桌面程序的状态与操作逻辑（与界面绘制分离，便于测试）。所有计算都调用 labor-fee-core / labor-fee-batch。
 
 use crate::settings::{
-    item_index, key, Dialog, Prefs, SettingsDraft, SettingsStore, SettingsWindow, ThemeChoice,
+    item_index, Dialog, Prefs, SettingsDraft, SettingsStore, SettingsWindow, ThemeChoice,
 };
 use labor_fee_batch::{InputKind, Output};
 use labor_fee_core::{
@@ -311,10 +311,15 @@ pub fn fields(b: &Breakdown) -> Vec<Field> {
         f("增值税税额", b.vat.to_string()),
     ];
     for l in &b.surcharges {
-        v.push(f(
-            &format!("  {}（{}）", l.name, pct(l.rate)),
-            l.amount.to_string(),
-        ));
+        let rate = if l.relief_rate.is_zero() {
+            pct(l.statutory_rate)
+        } else {
+            format!("{}，减征 {}", pct(l.statutory_rate), pct(l.relief_rate))
+        };
+        v.push(f(&format!("  {}（{rate}）", l.name), l.amount.to_string()));
+    }
+    if !b.surcharge_relief.is_zero() {
+        v.push(f("附加税费减征额", b.surcharge_relief.to_string()));
     }
     v.push(f("增值税附加税费合计", b.surcharge_total.to_string()));
     v.extend([
@@ -553,28 +558,23 @@ impl AppState {
         }
     }
 
-    /// 单项恢复默认：内置默认值总是有效，直接生效并保存（同时放弃本项未生效的输入）。
+    /// 单项“默认”：把设置行 `k` 的输入填为内置默认值，进入未生效状态（不弹框、不保存）；
+    /// 之后点击 √ 生效并保存，点击 × 放弃。生效值已等于默认时无变化。
     pub fn reset_setting(&mut self, k: &str) -> bool {
-        let Some(w) = &self.settings else {
+        let Some(w) = &mut self.settings else {
             return false;
         };
-        let def = w.applied.defaults();
-        let mut c = w.applied.clone();
+        let def = w.edit.defaults();
         if let Some(i) = item_index(k) {
-            match w.applied.standard_item(i, &def) {
-                Some(it) => c.items[i] = it.clone(),
+            match w.edit.standard_item(i, &def).cloned() {
+                Some(it) => w.edit.items[i] = it,
                 None => return false,
             }
         } else {
-            let _ = c.copy_row(&def, k);
+            let _ = w.edit.copy_row(&def, k);
         }
-        let ok = self.commit(c, k);
-        if ok && k == key::ITEMS_REMOVED {
-            if let Some(w) = &mut self.settings {
-                w.edit.items = w.applied.items.clone();
-            }
-        }
-        ok
+        w.message = None;
+        true
     }
 
     /// 删除附加税费项目：尚未生效的新增项目直接移除；已生效的自定义项目删除后立即生效。

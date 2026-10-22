@@ -106,12 +106,29 @@ fn print_breakdown(b: &Breakdown) {
         println!("  （未达到增值税起征点，不征收增值税及附加税费）");
     }
     for l in &b.surcharges {
-        println!(
-            "{}{:>14}  （费率 {}）",
-            label(&format!("  {}", l.name)),
-            l.amount,
-            pct(l.rate)
-        );
+        if l.relief_rate.is_zero() {
+            println!(
+                "{}{:>14}  （费率 {}）",
+                label(&format!("  {}", l.name)),
+                l.amount,
+                pct(l.statutory_rate)
+            );
+        } else {
+            println!(
+                "{}{:>14}  （法定费率 {}，减征 {}，实际征收率 {}；减征前 {}，减征额 {}）",
+                label(&format!("  {}", l.name)),
+                l.amount,
+                pct(l.statutory_rate),
+                pct(l.relief_rate),
+                pct(l.rate),
+                l.amount_before_relief,
+                l.relief_amount
+            );
+        }
+    }
+    if !b.surcharge_relief.is_zero() {
+        line("附加税费合计（减征前）", b.surcharge_before_relief);
+        line("附加税费减征额", b.surcharge_relief);
     }
     line("增值税附加税费合计", b.surcharge_total);
     line("企业总支出", b.total_cost);

@@ -55,7 +55,14 @@ function render(b) {
   let h = '<table>';
   h += row('不含增值税收入', b.net_income + (b.vat_exempt ? '（未达到起征点，不征收增值税及附加税费）' : ''));
   h += row('增值税税额', b.vat);
-  for (const s of b.surcharges) h += row(`${s.name}（${fmtPct(s.rate)}）`, s.amount);
+  for (const s of b.surcharges) {
+    if (Number(s.relief_rate) === 0) h += row(`${s.name}（${fmtPct(s.statutory_rate)}）`, s.amount);
+    else h += row(`${s.name}（法定 ${fmtPct(s.statutory_rate)}，减征 ${fmtPct(s.relief_rate)}，实际 ${fmtPct(s.rate)}；减征前 ${s.amount_before_relief}）`, s.amount);
+  }
+  if (Number(b.surcharge_relief) !== 0) {
+    h += row('附加税费合计（减征前）', b.surcharge_before_relief);
+    h += row('附加税费减征额', b.surcharge_relief);
+  }
   h += row('增值税附加税费合计', b.surcharge_total);
   h += row('<b>企业总支出</b>', `<b>${b.total_cost}</b>`);
   h += row('每次收入', b.iit.income);

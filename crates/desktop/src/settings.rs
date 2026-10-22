@@ -291,7 +291,7 @@ pub struct ItemDraft {
     pub name: String,
     /// 费率（百分数，如 "3"）。
     pub rate: String,
-    /// 是否计征。
+    /// 是否征收。
     pub enabled: bool,
 }
 
@@ -314,6 +314,10 @@ pub struct SettingsDraft {
     pub threshold: String,
     pub levy_at_threshold: bool,
     pub surcharge_base: SurchargeBase,
+    /// 是否享受附加税费减征优惠（全局，作用于全部征收项目）。
+    pub relief_enabled: bool,
+    /// 减征比例（百分数，如 "50"）。
+    pub relief_rate: String,
     pub items: Vec<ItemDraft>,
     pub fixed_limit: String,
     pub fixed_deduction: String,
@@ -327,7 +331,7 @@ pub struct SettingsDraft {
     pub max_net_income: String,
 }
 
-/// 附加税费项目是否与默认一致：名称、是否计征相同，费率按数值比较（“7”与“7.0”视为相同）。
+/// 附加税费项目是否与默认一致：名称、是否征收相同，费率按数值比较（“7”与“7.0”视为相同）。
 pub fn item_same(a: &ItemDraft, b: &ItemDraft) -> bool {
     a.name.trim() == b.name.trim()
         && a.enabled == b.enabled
@@ -339,7 +343,7 @@ pub fn items_same(a: &[ItemDraft], b: &[ItemDraft]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| item_same(x, y))
 }
 
-fn pct_text(d: Decimal) -> String {
+pub fn pct_text(d: Decimal) -> String {
     (d * Decimal::ONE_HUNDRED).normalize().to_string()
 }
 
@@ -359,6 +363,8 @@ pub mod key {
     pub const THRESHOLD_ENABLED: &str = "vat.threshold_enabled";
     pub const LEVY_AT: &str = "vat.levy_at_threshold";
     pub const BASE: &str = "surcharge.base";
+    /// 减征优惠（是否享受 + 减征比例，一行确认）。
+    pub const RELIEF: &str = "surcharge.relief";
     pub const MODE: &str = "rounding.mode";
     pub const SURCHARGE_ROUNDING: &str = "rounding.surcharge";
     pub const PREFER: &str = "reverse.prefer";
@@ -391,6 +397,8 @@ impl SettingsDraft {
             threshold: num_text(cfg.vat.threshold),
             levy_at_threshold: cfg.vat.levy_at_threshold,
             surcharge_base: cfg.surcharge.base,
+            relief_enabled: cfg.surcharge.relief_enabled,
+            relief_rate: pct_text(cfg.surcharge.relief_rate),
             items: cfg
                 .surcharge
                 .items
@@ -457,6 +465,11 @@ impl SettingsDraft {
         }
         cfg.vat.levy_at_threshold = self.levy_at_threshold;
         cfg.surcharge.base = self.surcharge_base;
+        cfg.surcharge.relief_enabled = self.relief_enabled;
+        match rate(&self.relief_rate) {
+            Some(r) if r >= Decimal::ZERO && r <= Decimal::ONE => cfg.surcharge.relief_rate = r,
+            _ => err(key::RELIEF, "减征比例请输入 0～100 之间的百分数，如 50"),
+        }
         cfg.surcharge.items.clear();
         for (i, it) in self.items.iter().enumerate() {
             let k = format!("{}.{i}", key::ITEMS);
@@ -557,7 +570,7 @@ impl SettingsDraft {
 
     /// 显示“已修改”标签的各行（字段标识），与设置界面逐行一致。
     ///
-    /// 附加税费项目逐项计：与默认同位置同名的标准项目按“是否计征 + 费率数值”比较，
+    /// 附加税费项目逐项计：与默认同位置同名的标准项目按“是否征收 + 费率数值”比较，
     /// 自行添加的项目每项计 1；删除了默认项目时另计 1 行（`surcharge.items.removed`）。
     pub fn modified_rows(&self) -> Vec<String> {
         let d = self.defaults();
@@ -575,6 +588,7 @@ impl SettingsDraft {
         add(key::THRESHOLD, !same_value(&self.threshold, &d.threshold));
         add(key::LEVY_AT, self.levy_at_threshold != d.levy_at_threshold);
         add(key::BASE, self.surcharge_base != d.surcharge_base);
+        add(key::RELIEF, !relief_same(self, &d));
         for i in 0..self.items.len() {
             add(&format!("{}.{i}", key::ITEMS), self.item_modified(i));
         }
@@ -686,9 +700,14 @@ pub fn prefer_text(p: Prefer) -> &'static str {
 
 // ---------------- 逐项确认（编辑态 / 生效值） ----------------
 
-/// 两个附加税费项目的输入是否相同（名称、是否计征、费率数值）。
+/// 两个附加税费项目的输入是否相同（名称、是否征收、费率数值）。
 fn item_input_same(a: &ItemDraft, b: &ItemDraft) -> bool {
     a.name.trim() == b.name.trim() && a.enabled == b.enabled && same_value(&a.rate, &b.rate)
+}
+
+/// 减征优惠是否相同：是否享受相同，且减征比例数值相同。
+fn relief_same(a: &SettingsDraft, b: &SettingsDraft) -> bool {
+    a.relief_enabled == b.relief_enabled && same_value(&a.relief_rate, &b.relief_rate)
 }
 
 fn brackets_same(a: &[BracketDraft], b: &[BracketDraft]) -> bool {
@@ -722,11 +741,13 @@ impl SettingsDraft {
             key::THRESHOLD,
             key::LEVY_AT,
             key::BASE,
+            key::RELIEF,
         ]
         .iter()
         .map(|s| s.to_string())
         .collect();
         v.extend((0..self.items.len()).map(|i| format!("{}.{i}", key::ITEMS)));
+        v.push(key::ITEMS_REMOVED.to_string());
         v.extend(
             [
                 key::FIXED_LIMIT,
@@ -762,6 +783,8 @@ impl SettingsDraft {
             key::THRESHOLD => same_value(&self.threshold, &other.threshold),
             key::LEVY_AT => self.levy_at_threshold == other.levy_at_threshold,
             key::BASE => self.surcharge_base == other.surcharge_base,
+            key::RELIEF => relief_same(self, other),
+            key::ITEMS_REMOVED => self.standard_items_removed() == other.standard_items_removed(),
             key::FIXED_LIMIT => same_value(&self.fixed_limit, &other.fixed_limit),
             key::FIXED_DEDUCTION => same_value(&self.fixed_deduction, &other.fixed_deduction),
             key::PCT_DEDUCTION => same_value(&self.pct_deduction, &other.pct_deduction),
@@ -801,6 +824,10 @@ impl SettingsDraft {
             key::THRESHOLD => self.threshold = src.threshold.clone(),
             key::LEVY_AT => self.levy_at_threshold = src.levy_at_threshold,
             key::BASE => self.surcharge_base = src.surcharge_base,
+            key::RELIEF => {
+                self.relief_enabled = src.relief_enabled;
+                self.relief_rate = src.relief_rate.clone();
+            }
             key::ITEMS_REMOVED => self.items = src.items.clone(),
             key::FIXED_LIMIT => self.fixed_limit = src.fixed_limit.clone(),
             key::FIXED_DEDUCTION => self.fixed_deduction = src.fixed_deduction.clone(),
@@ -816,6 +843,72 @@ impl SettingsDraft {
             _ => {}
         }
         Ok(())
+    }
+}
+
+// ---------------- 附加税费合计比例 ----------------
+
+/// 附加税费合计比例中的一项（征收项目）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SummaryLine {
+    pub name: String,
+    /// 法定费率（税率）。
+    pub statutory: Decimal,
+    /// 减征比例（未享受减征为 0）。
+    pub relief: Decimal,
+    /// 实际征收率 = 法定费率 × (1 − 减征比例)。
+    pub actual: Decimal,
+}
+
+/// 附加税费合计比例（占计税依据）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SurchargeSummary {
+    pub lines: Vec<SummaryLine>,
+    /// 减征前合计（各征收项目法定费率之和）。
+    pub statutory_total: Decimal,
+    /// 减征后合计（实际征收率之和）。
+    pub actual_total: Decimal,
+    /// 适用的减征比例（未享受减征为 0）。
+    pub relief: Decimal,
+}
+
+/// 城市维护建设税税率对应的纳税人所在地（`URBAN_CONSTRUCTION_RATES` 的序号）；非法定税率返回 None。
+pub fn urban_region(rate: &str) -> Option<usize> {
+    let r = parse_dec(rate)? / Decimal::ONE_HUNDRED;
+    labor_fee_core::URBAN_CONSTRUCTION_RATES
+        .iter()
+        .position(|(_, x)| *x == r)
+}
+
+impl SettingsDraft {
+    /// 按本草稿计算附加税费合计比例；费率或减征比例无法解析时返回 None。
+    pub fn surcharge_summary(&self) -> Option<SurchargeSummary> {
+        let mut sc = Config::default().surcharge;
+        sc.relief_enabled = self.relief_enabled;
+        sc.relief_rate = parse_dec(&self.relief_rate)? / Decimal::ONE_HUNDRED;
+        if sc.relief_rate < Decimal::ZERO || sc.relief_rate > Decimal::ONE {
+            return None;
+        }
+        sc.items.clear();
+        for it in &self.items {
+            let r = parse_dec(&it.rate)? / Decimal::ONE_HUNDRED;
+            sc.items
+                .push(SurchargeItem::new(it.name.trim(), r, it.enabled));
+        }
+        Some(SurchargeSummary {
+            lines: sc
+                .enabled_items()
+                .map(|i| SummaryLine {
+                    name: i.name.clone(),
+                    statutory: i.rate,
+                    relief: sc.applied_relief(),
+                    actual: sc.actual_rate(i.rate),
+                })
+                .collect(),
+            statutory_total: sc.statutory_total_rate(),
+            actual_total: sc.actual_total_rate(),
+            relief: sc.applied_relief(),
+        })
     }
 }
 

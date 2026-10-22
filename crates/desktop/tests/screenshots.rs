@@ -156,7 +156,7 @@ fn screenshots() {
         }
         shoot("5a-settings-surcharge-default", st, theme, size, |_| {});
 
-        // 只勾选，不改费率
+        // 只选“是”，不改费率
         st = AppState::with_default_config();
         st.open_settings();
         if let Some(d) = st.settings.as_mut().map(|w| &mut w.edit) {
@@ -186,7 +186,7 @@ fn screenshots_settings() {
         st.settings.as_mut().unwrap().edit.section = sec;
         st
     };
-    // 已生效：征收率 3%、城市维护建设税计征
+    // 已生效：征收率 3%、城市维护建设税征收
     let modified = |sec: Section| {
         let mut st = at(sec);
         {
@@ -255,5 +255,87 @@ fn screenshots_settings() {
         shoot("s13-file-menu", st, theme, size, |h| {
             h.get_by_label("文件").click();
         });
+    }
+}
+
+/// 附加税费页：减征优惠、是否征收单选、合计比例（第六轮设计复核）。
+#[test]
+#[ignore = "需要 GPU / 软件渲染，手动运行"]
+fn screenshots_surcharge() {
+    use labor_fee_desktop::settings::{key, Dialog};
+    let size = (1280.0, 820.0);
+    let at = || {
+        let mut st = AppState::with_default_config();
+        st.open_settings();
+        st.settings.as_mut().unwrap().edit.section = Section::Surcharge;
+        st
+    };
+    // 已生效：三项全部征收（城建按市区 7%）+ 减半征收
+    let three = || {
+        let mut st = at();
+        {
+            let w = st.settings.as_mut().unwrap();
+            w.edit.items[0].enabled = true;
+            w.edit.items[2].enabled = true;
+        }
+        st.confirm_setting("surcharge.items.0");
+        st.confirm_setting("surcharge.items.2");
+        st
+    };
+    for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
+        // 1. 默认：减征“是”50%，仅教育费附加征收，合计 3% → 1.5%
+        shoot("v1-surcharge-default", at(), theme, size, |_| {});
+        // 2. 三项征收 + 减征：合计 12% → 6%
+        shoot("v2-surcharge-three-relief", three(), theme, size, |_| {});
+        if theme == ThemeChoice::Dark {
+            continue;
+        }
+        shoot(
+            "v2b-surcharge-three-relief-items",
+            three(),
+            theme,
+            size,
+            |h| {
+                h.get_by_label("城市维护建设税是否征收：是").scroll_to_me();
+            },
+        );
+        // 3. 编辑中：城建选“是”（未生效，展开纳税人所在地，合计比例显示预览）
+        let mut st = at();
+        st.settings.as_mut().unwrap().edit.items[0].enabled = true;
+        shoot("v3-surcharge-editing", st, theme, size, |_| {});
+        let mut st = at();
+        st.settings.as_mut().unwrap().edit.items[0].enabled = true;
+        st.settings.as_mut().unwrap().edit.items[0].rate = "5".into();
+        shoot("v3b-surcharge-editing-region", st, theme, size, |h| {
+            h.get_by_label("纳税人所在地在县城、镇：税率 5%")
+                .scroll_to_me();
+        });
+        // 3c. 单项“默认”：减征已改为“否”并生效，点“默认”后填入“是，50%”待确认
+        let mut st = at();
+        st.settings.as_mut().unwrap().edit.relief_enabled = false;
+        st.confirm_setting(key::RELIEF);
+        st.reset_setting(key::RELIEF);
+        shoot("v3c-surcharge-default-pending", st, theme, size, |_| {});
+        // 4. 全部恢复默认确认框
+        let mut st = three();
+        st.settings.as_mut().unwrap().dialog = Some(Dialog::ResetAll);
+        shoot("v4-reset-all-confirm", st, theme, size, |_| {});
+    }
+    // 5. 收入计算页：逐项列示减征前后金额
+    for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
+        let mut cfg = labor_fee_core::Config::default();
+        for it in &mut cfg.surcharge.items {
+            it.enabled = true;
+        }
+        let mut st = AppState::new(cfg, "已保存的设置").unwrap();
+        st.forward.input = "10000".into();
+        st.calc_forward();
+        shoot("v5-forward-three-relief", st, theme, size, |_| {});
+        if theme == ThemeChoice::Light {
+            let mut st = AppState::with_default_config();
+            st.forward.input = "10000".into();
+            st.calc_forward();
+            shoot("v5b-forward-default", st, theme, size, |_| {});
+        }
     }
 }

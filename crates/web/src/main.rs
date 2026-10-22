@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v = body_json(resp).await;
         assert_eq!(v["take_home"], "8400.00");
-        assert_eq!(v["total_cost"], "10103.00");
+        assert_eq!(v["total_cost"], "10101.50");
         let resp = router()
             .oneshot(
                 Request::get("/api/reverse?take_home=8400")
@@ -308,7 +308,7 @@ mod tests {
             .unwrap();
         let v = body_json(resp).await;
         assert_eq!(v["exact"], true);
-        assert_eq!(v["breakdown"]["total_cost"], "10103.00");
+        assert_eq!(v["breakdown"]["total_cost"], "10101.50");
         assert_eq!(v["breakdown"]["net_income"], "10000.00");
         let resp = router()
             .oneshot(
@@ -328,7 +328,7 @@ mod tests {
                 .body(Body::empty())
                 .unwrap()
         };
-        let resp = router().oneshot(get("10103")).await.unwrap();
+        let resp = router().oneshot(get("10101.50")).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_json(resp).await["net_income"], "10000.00");
         let resp = router().oneshot(get("1005.00")).await.unwrap();
@@ -336,7 +336,7 @@ mod tests {
         let v = body_json(resp).await;
         assert_eq!(v["reason"], "threshold");
         assert_eq!(v["gap"]["lower"]["total_cost"], "999.99");
-        assert_eq!(v["gap"]["upper"]["total_cost"], "1010.30");
+        assert_eq!(v["gap"]["upper"]["total_cost"], "1010.15");
         assert_eq!(v["gap"]["upper"]["net_income"], "1000.00");
         let msg = v["error"].as_str().unwrap();
         assert!(
@@ -344,7 +344,7 @@ mod tests {
             "{msg}"
         );
         assert!(
-            msg.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.30"),
+            msg.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.15"),
             "{msg}"
         );
     }
@@ -353,7 +353,7 @@ mod tests {
     async fn batch_upload_total_cost_gap_note() {
         let boundary = "XB";
         let body = format!(
-            "--{boundary}\r\nContent-Disposition: form-data; name=\"input_kind\"\r\n\r\ntotal-cost\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"c.csv\"\r\nContent-Type: text/csv\r\n\r\n企业总成本\n10103\n1005\n\r\n--{boundary}--\r\n"
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"input_kind\"\r\n\r\ntotal-cost\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"c.csv\"\r\nContent-Type: text/csv\r\n\r\n企业总成本\n10101.50\n1005\n\r\n--{boundary}--\r\n"
         );
         let req = Request::post("/api/batch")
             .header(
@@ -400,7 +400,7 @@ mod tests {
         assert!(cd.contains("filename*=UTF-8''"));
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         let s = String::from_utf8(b.to_vec()).unwrap();
-        assert!(s.contains("10103.00"));
+        assert!(s.contains("10101.50"));
     }
 
     #[tokio::test]

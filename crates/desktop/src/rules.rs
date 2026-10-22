@@ -115,13 +115,26 @@ pub fn vat_condition(cfg: &Config) -> String {
     )
 }
 
-/// 增值税附加税费的计算说明（每个计征项目一行，另附合计与未计征项目）。
+/// 增值税附加税费的计算说明（每个征收项目一行，另附合计、合计比例与不征收项目）。
 pub fn surcharge_lines(cfg: &Config) -> Vec<String> {
     let base = surcharge_base_text(cfg.surcharge.base);
     let mut v: Vec<String> = cfg
         .surcharge
         .enabled_items()
-        .map(|it| format!("{} = {base} × {}", it.name, pct(it.rate)))
+        .map(|it| {
+            let actual = cfg.surcharge.actual_rate(it.rate);
+            if actual == it.rate {
+                format!("{} = {base} × {}", it.name, pct(it.rate))
+            } else {
+                format!(
+                    "{} = {base} × {} × (1 − 减征 {}) = {base} × {}",
+                    it.name,
+                    pct(it.rate),
+                    pct(cfg.surcharge.applied_relief()),
+                    pct(actual)
+                )
+            }
+        })
         .collect();
     if v.is_empty() {
         v.push("未启用任何附加税费项目".into());
@@ -139,6 +152,21 @@ pub fn surcharge_lines(cfg: &Config) -> Vec<String> {
                 labor_fee_core::SurchargeRounding::Total => "合计后一次舍入",
             }
         ));
+        let (st, ac) = (
+            cfg.surcharge.statutory_total_rate(),
+            cfg.surcharge.actual_total_rate(),
+        );
+        if st == ac {
+            v.push(format!("附加税费合计比例 {}（占计税依据）", pct(st)));
+        } else {
+            v.push(format!(
+                "附加税费合计比例：减征前 {}，减征后 {}（减征 {}，依据{}）",
+                pct(st),
+                pct(ac),
+                pct(cfg.surcharge.applied_relief()),
+                RELIEF_POLICY_NAME
+            ));
+        }
     }
     let off: Vec<String> = cfg
         .surcharge
@@ -148,7 +176,7 @@ pub fn surcharge_lines(cfg: &Config) -> Vec<String> {
         .map(|i| format!("{}（{}）", i.name, pct(i.rate)))
         .collect();
     if !off.is_empty() {
-        v.push(format!("未计征：{}", off.join("、")));
+        v.push(format!("不征收：{}", off.join("、")));
     }
     v
 }
@@ -227,3 +255,13 @@ pub fn rule_groups(cfg: &Config) -> Vec<RuleGroup> {
 /// 增值税起征点与 1% 优惠征收率依据。
 pub const POLICY_VAT_NAME: &str = "财政部 税务总局公告2026年第10号";
 pub const POLICY_VAT_URL: &str = "https://www.mof.gov.cn/jrttts/202602/t20260203_3983175.htm";
+
+/// 增值税小规模纳税人附加税费减征政策（“六税两费”减半征收）。
+pub const RELIEF_POLICY_NAME: &str = "财政部 税务总局公告2023年第12号";
+pub const RELIEF_POLICY_URL: &str = "https://www.mof.gov.cn/jrttts/202308/t20230802_3899936.htm";
+pub const RELIEF_POLICY_URL_TAX: &str =
+    "https://fgk.chinatax.gov.cn/zcfgk/c102416/c5210453/content.html";
+/// 国家税务总局问答：自然人按小规模纳税人享受减征（代开发票环节适用）。
+pub const RELIEF_QA_NAME: &str = "国家税务总局“六税两费”减免政策问答第10问";
+pub const RELIEF_QA_URL: &str =
+    "https://www.chinatax.gov.cn/chinatax/n810356/n3010387/c5215113/content.html";

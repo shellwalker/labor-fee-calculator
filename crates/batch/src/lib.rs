@@ -283,6 +283,7 @@ fn result_headers(cfg: &Config) -> Vec<String> {
     h.extend(cfg.surcharge.enabled_items().map(|i| i.name.clone()));
     h.extend(
         [
+            "附加税费减征额",
             "增值税附加税费合计",
             "企业总支出",
             "每次收入",
@@ -315,6 +316,7 @@ fn result_values(r: &RowResult) -> Vec<Out> {
     let mut v = vec![Out::Money(b.net_income), Out::Money(b.vat)];
     v.extend(b.surcharges.iter().map(|l| Out::Money(l.amount)));
     v.extend([
+        Out::Money(b.surcharge_relief),
         Out::Money(b.surcharge_total),
         Out::Money(b.total_cost),
         Out::Money(b.iit.income),
