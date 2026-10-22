@@ -7,6 +7,8 @@ edition.workspace = true
 rust-version = "1.95"
 license.workspace = true
 
+build = "build.rs"
+
 [[bin]]
 name = "labor-fee-desktop"
 path = "src/main.rs"
@@ -32,9 +34,22 @@ eframe = { version = "0.37", default-features = false, features = [
     "x11",
 ] }
 rfd = { version = "0.17", default-features = false }
+egui_extras = { version = "0.37", default-features = false }
+serde.workspace = true
+toml.workspace = true
+# 平台标准配置目录（Linux ~/.config、macOS ~/Library/Application Support、Windows %APPDATA%）
+dirs = "6"
+
+# macOS 原生应用菜单（关于…/偏好设置… ⌘,/退出 ⌘Q）
+[target.'cfg(target_os = "macos")'.dependencies]
+muda = { version = "0.17", default-features = false }
+
+[build-dependencies]
+# Windows 可执行文件图标资源（MSVC 用 rc.exe，mingw 用 windres）
+embed-resource = "3"
 
 [dev-dependencies]
-egui_kittest = "0.37"
+egui_kittest = { version = "0.37", features = ["wgpu", "snapshot"] }
 rust_decimal_macros.workspace = true
 ttf-parser = "0.25"
 rust_xlsxwriter = "0.89"

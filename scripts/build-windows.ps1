@@ -8,6 +8,7 @@
     - Visual Studio 2019+ 生成工具（“使用 C++ 的桌面开发”工作负载，提供 link.exe 与 Windows SDK）
   桌面程序发布构建为 Windows 子系统（源码中 windows_subsystem = "windows"），双击运行不会弹出控制台窗口。
   不需要 GTK；文件对话框使用系统原生对话框。
+  可执行文件图标由 crates/desktop/build.rs 通过 embed-resource 嵌入（MSVC 用 rc.exe，随 Windows SDK 提供）。
 
 .PARAMETER Target
   Rust 目标，默认 x86_64-pc-windows-msvc；也可 aarch64-pc-windows-msvc 或 x86_64-pc-windows-gnu。
@@ -64,8 +65,9 @@ labor-fee-desktop.exe  桌面程序（双击运行）
 labor-fee.exe          命令行工具（如随包提供）
 labor-fee-web.exe      Web 服务（如随包提供）
 
-自定义口径：labor-fee-desktop.exe --config 口径.toml，或在程序“口径”页签加载。
-界面内嵌字体为 Noto Sans CJK SC 子集（SIL OFL 1.1），见 字体许可证-OFL.txt。
+口径与主题：在程序菜单“文件 → 设置…”（Ctrl+,）中逐项修改，自动保存到 %APPDATA%\labor-fee-desktop\。
+临时口径文件：labor-fee-desktop.exe --config 口径.toml（只对本次运行生效）。
+界面内嵌字体为 Noto Sans CJK SC 子集与 Noto Emoji 子集（SIL OFL 1.1），见 字体许可证-OFL.txt。
 "@ | Set-Content -Encoding UTF8 (Join-Path $Out "说明.txt")
     Get-ChildItem $Out -File | Get-FileHash -Algorithm SHA256 |
         ForEach-Object { "{0}  {1}" -f $_.Hash.ToLower(), (Split-Path $_.Path -Leaf) } |

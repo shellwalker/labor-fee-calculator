@@ -54,6 +54,19 @@ for b in "${BINS[@]}"; do
     install -m 755 "$TDIR/$TARGET/release/$b" "$OUT/$b"
 done
 copy_docs "$OUT"
+# 图标与桌面入口（可复制到 ~/.local/share/applications/ 与 ~/.local/share/icons/hicolor/256x256/apps/）
+install -m 644 "$ROOT/crates/desktop/assets/icon/icon-256.png" "$OUT/labor-fee-desktop.png"
+cat >"$OUT/labor-fee-desktop.desktop" <<DESKTOP
+[Desktop Entry]
+Type=Application
+Name=$APP_TITLE
+Comment=劳务报酬增值税、附加税、个税预扣计算
+Exec=labor-fee-desktop
+Icon=labor-fee-desktop
+Categories=Office;Finance;
+StartupWMClass=labor-fee-desktop
+Terminal=false
+DESKTOP
 write_checksums "$OUT"
 TAR="$DIST/labor-fee-$VERSION-linux-$ARCH.tar.gz"
 tar -C "$DIST" -czf "$TAR" "linux-$ARCH"

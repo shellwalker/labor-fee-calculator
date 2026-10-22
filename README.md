@@ -32,6 +32,7 @@ samples/      测试用表格（到手样例.xlsx）
 examples/sample.csv   批量反算示例
 config/default.toml   默认口径配置（同时内置于程序）
 docs/ASSUMPTIONS.md   口径假设与待确认清单
+docs/UI_DESIGN.md     桌面程序界面设计说明
 ```
 
 ## 构建
@@ -137,27 +138,52 @@ labor-fee-web --listen 127.0.0.1:8080 [-c my.toml] [--max-upload-mb 20]
 `labor-fee-desktop` 是单个可执行文件，计算全部复用 `crates/core` 与 `crates/batch`。
 
 ```bash
-labor-fee-desktop                   # 内置默认口径
-labor-fee-desktop --config my.toml  # 启动时加载自定义口径
+labor-fee-desktop                   # 使用“设置”中保存的口径（未保存过则为内置默认）
+labor-fee-desktop --config my.toml  # 本次运行临时使用口径文件（不写入设置）
+labor-fee-desktop --version         # 版本、git 短哈希、构建日期
 ```
 
-界面（顶部为标题和页签栏，右上角显示当前口径来源）：
+界面设计说明见 [docs/UI_DESIGN.md](docs/UI_DESIGN.md)。默认浅色/深色**跟随系统**，可在设置中改为固定浅色或深色（顶栏的主题按钮也可快速切换），选择会被记住。
 
-| 页签 | 内容 |
+窗口结构：顶部品牌栏（图标、应用名、导航“正算 / 反算 / 按总成本 / 批量”、口径状态徽章、主题切换、设置），底部状态栏（口径是否为内置默认、版本与构建信息）。Windows / Linux 在窗口顶部有菜单栏；macOS 使用系统原生应用菜单。
+
+| 页面 | 内容 |
 |---|---|
-| 正算 | 输入不含税收入，点“计算”或回车 |
-| 反算 | 输入实际到手 |
-| 按总成本 | 输入企业总成本；落在空白区间或舍入空位时用红字显示原因，两侧最近的有效总成本是按钮，点击即填入并重算 |
-| 批量 | 文件路径（“选择文件…”或直接粘贴路径）、输入列类型（到手金额 / 不含税收入 / 企业总成本）、列标题；“执行”后显示统计和前 50 行预览，可“另存为…”或“保存到输入文件旁” |
-| 口径 | 只读显示当前生效的 TOML；可“加载 TOML 文件…”、输入路径后“加载”、“恢复内置默认” |
+| 正算 / 反算 / 按总成本 | 左：输入卡片（大号输入框、单位“元”、回车或“计算”、快捷示例金额）与最近计算记录；中：企业总成本 / 个税 / 实际到手三张指标卡、校验状态徽章、“增值税与附加税”和“个人所得税”两组明细（千分位、等宽右对齐）、算式核对；右：**试算规则**面板（按当前口径动态生成：增值税率与征收门槛、附加税 = 增值税 × 3%、企业承担、减除费用规则、预扣率表、逐步舍入、反算取最小解、真空区间，并注明国家税务总局公告 2018 年第 61 号），可收起 |
+| 按总成本（无解时） | 红色警示卡：原因、数轴示意（两侧有效值与空白段）、两侧最近的有效总成本按钮（点击即填入并重算） |
+| 批量 | 四步：① 拖放或选择文件 ② 选择输入列（到手金额 / 不含税收入 / 企业总成本）和列标题 ③ 执行 ④ 导出（保存到输入文件旁 / 另存为）；彩色统计卡片（总行数、成功、不可精确/不可达、错误、空白）；预览表（表头固定、斑马纹、数字右对齐、错误行红底、可横向滚动、可调列宽） |
 
-三个单笔页签都用表格显示：不含税收入、增值税、附加税、企业总成本、减除费用、应纳税所得额、预扣率、速算扣除数、个税、实际到手，最后一行是校验状态（正算：恒等式自检；反算：正算回去与输入一致、等效区间；按总成本：是否可达）。
+窗口宽度 ≥ 1120 时三栏，820～1120 时两栏（试算规则移到输入下方），更窄时单列滚动；最小窗口 960×640。
+
+### 菜单与快捷键
+
+| 平台 | 入口 |
+|---|---|
+| macOS | 应用菜单：关于劳务报酬计算工具、偏好设置… `⌘,`、服务、隐藏 `⌘H`、退出 `⌘Q`；文件：打开批量文件… `⌘O`；窗口；帮助：使用说明 |
+| Windows / Linux | 文件：打开批量文件… `Ctrl+O`、设置… `Ctrl+,`、退出 `Ctrl+Q`；帮助：使用说明、关于 |
+
+拖放表格文件到窗口任意位置会直接进入批量页。
+
+### 设置
+
+“设置”对话框分为 增值税与附加税 / 个税（劳务报酬）/ 舍入与反算 / 外观 四组，逐项编辑全部口径：增值税征收率、征收门槛及是否含本数、附加税计税依据/减半/税目（可增删）、定额减除上限与金额、定率减除比例、预扣率表各档（可增删，最后一档无上限）、小数位、舍入方式、附加税舍入时点、反算多解取值、校准窗口与搜索上限，以及主题。
+
+- 每项标注 **已确认 / 已核实 / 待确认 / 实现参数**；改成与内置默认不同的值后显示 **已修改**，并提供单项“默认”按钮；底部有“全部恢复默认”。
+- 输入实时校验，错误项标红并在分组导航上显示错误数；有错误时不能保存。
+- “保存”后立即生效（已有结果按新口径重算），“取消”放弃修改。
+- 设置保存在平台标准配置目录的 `labor-fee-desktop/` 下：Linux `~/.config/`（遵循 `$XDG_CONFIG_HOME`）、macOS `~/Library/Application Support/`、Windows `%APPDATA%\`。`preferences.toml` 存主题，`rules.toml` 存口径（与内置默认相同时不保存），由程序自动维护。
 
 测试表格：[samples/到手样例.xlsx](samples/到手样例.xlsx)（到手 500、959.99、960、3360、20000、50000 和一个非法值）。
 
+### 图标、关于与构建信息
+
+- 应用图标由 `scripts/gen-assets.py` 生成（`crates/desktop/assets/icon/`）：窗口图标、Windows 可执行文件图标（`build.rs` 通过 embed-resource 嵌入 `icon.ico`，MSVC 需要 rc.exe，mingw 需要 `x86_64-w64-mingw32-windres`）、macOS `AppIcon.icns`（`build-macos.sh` 打包进 .app），Linux 包内附 `labor-fee-desktop.png` 与 `.desktop` 文件。
+- 窗口标题含版本号；“关于”窗口显示版本、git 短哈希与构建日期（`build.rs` 写入，可用 `LFD_GIT_HASH`、`SOURCE_DATE_EPOCH` 覆盖）、许可、字体 OFL 声明、政策依据链接和免责声明。
+- 界面截图自检：`LFD_SHOTS_DIR=/tmp/shots cargo test -p labor-fee-desktop --test screenshots -- --ignored`（wgpu 离屏渲染；Linux 无 GPU 时安装 `mesa-vulkan-drivers` 用 lavapipe）。
+
 ### 中文字体与许可证
 
-程序内嵌 `crates/desktop/assets/fonts/LaborFeeSansSC-Regular.otf`（约 3 MB）。它是 [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk) 2.004 的子集，包含 ASCII、常用标点符号、全角字符和 GB2312 全部 6763 个汉字。原字体按 **SIL Open Font License 1.1** 授权，Copyright 2014-2021 Adobe。按 OFL 要求，子集已改名为 “LaborFee Sans SC”，许可证全文见 [assets/fonts/OFL.txt](crates/desktop/assets/fonts/OFL.txt)，各平台发布包都附带一份“字体许可证-OFL.txt”。OFL 允许把字体随软件分发（包括嵌入程序），但不允许单独出售字体。
+程序内嵌 `crates/desktop/assets/fonts/LaborFeeSansSC-Regular.otf`（约 3 MB）和图标字体 `LaborFeeIcons-Regular.ttf`（约 16 KB，[Noto Emoji](https://github.com/googlefonts/noto-emoji) 子集，SIL OFL 1.1，已改名 “LaborFee Icons”，只含界面用到的图标）。它是 [Noto Sans CJK SC](https://github.com/notofonts/noto-cjk) 2.004 的子集，包含 ASCII、常用标点符号、全角字符和 GB2312 全部 6763 个汉字。原字体按 **SIL Open Font License 1.1** 授权，Copyright 2014-2021 Adobe。按 OFL 要求，子集已改名为 “LaborFee Sans SC”，许可证全文见 [assets/fonts/OFL.txt](crates/desktop/assets/fonts/OFL.txt)，各平台发布包都附带一份“字体许可证-OFL.txt”。OFL 允许把字体随软件分发（包括嵌入程序），但不允许单独出售字体。
 
 GB2312 以外的罕见字（例如个别人名用字）由 egui 的 `system_fonts` 按需从系统字体补齐。
 
@@ -256,7 +282,7 @@ cargo test
 - 按总成本正算：总成本 0～70,000 元逐分（可达则与正算一致，空位则报原因和两侧最近有效总成本；门槛空白区间正好 1030 个分）；
 - proptest：收入→到手→反算、目标→反算→正算、单调性、按总成本正算；
 - 批量 xlsx/csv（UTF-8/GBK/BOM）读写、按总成本批量时备注列原因；Web 接口（含 422 空位说明）；
-- 桌面程序：状态逻辑（正算/反算/按总成本空位点击重算、口径加载与恢复、批量同步与后台线程、预览与保存、样例表格）及 egui_kittest 界面测试（页签、输入、回车、按钮点击、下拉框）；内嵌字体覆盖界面与核心模块中出现的全部中文字符（kittest 遇到缺字会直接失败）。
+- 桌面程序：状态逻辑（正算/反算/按总成本空位点击重算、口径文件加载与恢复、设置草稿校验/保存/取消/持久化与重新读取、试算规则随口径变化、批量同步与后台线程、预览与保存、样例表格）及 egui_kittest 界面测试（导航、输入、回车、快捷示例、规则面板收起、空位按钮、批量步骤与统计、设置对话框分组/校验/单项恢复默认/保存、菜单、关于、快捷键、最小窗口）；内嵌中文与图标字体覆盖界面与核心模块中出现的全部字符（kittest 遇到缺字会直接失败）。
 
 ## 路线图
 

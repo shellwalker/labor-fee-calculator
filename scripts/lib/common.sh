@@ -34,8 +34,10 @@ labor-fee-desktop  桌面程序（正算 / 反算 / 按总成本 / 批量 / 口�
 labor-fee          命令行工具（如随包提供）
 labor-fee-web      Web 服务（如随包提供）
 
-自定义口径：labor-fee-desktop --config 口径.toml，或在程序“口径”页签加载。
-界面内嵌字体为 Noto Sans CJK SC 子集（SIL OFL 1.1），见 字体许可证-OFL.txt。
+口径与主题：在程序“设置”中逐项修改（Windows/Linux 菜单“文件 → 设置…” Ctrl+,；macOS “偏好设置…” Cmd+,），
+  自动保存到平台标准配置目录下的 labor-fee-desktop/（Linux ~/.config，macOS ~/Library/Application Support，Windows %APPDATA%）。
+临时口径文件：labor-fee-desktop --config 口径.toml（只对本次运行生效）。
+界面内嵌字体为 Noto Sans CJK SC 子集与 Noto Emoji 子集（SIL OFL 1.1），见 字体许可证-OFL.txt。
 TXT
 }
 
@@ -48,6 +50,7 @@ make_app() {
     cp "$exe" "$app/Contents/MacOS/$APP_NAME"
     chmod +x "$app/Contents/MacOS/$APP_NAME"
     cp "$ROOT/crates/desktop/assets/fonts/OFL.txt" "$app/Contents/Resources/"
+    cp "$ROOT/crates/desktop/assets/icon/icon.icns" "$app/Contents/Resources/AppIcon.icns"
     cat >"$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -55,6 +58,8 @@ make_app() {
 <dict>
     <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
     <key>CFBundleExecutable</key><string>$APP_NAME</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>NSHumanReadableCopyright</key><string>内部使用。界面字体 Noto Sans CJK SC / Noto Emoji 子集，SIL OFL 1.1。</string>
     <key>CFBundleIdentifier</key><string>$BUNDLE_ID</string>
     <key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
     <key>CFBundleName</key><string>LaborFee</string>

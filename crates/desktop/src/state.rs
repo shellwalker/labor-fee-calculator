@@ -1,5 +1,6 @@
 //! 桌面程序的状态与操作逻辑（与界面绘制分离，便于测试）。所有计算都调用 labor-fee-core / labor-fee-batch。
 
+use crate::settings::{Prefs, SettingsDraft, SettingsStore, ThemeChoice};
 use labor_fee_batch::{InputKind, Output};
 use labor_fee_core::{
     forward, from_total_cost, Breakdown, CalcError, Config, CostGap, CostGapReason, Decimal,
@@ -19,17 +20,10 @@ pub enum Tab {
     Reverse,
     FromCost,
     Batch,
-    Config,
 }
 
 impl Tab {
-    pub const ALL: [Tab; 5] = [
-        Tab::Forward,
-        Tab::Reverse,
-        Tab::FromCost,
-        Tab::Batch,
-        Tab::Config,
-    ];
+    pub const ALL: [Tab; 4] = [Tab::Forward, Tab::Reverse, Tab::FromCost, Tab::Batch];
 
     pub fn title(self) -> &'static str {
         match self {
@@ -37,9 +31,37 @@ impl Tab {
             Tab::Reverse => "反算",
             Tab::FromCost => "按总成本",
             Tab::Batch => "批量",
-            Tab::Config => "口径",
         }
     }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Tab::Forward => crate::icons::FORWARD,
+            Tab::Reverse => crate::icons::REVERSE,
+            Tab::FromCost => crate::icons::COST,
+            Tab::Batch => crate::icons::BATCH,
+        }
+    }
+
+    /// 页面标题下的一句话说明。
+    pub fn description(self) -> &'static str {
+        match self {
+            Tab::Forward => "输入不含税收入，计算增值税、附加税、企业总成本、个税和实际到手",
+            Tab::Reverse => "输入实际到手金额，反算不含税收入及全部金额，多解时取最小不含税收入",
+            Tab::FromCost => "输入企业总成本，求对应的不含税收入；落在真空区间或舍入空位时说明原因",
+            Tab::Batch => "读取表格中的一列金额，逐行计算并在右侧追加结果列，导出为新文件",
+        }
+    }
+}
+
+/// 菜单 / 快捷键触发的操作（由界面在本帧末尾执行）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    OpenBatchFile,
+    Settings,
+    Help,
+    About,
+    Quit,
 }
 
 /// 状态行的级别（决定颜色）。
@@ -58,19 +80,19 @@ pub struct Status {
 }
 
 impl Status {
-    fn ok(text: impl Into<String>) -> Self {
+    pub fn ok(text: impl Into<String>) -> Self {
         Status {
             level: Level::Ok,
             text: text.into(),
         }
     }
-    fn warn(text: impl Into<String>) -> Self {
+    pub fn warn(text: impl Into<String>) -> Self {
         Status {
             level: Level::Warn,
             text: text.into(),
         }
     }
-    fn error(text: impl Into<String>) -> Self {
+    pub fn error(text: impl Into<String>) -> Self {
         Status {
             level: Level::Error,
             text: text.into(),
@@ -91,18 +113,35 @@ pub enum Outcome {
     /// 尚未计算。
     None,
     /// 计算成功：全部字段 + 校验状态。
-    Done { fields: Vec<Field>, status: Status },
+    Done {
+        fields: Vec<Field>,
+        status: Status,
+        breakdown: Box<Breakdown>,
+    },
     /// 企业总成本落在空位：原因及两侧最近的有效值。
     Gap(Box<CostGap>),
     /// 输入或计算错误。
     Error(String),
 }
 
+/// 最近计算记录。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryEntry {
+    pub input: Decimal,
+    pub net_income: Decimal,
+    pub total_cost: Decimal,
+    pub take_home: Decimal,
+}
+
+/// 最近计算记录的条数上限。
+pub const HISTORY_LEN: usize = 6;
+
 /// 单笔计算页签（正算 / 反算 / 按总成本）。
 #[derive(Debug, Clone)]
 pub struct SingleTab {
     pub input: String,
     pub outcome: Outcome,
+    pub history: Vec<HistoryEntry>,
 }
 
 impl Default for SingleTab {
@@ -110,7 +149,27 @@ impl Default for SingleTab {
         SingleTab {
             input: String::new(),
             outcome: Outcome::None,
+            history: Vec::new(),
         }
+    }
+}
+
+impl SingleTab {
+    fn record(&mut self) {
+        let (Ok(input), Outcome::Done { breakdown: b, .. }) =
+            (parse_amount(&self.input), &self.outcome)
+        else {
+            return;
+        };
+        let e = HistoryEntry {
+            input,
+            net_income: b.net_income,
+            total_cost: b.total_cost,
+            take_home: b.take_home,
+        };
+        self.history.retain(|h| h.input != e.input);
+        self.history.insert(0, e);
+        self.history.truncate(HISTORY_LEN);
     }
 }
 
@@ -162,17 +221,10 @@ impl BatchResult {
     }
 }
 
-/// 口径查看区。
-#[derive(Debug, Clone)]
-pub struct ConfigView {
-    /// 当前口径来源说明。
-    pub source: String,
-    /// 当前生效配置（TOML）。
-    pub toml: String,
-    /// 自定义 TOML 路径输入框。
-    pub path: String,
-    pub message: Option<Status>,
-}
+/// 口径来源说明：内置默认。
+pub const SOURCE_DEFAULT: &str = "内置默认口径";
+/// 口径来源说明：设置窗口保存的口径。
+pub const SOURCE_SAVED: &str = "已保存的设置";
 
 /// 整个程序的状态。
 pub struct AppState {
@@ -183,7 +235,23 @@ pub struct AppState {
     pub reverse: SingleTab,
     pub from_cost: SingleTab,
     pub batch: BatchTab,
-    pub config: ConfigView,
+    /// 当前口径来源说明。
+    pub source: String,
+    /// 顶部提示（如启动时加载设置失败）。
+    pub notice: Option<Status>,
+    pub prefs: Prefs,
+    /// 设置的保存位置；None 表示不持久化（测试或取不到配置目录）。
+    pub store: Option<SettingsStore>,
+    /// 打开中的设置窗口。
+    pub settings: Option<SettingsDraft>,
+    pub show_about: bool,
+    pub show_help: bool,
+    /// 是否展开试算规则面板。
+    pub show_rules: bool,
+    /// 待执行的菜单操作。
+    pub actions: Vec<Action>,
+    /// 是否使用原生菜单（macOS）；为 true 时不绘制窗口内菜单栏、不处理菜单快捷键。
+    pub native_menu: bool,
 }
 
 /// 解析金额输入：允许空白、千分位逗号、¥、元。
@@ -266,7 +334,6 @@ impl AppState {
     /// 以给定口径创建；`source` 为口径来源说明。
     pub fn new(cfg: Config, source: impl Into<String>) -> Result<Self, CalcError> {
         let reverser = Reverser::new(&cfg)?;
-        let toml = cfg.to_toml_string();
         Ok(AppState {
             tab: Tab::Forward,
             cfg,
@@ -275,18 +342,125 @@ impl AppState {
             reverse: SingleTab::default(),
             from_cost: SingleTab::default(),
             batch: BatchTab::default(),
-            config: ConfigView {
-                source: source.into(),
-                toml,
-                path: String::new(),
-                message: None,
-            },
+            source: source.into(),
+            notice: None,
+            prefs: Prefs::default(),
+            store: None,
+            settings: None,
+            show_about: false,
+            show_help: false,
+            show_rules: true,
+            actions: Vec::new(),
+            native_menu: false,
         })
     }
 
-    /// 内置默认口径。
+    /// 内置默认口径（不持久化）。
     pub fn with_default_config() -> Self {
-        Self::new(Config::default(), "内置默认口径").expect("默认配置有效")
+        Self::new(Config::default(), SOURCE_DEFAULT).expect("默认配置有效")
+    }
+
+    /// 从设置目录读取主题与口径（启动时用）。已保存的口径无效时改用内置默认并提示。
+    pub fn with_store(store: SettingsStore) -> Self {
+        let mut st = Self::with_default_config();
+        st.prefs = store.load_prefs();
+        match store.load_rules() {
+            Ok(None) => {}
+            Ok(Some(cfg)) => {
+                if let Err(e) = st.set_config(cfg, SOURCE_SAVED) {
+                    st.notice = Some(Status::error(format!(
+                        "已保存的设置无法使用，已改用内置默认口径：{e}"
+                    )));
+                }
+            }
+            Err(e) => st.notice = Some(Status::error(e)),
+        }
+        st.store = Some(store);
+        st
+    }
+
+    /// 当前口径是否就是内置默认。
+    pub fn is_default_config(&self) -> bool {
+        self.cfg == Config::default()
+    }
+
+    /// 打开设置窗口（以当前口径为初值）。
+    pub fn open_settings(&mut self) {
+        if self.settings.is_none() {
+            self.settings = Some(SettingsDraft::from_config(&self.cfg, self.prefs.theme));
+        }
+    }
+
+    /// 取消设置：丢弃修改。
+    pub fn cancel_settings(&mut self) {
+        self.settings = None;
+    }
+
+    /// 保存设置：校验通过则应用并写入设置目录，关闭窗口，返回 true；否则保留窗口并给出错误。
+    pub fn save_settings(&mut self) -> bool {
+        let Some(draft) = &mut self.settings else {
+            return false;
+        };
+        let cfg = match draft.build() {
+            Ok(c) => c,
+            Err(errs) => {
+                draft.message = Some(format!(
+                    "有 {} 处输入需要修改，请检查标红的项目",
+                    errs.len()
+                ));
+                return false;
+            }
+        };
+        let theme = draft.theme;
+        if let Some(store) = &self.store {
+            if let Err(e) = store
+                .save_rules(&cfg)
+                .and_then(|_| store.save_prefs(&Prefs { theme }))
+            {
+                draft.message = Some(e);
+                return false;
+            }
+        }
+        let source = if cfg == Config::default() {
+            SOURCE_DEFAULT
+        } else {
+            SOURCE_SAVED
+        };
+        if cfg != self.cfg || self.source != source {
+            if let Err(e) = self.set_config(cfg, source) {
+                if let Some(d) = &mut self.settings {
+                    d.message = Some(e.to_string());
+                }
+                return false;
+            }
+        }
+        self.prefs.theme = theme;
+        self.settings = None;
+        self.notice = None;
+        true
+    }
+
+    /// 顶栏快捷切换主题（立即保存）。
+    pub fn set_theme(&mut self, theme: ThemeChoice) {
+        self.prefs.theme = theme;
+        if let Some(store) = &self.store {
+            if let Err(e) = store.save_prefs(&self.prefs) {
+                self.notice = Some(Status::error(e));
+            }
+        }
+    }
+
+    /// 当前应显示的主题（设置窗口打开时预览草稿中的选择）。
+    pub fn effective_theme(&self) -> ThemeChoice {
+        self.settings.as_ref().map_or(self.prefs.theme, |d| d.theme)
+    }
+
+    /// 已打开的批量文件（菜单“打开批量文件…”、拖放）：切到批量页并填入路径。
+    pub fn open_batch_file(&mut self, path: &Path) {
+        self.tab = Tab::Batch;
+        self.batch.path = path.display().to_string();
+        self.batch.result = None;
+        self.batch.message = None;
     }
 
     pub fn config(&self) -> &Config {
@@ -310,10 +484,12 @@ impl AppState {
                 Outcome::Done {
                     fields: fields(&b),
                     status,
+                    breakdown: Box::new(b),
                 }
             }
             Err(e) => Outcome::Error(e),
         };
+        self.forward.record();
     }
 
     /// 反算：实际到手 → 不含税收入 → 全部金额。
@@ -324,9 +500,11 @@ impl AppState {
             Ok(r) => Outcome::Done {
                 fields: fields(&r.breakdown),
                 status: reverse_status(&self.cfg, &r),
+                breakdown: Box::new(r.breakdown),
             },
             Err(e) => Outcome::Error(e),
         };
+        self.reverse.record();
     }
 
     /// 按企业总成本正算；空位时给出原因和两侧最近的有效总成本。
@@ -345,11 +523,13 @@ impl AppState {
                         Status::error("校验失败")
                     },
                     fields: fields(&b),
+                    breakdown: Box::new(b),
                 },
                 Err(CalcError::CostUnreachable(g)) => Outcome::Gap(g),
                 Err(e) => Outcome::Error(e.to_string()),
             },
         };
+        self.from_cost.record();
     }
 
     /// 点击空位两侧的有效值：填入并重算。
@@ -361,8 +541,7 @@ impl AppState {
     /// 更换口径，并重算已有结果。
     pub fn set_config(&mut self, cfg: Config, source: impl Into<String>) -> Result<(), CalcError> {
         let reverser = Reverser::new(&cfg)?;
-        self.config.toml = cfg.to_toml_string();
-        self.config.source = source.into();
+        self.source = source.into();
         self.cfg = cfg;
         self.reverser = reverser;
         if self.forward.outcome != Outcome::None {
@@ -385,23 +564,25 @@ impl AppState {
         self.set_config(cfg, source).map_err(|e| e.to_string())
     }
 
-    /// 从文件加载口径，结果写入口径区的提示。
+    /// 从文件加载口径（命令行 `--config`，只对本次运行生效，不写入设置），结果写入顶部提示。
     pub fn load_config_file(&mut self, path: &Path) {
         let r = std::fs::read_to_string(path)
             .map_err(|e| format!("读取失败：{e}"))
             .and_then(|t| self.load_config_str(&t, format!("文件 {}", path.display())));
-        self.config.path = path.display().to_string();
-        self.config.message = Some(match r {
-            Ok(()) => Status::ok(format!("已加载：{}", path.display())),
-            Err(e) => Status::error(format!("加载失败（仍使用原口径）：{e}")),
+        self.notice = Some(match r {
+            Ok(()) => Status::ok(format!(
+                "本次运行使用口径文件：{}（不会写入设置）",
+                path.display()
+            )),
+            Err(e) => Status::error(format!("口径文件加载失败（仍使用原口径）：{e}")),
         });
     }
 
-    /// 恢复内置默认口径。
+    /// 恢复内置默认口径（不改动已保存的设置）。
     pub fn reset_config(&mut self) {
-        self.set_config(Config::default(), "内置默认口径")
+        self.set_config(Config::default(), SOURCE_DEFAULT)
             .expect("默认配置有效");
-        self.config.message = Some(Status::ok("已恢复内置默认口径"));
+        self.notice = Some(Status::ok("已恢复内置默认口径"));
     }
 
     fn batch_job(
