@@ -11,7 +11,7 @@
 use eframe::egui::ThemePreference;
 use labor_fee_core::{
     Bracket, Config, Decimal, Prefer, Reverser, RoundingMode, SurchargeBase, SurchargeItem,
-    SurchargeRounding,
+    SurchargeRounding, UrbanRegion, URBAN_CONSTRUCTION_TAX,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -156,45 +156,6 @@ fn write_atomic(path: &Path, text: &str) -> Result<(), String> {
     std::fs::rename(&tmp, path).map_err(|e| format!("保存设置失败：{e}"))
 }
 
-// ---------------- 口径确认状态 ----------------
-
-/// 口径项的确认状态。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Tag {
-    /// 用户已确认。
-    Confirmed,
-    /// 已按公开资料核实。
-    Verified,
-    /// 待确认。
-    Pending,
-    /// 实现参数（不涉及税务口径）。
-    Implementation,
-    /// 已改为非默认值（未经确认）。
-    Modified,
-}
-
-impl Tag {
-    pub fn text(self) -> &'static str {
-        match self {
-            Tag::Confirmed => "已确认",
-            Tag::Verified => "已核实",
-            Tag::Pending => "待确认",
-            Tag::Implementation => "实现参数",
-            Tag::Modified => "已修改",
-        }
-    }
-
-    pub fn hint(self) -> &'static str {
-        match self {
-            Tag::Confirmed => "用户已确认的参数",
-            Tag::Verified => "已对照公开政策文件核实",
-            Tag::Pending => "可配置假设，尚未确认；正式结算前请财务人员确认",
-            Tag::Implementation => "计算实现参数，不涉及税收政策",
-            Tag::Modified => "已改为与内置默认不同的值，尚未确认",
-        }
-    }
-}
-
 // ---------------- 设置草稿（设置窗口的编辑状态） ----------------
 
 /// 设置窗口左侧导航的一级分组（标题，不可点击）。
@@ -318,6 +279,10 @@ pub struct SettingsDraft {
     pub relief_enabled: bool,
     /// 减征比例（百分数，如 "50"）。
     pub relief_rate: String,
+    /// 城市维护建设税所选的纳税人所在地档位（None：项目税率不属于任一档位）。
+    pub urban_region: Option<UrbanRegion>,
+    /// 城市维护建设税各档税率（百分数，顺序同 `UrbanRegion::ALL`：市区、县城和镇、其他）。
+    pub urban_rates: [String; 3],
     pub items: Vec<ItemDraft>,
     pub fixed_limit: String,
     pub fixed_deduction: String,
@@ -399,6 +364,9 @@ impl SettingsDraft {
             surcharge_base: cfg.surcharge.base,
             relief_enabled: cfg.surcharge.relief_enabled,
             relief_rate: pct_text(cfg.surcharge.relief_rate),
+            urban_region: cfg.surcharge.urban_construction.region,
+            urban_rates: UrbanRegion::ALL
+                .map(|r| pct_text(cfg.surcharge.urban_construction.rate(r))),
             items: cfg
                 .surcharge
                 .items
@@ -471,11 +439,43 @@ impl SettingsDraft {
             _ => err(key::RELIEF, "减征比例请输入 0～100 之间的百分数，如 50"),
         }
         cfg.surcharge.items.clear();
+        let urban_key = self
+            .urban_index()
+            .map(|i| format!("{}.{i}", key::ITEMS))
+            .unwrap_or_else(|| key::GENERAL.to_string());
+        let mut tiers = [Decimal::ZERO; 3];
+        for (j, t) in self.urban_rates.iter().enumerate() {
+            match rate(t) {
+                Some(r) if r >= Decimal::ZERO && r < Decimal::ONE => tiers[j] = r,
+                _ => err(
+                    &urban_key,
+                    &format!(
+                        "“{}”的税率请输入 0～100 之间的百分数",
+                        UrbanRegion::ALL[j].label()
+                    ),
+                ),
+            }
+        }
+        cfg.surcharge.urban_construction.region = self.urban_region;
+        for (j, r) in UrbanRegion::ALL.into_iter().enumerate() {
+            cfg.surcharge.urban_construction.set_rate(r, tiers[j]);
+        }
         for (i, it) in self.items.iter().enumerate() {
             let k = format!("{}.{i}", key::ITEMS);
             let name = it.name.trim();
             if name.is_empty() {
                 err(&k, "项目名称不得为空");
+            }
+            if name == URBAN_CONSTRUCTION_TAX {
+                if let Some(r) = self.urban_region {
+                    // 选定档位：税率取该档税率
+                    cfg.surcharge.items.push(SurchargeItem::new(
+                        name,
+                        tiers[r.index()],
+                        it.enabled,
+                    ));
+                    continue;
+                }
             }
             match rate(&it.rate) {
                 Some(r) if r >= Decimal::ZERO && r < Decimal::ONE => cfg
@@ -629,11 +629,32 @@ impl SettingsDraft {
         self.modified_rows().iter().any(|r| r == k)
     }
 
+    /// 城市维护建设税项目的序号。
+    pub fn urban_index(&self) -> Option<usize> {
+        self.items
+            .iter()
+            .position(|it| it.name.trim() == URBAN_CONSTRUCTION_TAX)
+    }
+
+    /// 城市维护建设税的档位与各档税率是否与 `other` 相同（税率按数值比较）。
+    pub fn urban_same(&self, other: &SettingsDraft) -> bool {
+        self.urban_region == other.urban_region
+            && self
+                .urban_rates
+                .iter()
+                .zip(&other.urban_rates)
+                .all(|(a, b)| same_value(a, b))
+    }
+
     /// 第 `i` 个附加税费项目是否与默认不同（自行添加的项目恒为已修改）。
+    /// 城市维护建设税另比较所选档位与各档税率。
     pub fn item_modified(&self, i: usize) -> bool {
         let d = self.defaults();
         match (self.items.get(i), self.standard_item(i, &d)) {
-            (Some(it), Some(std_item)) => !item_same(it, std_item),
+            (Some(it), Some(std_item)) => {
+                !item_same(it, std_item)
+                    || (it.name == URBAN_CONSTRUCTION_TAX && !self.urban_same(&d))
+            }
             (Some(_), None) => true,
             (None, _) => false,
         }
@@ -772,7 +793,10 @@ impl SettingsDraft {
     pub fn row_same(&self, other: &SettingsDraft, k: &str) -> bool {
         if let Some(i) = item_index(k) {
             return match (self.items.get(i), other.items.get(i)) {
-                (Some(a), Some(b)) => item_input_same(a, b),
+                (Some(a), Some(b)) => {
+                    item_input_same(a, b)
+                        && (a.name.trim() != URBAN_CONSTRUCTION_TAX || self.urban_same(other))
+                }
                 (None, None) => true,
                 _ => false,
             };
@@ -806,6 +830,10 @@ impl SettingsDraft {
             let Some(it) = src.items.get(i) else {
                 return Ok(());
             };
+            if it.name.trim() == URBAN_CONSTRUCTION_TAX {
+                self.urban_region = src.urban_region;
+                self.urban_rates = src.urban_rates.clone();
+            }
             return match i.cmp(&self.items.len()) {
                 std::cmp::Ordering::Less => {
                     self.items[i] = it.clone();
@@ -828,7 +856,11 @@ impl SettingsDraft {
                 self.relief_enabled = src.relief_enabled;
                 self.relief_rate = src.relief_rate.clone();
             }
-            key::ITEMS_REMOVED => self.items = src.items.clone(),
+            key::ITEMS_REMOVED => {
+                self.items = src.items.clone();
+                self.urban_region = src.urban_region;
+                self.urban_rates = src.urban_rates.clone();
+            }
             key::FIXED_LIMIT => self.fixed_limit = src.fixed_limit.clone(),
             key::FIXED_DEDUCTION => self.fixed_deduction = src.fixed_deduction.clone(),
             key::PCT_DEDUCTION => self.pct_deduction = src.pct_deduction.clone(),
@@ -891,7 +923,12 @@ impl SettingsDraft {
         }
         sc.items.clear();
         for it in &self.items {
-            let r = parse_dec(&it.rate)? / Decimal::ONE_HUNDRED;
+            let r = match self.urban_region {
+                Some(region) if it.name.trim() == URBAN_CONSTRUCTION_TAX => {
+                    parse_dec(&self.urban_rates[region.index()])?
+                }
+                _ => parse_dec(&it.rate)?,
+            } / Decimal::ONE_HUNDRED;
             sc.items
                 .push(SurchargeItem::new(it.name.trim(), r, it.enabled));
         }

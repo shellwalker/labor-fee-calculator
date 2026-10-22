@@ -89,6 +89,99 @@ pub const URBAN_CONSTRUCTION_RATES: [(&str, Decimal); 3] = [
         Decimal::from_parts(1, 0, 0, false, 2),
     ),
 ];
+/// 城市维护建设税的纳税人所在地档位（城市维护建设税法第四条）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UrbanRegion {
+    /// 纳税人所在地在市区（法定 7%）。
+    Urban,
+    /// 纳税人所在地在县城、镇（法定 5%）。
+    CountyTown,
+    /// 纳税人所在地不在市区、县城或者镇（法定 1%）。
+    Other,
+}
+
+impl UrbanRegion {
+    pub const ALL: [UrbanRegion; 3] = [
+        UrbanRegion::Urban,
+        UrbanRegion::CountyTown,
+        UrbanRegion::Other,
+    ];
+
+    /// 档位名称，如“纳税人所在地在市区”。
+    pub fn label(self) -> &'static str {
+        URBAN_CONSTRUCTION_RATES[self.index()].0
+    }
+
+    /// 法定税率（内置默认的档位税率）。
+    pub fn statutory_rate(self) -> Decimal {
+        URBAN_CONSTRUCTION_RATES[self.index()].1
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            UrbanRegion::Urban => 0,
+            UrbanRegion::CountyTown => 1,
+            UrbanRegion::Other => 2,
+        }
+    }
+}
+
+/// 城市维护建设税的档位税率与所选档位。
+///
+/// 选定档位时，城市维护建设税项目的税率取该档税率（读入配置时同步）；
+/// `region` 为空表示项目税率不属于任一档位（旧配置中的自定义税率），按项目税率计算。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UrbanConstructionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<UrbanRegion>,
+    /// 纳税人所在地在市区的税率（默认 7%）。
+    pub urban: Decimal,
+    /// 纳税人所在地在县城、镇的税率（默认 5%）。
+    pub county_town: Decimal,
+    /// 纳税人所在地不在市区、县城或者镇的税率（默认 1%）。
+    pub other: Decimal,
+}
+
+impl Default for UrbanConstructionConfig {
+    /// 默认档位“不在市区、县城或者镇”（用户已确认），各档税率为法定税率。
+    fn default() -> Self {
+        UrbanConstructionConfig {
+            region: Some(DEFAULT_URBAN_REGION),
+            urban: UrbanRegion::Urban.statutory_rate(),
+            county_town: UrbanRegion::CountyTown.statutory_rate(),
+            other: UrbanRegion::Other.statutory_rate(),
+        }
+    }
+}
+
+impl UrbanConstructionConfig {
+    /// 某一档的税率。
+    pub fn rate(&self, r: UrbanRegion) -> Decimal {
+        match r {
+            UrbanRegion::Urban => self.urban,
+            UrbanRegion::CountyTown => self.county_town,
+            UrbanRegion::Other => self.other,
+        }
+    }
+
+    pub fn set_rate(&mut self, r: UrbanRegion, v: Decimal) {
+        match r {
+            UrbanRegion::Urban => self.urban = v,
+            UrbanRegion::CountyTown => self.county_town = v,
+            UrbanRegion::Other => self.other = v,
+        }
+    }
+
+    /// 税率对应的档位（多档相同时取靠前的一档）。
+    pub fn region_of(&self, rate: Decimal) -> Option<UrbanRegion> {
+        UrbanRegion::ALL.into_iter().find(|r| self.rate(*r) == rate)
+    }
+}
+
+/// 城市维护建设税默认档位：纳税人所在地不在市区、县城或者镇（1%），用户已确认。
+pub const DEFAULT_URBAN_REGION: UrbanRegion = UrbanRegion::Other;
 /// 默认减征比例：50%（减半征收，财政部 税务总局公告2023年第12号第二条）。
 pub const DEFAULT_RELIEF_RATE: Decimal = Decimal::from_parts(5, 0, 0, false, 1);
 /// 旧版配置中的合并项目名称，读入时视为教育费附加。
@@ -120,12 +213,13 @@ impl SurchargeItem {
     }
 
     /// 标准三项：城市维护建设税、教育费附加、地方教育附加。
-    /// 教育费附加按 `education` 征收；城市维护建设税（预填 7%）与地方教育附加（预填 2%）不启用。
+    /// 三项均征收（用户已确认）：城市维护建设税 1%（纳税人所在地不在市区、县城或者镇）、
+    /// 教育费附加 `education`、地方教育附加 2%。
     pub fn standard(education: Decimal) -> Vec<SurchargeItem> {
         vec![
-            SurchargeItem::new(URBAN_CONSTRUCTION_TAX, Decimal::new(7, 2), false),
+            SurchargeItem::new(URBAN_CONSTRUCTION_TAX, Decimal::new(1, 2), true),
             SurchargeItem::new(EDUCATION_SURCHARGE, education, true),
-            SurchargeItem::new(LOCAL_EDUCATION_SURCHARGE, Decimal::new(2, 2), false),
+            SurchargeItem::new(LOCAL_EDUCATION_SURCHARGE, Decimal::new(2, 2), true),
         ]
     }
 }
@@ -139,13 +233,16 @@ pub struct SurchargeConfig {
     pub relief_enabled: bool,
     /// 减征比例，取值 [0, 1]：实际征收率 = 法定费率 × (1 − 减征比例)；0.5 即减半征收。
     pub relief_rate: Decimal,
+    /// 城市维护建设税的档位税率与所选档位。
+    pub urban_construction: UrbanConstructionConfig,
     pub items: Vec<SurchargeItem>,
 }
 
 /// 读取用的原始结构，兼容旧版字段：
 /// - 未写 `relief_enabled` / `relief_rate` → 取内置默认（享受减征、50%）；
 /// - 旧版 `halve = true` → 享受减征、50%；`halve = false` → 不享受（`relief_*` 已写明时以其为准）；
-/// - 单一 `rate`（未列 `items`）或名为“附加税”的项目 → 教育费附加，并补齐另外两项（未启用）。
+/// - 单一 `rate`（未列 `items`）或名为“附加税”的项目 → 教育费附加，另外两项按内置默认补齐（征收）；
+/// - 已列出的项目原样读取：明确写了 `enabled = false`（不征收）的保持不征收，未写 `enabled` 的视为征收。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SurchargeConfigRaw {
@@ -156,6 +253,8 @@ struct SurchargeConfigRaw {
     relief_rate: Option<Decimal>,
     #[serde(default)]
     halve: Option<bool>,
+    #[serde(default)]
+    urban_construction: Option<UrbanConstructionConfig>,
     #[serde(default)]
     rate: Option<Decimal>,
     #[serde(default)]
@@ -181,16 +280,57 @@ impl From<SurchargeConfigRaw> for SurchargeConfig {
                 }
             }
         }
+        let urban_rate = items
+            .iter()
+            .find(|i| i.name == URBAN_CONSTRUCTION_TAX)
+            .map(|i| i.rate);
+        let urban_construction = match r.urban_construction {
+            // 已写档位：项目税率取该档税率（档位税率可在设置中修改）
+            Some(u) if u.region.is_some() => {
+                let rate = u.rate(u.region.unwrap_or(DEFAULT_URBAN_REGION));
+                for it in &mut items {
+                    if it.name == URBAN_CONSTRUCTION_TAX {
+                        it.rate = rate;
+                    }
+                }
+                u
+            }
+            // 未写档位（含旧配置）：按项目税率匹配档位，已写 7% / 5% / 1% 的保持原值
+            other => {
+                let mut u = other.unwrap_or_default();
+                u.region = match urban_rate {
+                    Some(rate) => u.region_of(rate),
+                    None => Some(DEFAULT_URBAN_REGION),
+                };
+                u
+            }
+        };
         SurchargeConfig {
             base: r.base,
             relief_enabled: r.relief_enabled.or(r.halve).unwrap_or(true),
             relief_rate: r.relief_rate.unwrap_or(DEFAULT_RELIEF_RATE),
+            urban_construction,
             items,
         }
     }
 }
 
 impl SurchargeConfig {
+    /// 按城市维护建设税项目的实际税率修正所选档位（程序内直接改了项目税率时用），保证写出再读回结果不变。
+    pub fn sync_urban_region(&mut self) {
+        if let Some(rate) = self
+            .items
+            .iter()
+            .find(|i| i.name == URBAN_CONSTRUCTION_TAX)
+            .map(|i| i.rate)
+        {
+            let u = &mut self.urban_construction;
+            if u.region.is_none_or(|r| u.rate(r) != rate) {
+                u.region = u.region_of(rate);
+            }
+        }
+    }
+
     /// 已启用的项目。
     pub fn enabled_items(&self) -> impl Iterator<Item = &SurchargeItem> {
         self.items.iter().filter(|i| i.enabled)
@@ -286,7 +426,9 @@ impl Config {
 
     /// 序列化为 TOML 文本。
     pub fn to_toml_string(&self) -> String {
-        toml::to_string_pretty(self).expect("配置可序列化")
+        let mut c = self.clone();
+        c.surcharge.sync_urban_region();
+        toml::to_string_pretty(&c).expect("配置可序列化")
     }
 
     /// 校验配置的合理性。
@@ -308,6 +450,13 @@ impl Config {
             }
             if it.name.trim().is_empty() {
                 return bad("surcharge.items.name 不能为空");
+            }
+        }
+        let u = &self.surcharge.urban_construction;
+        for r in UrbanRegion::ALL {
+            let v = u.rate(r);
+            if v < Decimal::ZERO || v >= one {
+                return bad("surcharge.urban_construction 各档税率必须在 [0, 1) 内");
             }
         }
         let r = self.surcharge.relief_rate;
@@ -387,15 +536,16 @@ mod tests {
     fn default_config_parses_and_roundtrips() {
         let cfg = Config::default();
         assert_eq!(cfg.vat.rate, Decimal::new(1, 2));
+        // 用户已确认：三项默认均征收，1% / 3% / 2%
         let on: Vec<_> = cfg.surcharge.enabled_items().collect();
-        assert_eq!(on.len(), 1);
-        assert_eq!(on[0].name, EDUCATION_SURCHARGE);
-        assert_eq!(on[0].rate, Decimal::new(3, 2));
+        assert_eq!(on.len(), 3);
+        assert_eq!(on[0].name, URBAN_CONSTRUCTION_TAX);
+        assert_eq!(on[0].rate, Decimal::new(1, 2));
+        assert_eq!(on[1].name, EDUCATION_SURCHARGE);
+        assert_eq!(on[1].rate, Decimal::new(3, 2));
+        assert_eq!(on[2].name, LOCAL_EDUCATION_SURCHARGE);
+        assert_eq!(on[2].rate, Decimal::new(2, 2));
         assert_eq!(cfg.surcharge.items.len(), 3);
-        assert_eq!(cfg.surcharge.items[0].rate, Decimal::new(7, 2));
-        assert!(!cfg.surcharge.items[0].enabled);
-        assert_eq!(cfg.surcharge.items[2].rate, Decimal::new(2, 2));
-        assert!(!cfg.surcharge.items[2].enabled);
         let again = Config::from_toml_str(&cfg.to_toml_string()).unwrap();
         assert_eq!(cfg, again);
     }
@@ -433,6 +583,83 @@ mod tests {
         // 旧版：单一 rate 字段
         let b = legacy("[surcharge]\nbase = \"vat\"\nrate = \"0.03\"\n");
         assert_eq!(b, def);
+        // 旧配置未写城市维护建设税、地方教育附加：补为新默认（征收，1% / 2%）
+        assert_eq!(a.surcharge.items[0].name, URBAN_CONSTRUCTION_TAX);
+        assert_eq!(a.surcharge.items[0].rate, Decimal::new(1, 2));
+        assert!(a.surcharge.items[0].enabled);
+        assert!(a.surcharge.items[2].enabled);
+        // 旧配置中明确写了不征收的项目保持不征收
+        let c = legacy("[surcharge]\nbase = \"vat\"\n[[surcharge.items]]\nname = \"城市维护建设税\"\nrate = \"0.01\"\nenabled = false\n[[surcharge.items]]\nname = \"教育费附加\"\nrate = \"0.03\"\n[[surcharge.items]]\nname = \"地方教育附加\"\nrate = \"0.02\"\nenabled = false\n");
+        let on: Vec<_> = c
+            .surcharge
+            .enabled_items()
+            .map(|i| i.name.as_str())
+            .collect();
+        assert_eq!(on, vec![EDUCATION_SURCHARGE]);
+        assert_ne!(c, def);
+    }
+
+    #[test]
+    fn urban_construction_tiers_configurable() {
+        let items = "[[surcharge.items]]\nname = \"城市维护建设税\"\nrate = \"0.01\"\nenabled = true\n[[surcharge.items]]\nname = \"教育费附加\"\nrate = \"0.03\"\n";
+        let def = Config::default();
+        let u = &def.surcharge.urban_construction;
+        assert_eq!(u.region, Some(UrbanRegion::Other));
+        assert_eq!(
+            (u.urban, u.county_town, u.other),
+            (Decimal::new(7, 2), Decimal::new(5, 2), Decimal::new(1, 2))
+        );
+        // 已写档位：项目税率取该档（修改后的）税率
+        let c = legacy(&format!(
+            "[surcharge]\nbase = \"vat\"\n[surcharge.urban_construction]\nregion = \"urban\"\nurban = \"0.06\"\ncounty_town = \"0.05\"\nother = \"0.01\"\n{items}"
+        ));
+        assert_eq!(c.surcharge.items[0].rate, Decimal::new(6, 2));
+        assert_eq!(c.surcharge.urban_construction.urban, Decimal::new(6, 2));
+        // 写出再读回不变
+        assert_eq!(Config::from_toml_str(&c.to_toml_string()).unwrap(), c);
+        // 只写部分档位、未写 region：其余取默认，按项目税率匹配档位
+        let c = legacy(&format!(
+            "[surcharge]\nbase = \"vat\"\n[surcharge.urban_construction]\nother = \"0.01\"\n{items}"
+        ));
+        assert_eq!(
+            c.surcharge.urban_construction.region,
+            Some(UrbanRegion::Other)
+        );
+        assert_eq!(c.surcharge.urban_construction.urban, Decimal::new(7, 2));
+        // 旧配置中的非档位税率（如 6%）：不属于任一档位，按项目税率计算，写出再读回不变
+        let c = legacy("[surcharge]\nbase = \"vat\"\n[[surcharge.items]]\nname = \"城市维护建设税\"\nrate = \"0.06\"\n");
+        assert_eq!(c.surcharge.urban_construction.region, None);
+        assert_eq!(c.surcharge.items[0].rate, Decimal::new(6, 2));
+        assert_eq!(Config::from_toml_str(&c.to_toml_string()).unwrap(), c);
+        // 程序内直接改项目税率：写出时同步档位
+        let mut m = Config::default();
+        m.surcharge.items[0].rate = Decimal::new(5, 2);
+        let back = Config::from_toml_str(&m.to_toml_string()).unwrap();
+        assert_eq!(back.surcharge.items[0].rate, Decimal::new(5, 2));
+        assert_eq!(
+            back.surcharge.urban_construction.region,
+            Some(UrbanRegion::CountyTown)
+        );
+        // 非法档位税率
+        for v in ["-0.01", "1", "1.2"] {
+            let t = DEFAULT_CONFIG_TOML.replace("urban = \"0.07\"", &format!("urban = \"{v}\""));
+            assert!(Config::from_toml_str(&t).is_err(), "{v}");
+        }
+    }
+
+    #[test]
+    fn urban_rate_default_and_explicit_kept() {
+        // 默认档位：不在市区、县城或者镇 1%（用户已确认）
+        let def = Config::default();
+        assert_eq!(def.surcharge.items[0].rate, URBAN_CONSTRUCTION_RATES[2].1);
+        // 已写明 7% / 5% 的配置保持原值
+        for r in ["0.07", "0.05"] {
+            let c = legacy(&format!(
+                "[surcharge]\nbase = \"vat\"\n[[surcharge.items]]\nname = \"城市维护建设税\"\nrate = \"{r}\"\nenabled = false\n[[surcharge.items]]\nname = \"教育费附加\"\nrate = \"0.03\"\n[[surcharge.items]]\nname = \"地方教育附加\"\nrate = \"0.02\"\nenabled = false\n"
+            ));
+            assert_eq!(c.surcharge.items[0].rate.to_string(), r);
+            assert_ne!(c, def);
+        }
     }
 
     #[test]
@@ -440,9 +667,13 @@ mod tests {
         let def = Config::default();
         assert!(def.surcharge.relief_enabled, "默认享受减半征收");
         assert_eq!(def.surcharge.relief_rate, Decimal::new(5, 1));
-        assert_eq!(def.effective_surcharge_rates(), vec![Decimal::new(15, 3)]);
-        assert_eq!(def.surcharge.statutory_total_rate(), Decimal::new(3, 2));
-        assert_eq!(def.surcharge.actual_total_rate(), Decimal::new(15, 3));
+        // 默认合计比例 1% + 3% + 2% = 6%，减半后实际 3%
+        assert_eq!(
+            def.effective_surcharge_rates(),
+            vec![Decimal::new(5, 3), Decimal::new(15, 3), Decimal::new(1, 2)]
+        );
+        assert_eq!(def.surcharge.statutory_total_rate(), Decimal::new(6, 2));
+        assert_eq!(def.surcharge.actual_total_rate(), Decimal::new(3, 2));
         // 未写减征字段（旧版设置文件）→ 内置默认
         let none = legacy(
             "[surcharge]\nbase = \"vat\"\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n",
@@ -453,7 +684,10 @@ mod tests {
             "[surcharge]\nbase = \"vat\"\nhalve = false\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n",
         );
         assert!(!off.surcharge.relief_enabled);
-        assert_eq!(off.effective_surcharge_rates(), vec![Decimal::new(3, 2)]);
+        assert_eq!(
+            off.effective_surcharge_rates(),
+            vec![Decimal::new(1, 2), Decimal::new(3, 2), Decimal::new(2, 2)]
+        );
         let on = legacy(
             "[surcharge]\nbase = \"vat\"\nhalve = true\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n",
         );

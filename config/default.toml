@@ -38,14 +38,24 @@ base = "vat"
 relief_enabled = true
 relief_rate = "0.5"
 
+# 城市维护建设税：按纳税人所在地分档（城市维护建设税法第四条），各档税率可修改。
+# region：urban（市区，7%）| county_town（县城、镇，5%）| other（不在市区、县城或者镇，1%）。
+# 用户已确认：默认档位 other（1%）。写明 region 时，城市维护建设税项目的税率取该档税率；
+# 未写本段或未写 region 的旧配置，按项目税率匹配档位（已写 7% / 5% 的保持原值）。
+[surcharge.urban_construction]
+region = "other"
+urban = "0.07"
+county_town = "0.05"
+other = "0.01"
+
 # 附加税费项目，各项以增值税税额为计税依据，分别按分舍入，合计为增值税附加税费。
-# 用户已确认：默认仅征收教育费附加 3%；城市维护建设税、地方教育附加默认不征收（enabled = false），
-# 但费率预填法定标准，改为 enabled = true（或在设置中选“征收：是”）即可生效。
-# 城市维护建设税：纳税人所在地在市区 7%，县城、镇 5%，不在市区、县城或者镇 1%（城市维护建设税法第四条）
+# 用户已确认：三项默认均征收（enabled = true）；不征收的项目改为 enabled = false（或在设置中选“征收：否”）。
+# 默认合计比例 1% + 3% + 2% = 6%，减半后实际 3%。
+# 城市维护建设税：税率取上面 [surcharge.urban_construction] 所选档位的税率（默认 1%）。
 [[surcharge.items]]
 name = "城市维护建设税"
-rate = "0.07"
-enabled = false
+rate = "0.01"
+enabled = true
 
 [[surcharge.items]]
 name = "教育费附加"
@@ -56,7 +66,7 @@ enabled = true
 # 地方教育附加：征收标准 2%（财综〔2010〕98号）
 name = "地方教育附加"
 rate = "0.02"
-enabled = false
+enabled = true
 
 [iit]
 # 居民个人劳务报酬所得预扣预缴个人所得税（国家税务总局公告2018年第61号第八条及《个人所得税预扣率表二》），按不含增值税收入计算

@@ -230,7 +230,7 @@ pub fn forward(cfg: &Config, net_income: Decimal) -> Result<Breakdown, CalcError
 /// 辅助：按企业总成本正算，内部求出对应的不含税收入。
 ///
 /// 企业总成本随不含税收入严格递增，但并非每个“分”都可达：征收门槛处有一段空白区间
-/// （默认 999.99 → 1010.15），增值税、附加税逐分舍入也会留下单分空位。
+/// （默认 999.99 → 1010.30），增值税、附加税逐分舍入也会留下单分空位。
 /// 输入落在空位时返回 [`CalcError::CostUnreachable`]，说明原因并给出两侧最近的可达总成本。
 pub fn from_total_cost(cfg: &Config, total_cost: Decimal) -> Result<Breakdown, CalcError> {
     let cost = check_amount(cfg, total_cost)?;
@@ -288,11 +288,13 @@ mod tests {
         let b = at(dec!(10000));
         assert_eq!(b.net_income, dec!(10000.00));
         assert_eq!(b.vat, dec!(100.00));
-        // 默认：教育费附加 3%，减半征收 → 100.00 × 1.5% = 1.50
-        assert_eq!(b.surcharge_before_relief, dec!(3.00));
-        assert_eq!(b.surcharge_relief, dec!(1.50));
-        assert_eq!(b.surcharge_total, dec!(1.50));
-        assert_eq!(b.total_cost, dec!(10101.50));
+        // 默认：三项均征收（1% / 3% / 2%），减半征收 → 0.50 + 1.50 + 1.00 = 3.00
+        let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
+        assert_eq!(amts, vec![dec!(0.50), dec!(1.50), dec!(1.00)]);
+        assert_eq!(b.surcharge_before_relief, dec!(6.00));
+        assert_eq!(b.surcharge_relief, dec!(3.00));
+        assert_eq!(b.surcharge_total, dec!(3.00));
+        assert_eq!(b.total_cost, dec!(10103.00));
         assert_eq!(b.iit.income, dec!(10000.00));
         assert_eq!(b.iit.deduction, dec!(2000.00));
         assert_eq!(b.iit.taxable_income, dec!(8000.00));
@@ -314,8 +316,11 @@ mod tests {
         assert!(!b.vat_exempt);
         assert_eq!(
             (b.vat, b.surcharge_total, b.total_cost),
-            (dec!(10.00), dec!(0.15), dec!(1010.15))
+            (dec!(10.00), dec!(0.30), dec!(1010.30))
         );
+        // 0.05 + 0.15 + 0.10
+        let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
+        assert_eq!(amts, vec![dec!(0.05), dec!(0.15), dec!(0.10)]);
         assert_eq!(b.take_home, dec!(960.00));
         let mut c = cfg();
         c.vat.levy_at_threshold = false;
@@ -330,8 +335,10 @@ mod tests {
         // 1050.50 × 1% = 10.505 → 10.51（四舍五入远离零）
         let b = at(dec!(1050.50));
         assert_eq!(b.vat, dec!(10.51));
-        // 10.51 × 1.5% = 0.15765 → 0.16
-        assert_eq!(b.surcharge_total, dec!(0.16));
+        // 逐项按分舍入：10.51 × 0.5% = 0.05255 → 0.05、× 1.5% = 0.15765 → 0.16、× 1% = 0.1051 → 0.11
+        let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
+        assert_eq!(amts, vec![dec!(0.05), dec!(0.16), dec!(0.11)]);
+        assert_eq!(b.surcharge_total, dec!(0.32));
     }
 
     #[test]
@@ -423,7 +430,7 @@ mod tests {
 
     #[test]
     fn from_cost_threshold_gap() {
-        for cost in [dec!(1000.00), dec!(1005.00), dec!(1010.14)] {
+        for cost in [dec!(1000.00), dec!(1005.00), dec!(1010.29)] {
             let g = gap(cost);
             assert_eq!(g.reason, CostGapReason::Threshold);
             assert_eq!(
@@ -432,7 +439,7 @@ mod tests {
             );
             assert_eq!(
                 (g.upper.net_income, g.upper.total_cost),
-                (dec!(1000.00), dec!(1010.15))
+                (dec!(1000.00), dec!(1010.30))
             );
             let msg = CalcError::CostUnreachable(Box::new(g)).to_string();
             assert!(
@@ -440,7 +447,7 @@ mod tests {
                 "{msg}"
             );
             assert!(
-                msg.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.15"),
+                msg.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.30"),
                 "{msg}"
             );
         }
@@ -448,9 +455,9 @@ mod tests {
 
     #[test]
     fn from_cost_rounding_gap() {
-        // 例：1050.49 → 1061.15，1050.50 → 1061.17（增值税 10.50 → 10.51），1061.16 不可达
+        // 例：1050.49 → 1061.31，1050.50 → 1061.33（增值税 10.50 → 10.51），1061.32 不可达
         let mut found = 0;
-        for c in 101_015..200_000i64 {
+        for c in 101_030..200_000i64 {
             let cost = Decimal::new(c, 2);
             match from_total_cost(&cfg(), cost) {
                 Ok(b) => assert_eq!(b.total_cost, cost),
@@ -469,46 +476,55 @@ mod tests {
     }
 
     #[test]
-    fn ticking_prefilled_items() {
-        // 默认配置中城市维护建设税（7%）、地方教育附加（2%）已预填费率，只需勾选即可生效
+    fn default_three_items() {
+        // 默认配置三项均征收（用户已确认）：城市维护建设税 1%（不在市区、县城或者镇）、教育费附加 3%、地方教育附加 2%
         let mut c = cfg();
-        for it in &mut c.surcharge.items {
-            it.enabled = true;
-        }
+        assert!(c.surcharge.items.iter().all(|it| it.enabled));
         let b = forward(&c, dec!(10000)).unwrap();
         let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
-        // 三项全开 + 减半：12% → 6%
-        assert_eq!(amts, vec![dec!(3.50), dec!(1.50), dec!(1.00)]);
+        // 三项全开 + 减半：6% → 3%
+        assert_eq!(amts, vec![dec!(0.50), dec!(1.50), dec!(1.00)]);
         let before: Vec<_> = b
             .surcharges
             .iter()
             .map(|l| l.amount_before_relief)
             .collect();
-        assert_eq!(before, vec![dec!(7.00), dec!(3.00), dec!(2.00)]);
+        assert_eq!(before, vec![dec!(1.00), dec!(3.00), dec!(2.00)]);
         let rates: Vec<_> = b.surcharges.iter().map(|l| l.rate).collect();
-        assert_eq!(rates, vec![dec!(0.035), dec!(0.015), dec!(0.010)]);
+        assert_eq!(rates, vec![dec!(0.005), dec!(0.015), dec!(0.010)]);
         assert_eq!(
             (
                 b.surcharge_before_relief,
                 b.surcharge_relief,
                 b.surcharge_total
             ),
-            (dec!(12.00), dec!(6.00), dec!(6.00))
+            (dec!(6.00), dec!(3.00), dec!(3.00))
         );
-        assert_eq!(b.total_cost, dec!(10106.00));
-        assert_eq!(c.surcharge.statutory_total_rate(), dec!(0.12));
-        assert_eq!(c.surcharge.actual_total_rate(), dec!(0.06));
+        assert_eq!(b.total_cost, dec!(10103.00));
+        assert_eq!(c.surcharge.statutory_total_rate(), dec!(0.06));
+        assert_eq!(c.surcharge.actual_total_rate(), dec!(0.03));
         // 不享受减征
         c.surcharge.relief_enabled = false;
         let b = forward(&c, dec!(10000)).unwrap();
         let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
-        assert_eq!(amts, vec![dec!(7.00), dec!(3.00), dec!(2.00)]);
+        assert_eq!(amts, vec![dec!(1.00), dec!(3.00), dec!(2.00)]);
         assert_eq!(
             (b.surcharge_relief, b.total_cost),
-            (dec!(0.00), dec!(10112.00))
+            (dec!(0.00), dec!(10106.00))
         );
-        // 未征收的项目不参与计算
-        let d = forward(&cfg(), dec!(10000)).unwrap();
+        // 已写明其他档位（市区 7%）的配置保持原值：12% → 6%，企业总支出 10106.00
+        c.surcharge.relief_enabled = true;
+        c.surcharge.items[0].rate = dec!(0.07);
+        let b = forward(&c, dec!(10000)).unwrap();
+        assert_eq!(
+            (b.surcharge_total, b.total_cost),
+            (dec!(6.00), dec!(10106.00))
+        );
+        // 未征收的项目不参与计算：仅教育费附加 → 1.50，企业总支出 10101.50
+        let mut d = cfg();
+        d.surcharge.items[0].enabled = false;
+        d.surcharge.items[2].enabled = false;
+        let d = forward(&d, dec!(10000)).unwrap();
         assert_eq!(d.surcharges.len(), 1);
         assert_eq!(d.total_cost, dec!(10101.50));
     }
@@ -549,8 +565,8 @@ mod tests {
     #[test]
     fn default_results() {
         let b = at(dec!(1000));
-        assert_eq!(b.surcharges.len(), 1);
-        let l = &b.surcharges[0];
+        assert_eq!(b.surcharges.len(), 3);
+        let l = &b.surcharges[1];
         assert_eq!(l.name, "教育费附加");
         assert_eq!(
             (l.statutory_rate, l.relief_rate, l.rate),
@@ -560,18 +576,21 @@ mod tests {
             (l.amount_before_relief, l.relief_amount, l.amount),
             (dec!(0.30), dec!(0.15), dec!(0.15))
         );
-        assert_eq!(b.total_cost, dec!(1010.15));
-        // 不享受减征时与旧版一致
+        let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
+        assert_eq!(amts, vec![dec!(0.05), dec!(0.15), dec!(0.10)]);
+        assert_eq!(b.surcharge_total, dec!(0.30));
+        assert_eq!(b.total_cost, dec!(1010.30));
+        // 不享受减征：0.10 + 0.30 + 0.20 = 0.60
         let mut c = cfg();
         c.surcharge.relief_enabled = false;
-        assert_eq!(forward(&c, dec!(1000)).unwrap().total_cost, dec!(1010.30));
+        assert_eq!(forward(&c, dec!(1000)).unwrap().total_cost, dec!(1010.60));
         // 减征比例 100%：附加税费为 0
         c.surcharge.relief_enabled = true;
         c.surcharge.relief_rate = dec!(1);
         let b = forward(&c, dec!(1000)).unwrap();
         assert_eq!(
             (b.surcharge_total, b.surcharge_relief),
-            (dec!(0.00), dec!(0.30))
+            (dec!(0.00), dec!(0.60))
         );
     }
 

@@ -73,7 +73,7 @@ fn xlsx_roundtrip() {
         assert_eq!(money(&rows[r][col("税后实发金额")]), expect);
         assert_eq!(rows[r][col("测算状态")], Data::String("精确匹配".into()));
     }
-    assert_eq!(money(&rows[1][col("企业总支出")]), dec!(10101.50));
+    assert_eq!(money(&rows[1][col("企业总支出")]), dec!(10103.00));
     assert_eq!(money(&rows[1][col("不含增值税收入")]), dec!(10000));
     assert_eq!(rows[5][col("测算状态")].to_string(), "数据错误");
     assert!(rows[5][col("备注")].to_string().contains("无法解析金额"));
@@ -101,7 +101,7 @@ fn csv_utf8_and_gbk() {
         let recs: Vec<_> = rdr.records().map(|r| r.unwrap()).collect();
         assert_eq!(&recs[0][3], "10000.00");
         let tc = h.iter().position(|x| x == "企业总支出").unwrap();
-        assert_eq!(&recs[0][tc], "10101.50");
+        assert_eq!(&recs[0][tc], "10103.00");
         let ci = h.iter().position(|x| x == "预扣率").unwrap();
         assert_eq!(&recs[0][ci], "20%");
         let net = Decimal::from_str(&recs[1][3]).unwrap();
@@ -133,7 +133,7 @@ fn custom_column_and_missing_column() {
 fn total_cost_gap_notes() {
     // 按企业总成本批量正算：门槛空白区间与逐分舍入空位都在备注列写明原因和两侧最近的有效总成本
     let cfg = Config::default();
-    let text = "企业总成本\n999.99\n1000.00\n1010.14\n1010.15\n10101.50\n1061.16\n";
+    let text = "企业总成本\n999.99\n1000.00\n1010.29\n1010.30\n10103.00\n1061.32\n";
     let opts = Options {
         kind: InputKind::TotalCost,
         column: None,
@@ -165,14 +165,14 @@ fn total_cost_gap_notes() {
             "{note}"
         );
         assert!(
-            note.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.15"),
+            note.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.30"),
             "{note}"
         );
         assert!(note.contains("两侧最近的有效企业总支出：999.99"), "{note}");
     }
     assert_eq!(&recs[3][col("不含增值税收入")], "1000.00");
     assert_eq!(&recs[4][col("不含增值税收入")], "10000.00");
-    // 1050.49 → 1061.15，1050.50 → 1061.17（增值税 10.50 → 10.51，附加税减半后均为 0.16），中间 1061.16 不可达
+    // 1050.49 → 1061.31，1050.50 → 1061.33（增值税 10.50 → 10.51，三项减半后附加税费均为 0.32），中间 1061.32 不可达
     assert_eq!(&recs[5][col("测算状态")], "总支出不可达");
     assert!(
         recs[5][col("备注")].contains("按分舍入"),
@@ -191,7 +191,7 @@ fn net_income_kind() {
     };
     let out = process(&cfg, "不含税收入\n10000\n".as_bytes(), Format::Csv, &opts).unwrap();
     let s = String::from_utf8(out.bytes).unwrap();
-    assert!(s.contains("10101.50") && s.contains("8400.00"));
+    assert!(s.contains("10103.00") && s.contains("8400.00"));
 }
 
 #[test]
@@ -204,8 +204,8 @@ fn new_and_legacy_column_names() {
         ("到手金额\n8400\n", InputKind::TakeHome),
         ("不含增值税收入\n10000\n", InputKind::NetIncome),
         ("不含税收入\n10000\n", InputKind::NetIncome),
-        ("企业总支出\n10101.50\n", InputKind::TotalCost),
-        ("企业总成本\n10101.50\n", InputKind::TotalCost),
+        ("企业总支出\n10103.00\n", InputKind::TotalCost),
+        ("企业总成本\n10103.00\n", InputKind::TotalCost),
     ] {
         let opts = Options {
             kind,
@@ -230,12 +230,9 @@ fn new_and_legacy_column_names() {
 
 #[test]
 fn three_items_columns() {
-    // 三项附加税费全开时逐项列示（减半征收后的实际金额）
+    // 三项附加税费逐项列示（减半征收后的实际金额）；城市维护建设税改为市区 7%
     let mut cfg = Config::default();
     cfg.surcharge.items[0].rate = dec!(0.07);
-    cfg.surcharge.items[0].enabled = true;
-    cfg.surcharge.items[2].rate = dec!(0.02);
-    cfg.surcharge.items[2].enabled = true;
     let opts = Options {
         kind: InputKind::NetIncome,
         ..Default::default()
@@ -260,4 +257,17 @@ fn three_items_columns() {
         .next()
         .unwrap()
         .contains("100.00,3.50,1.50,1.00,6.00,6.00,10106.00"));
+    // 默认（城市维护建设税 1%）：0.50 + 1.50 + 1.00 = 3.00
+    let out = process(
+        &Config::default(),
+        "不含增值税收入\n10000\n".as_bytes(),
+        Format::Csv,
+        &opts,
+    )
+    .unwrap();
+    let s = String::from_utf8(out.bytes).unwrap();
+    assert!(
+        s.contains("100.00,0.50,1.50,1.00,3.00,3.00,10103.00"),
+        "{s}"
+    );
 }

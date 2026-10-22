@@ -567,7 +567,13 @@ impl AppState {
         let def = w.edit.defaults();
         if let Some(i) = item_index(k) {
             match w.edit.standard_item(i, &def).cloned() {
-                Some(it) => w.edit.items[i] = it,
+                Some(it) => {
+                    if it.name == labor_fee_core::URBAN_CONSTRUCTION_TAX {
+                        w.edit.urban_region = def.urban_region;
+                        w.edit.urban_rates = def.urban_rates.clone();
+                    }
+                    w.edit.items[i] = it;
+                }
                 None => return false,
             }
         } else {

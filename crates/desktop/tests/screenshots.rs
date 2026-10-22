@@ -129,11 +129,10 @@ fn screenshots() {
             h.get_by_label("文件").click();
         });
 
-        // 非默认参数：勾选预填的城市维护建设税 7%、地方教育附加 2%，与教育费附加 3% 三项全开
+        // 非默认参数：城市维护建设税改选市区 7%，与教育费附加 3%、地方教育附加 2% 三项征收
         let mut cfg = labor_fee_core::Config::default();
-        for it in &mut cfg.surcharge.items {
-            it.enabled = true;
-        }
+        cfg.surcharge.urban_construction.region = Some(labor_fee_core::UrbanRegion::Urban);
+        cfg.surcharge.items[0].rate = cfg.surcharge.urban_construction.urban;
         st = AppState::new(cfg, "已保存的设置").unwrap();
         st.forward.input = "10000".into();
         st.calc_forward();
@@ -156,13 +155,13 @@ fn screenshots() {
         }
         shoot("5a-settings-surcharge-default", st, theme, size, |_| {});
 
-        // 只选“是”，不改费率
+        // 城建、地方教育附加选“否”（未生效）
         st = AppState::with_default_config();
         st.open_settings();
         if let Some(d) = st.settings.as_mut().map(|w| &mut w.edit) {
             d.section = Section::Surcharge;
-            d.items[0].enabled = true;
-            d.items[2].enabled = true;
+            d.items[0].enabled = false;
+            d.items[2].enabled = false;
         }
         shoot("5b-settings-surcharge", st, theme, size, |_| {});
 
@@ -186,13 +185,13 @@ fn screenshots_settings() {
         st.settings.as_mut().unwrap().edit.section = sec;
         st
     };
-    // 已生效：征收率 3%、城市维护建设税征收
+    // 已生效：征收率 3%、城市维护建设税不征收
     let modified = |sec: Section| {
         let mut st = at(sec);
         {
             let w = st.settings.as_mut().unwrap();
             w.edit.vat_rate = "3".into();
-            w.edit.items[0].enabled = true;
+            w.edit.items[0].enabled = false;
         }
         st.confirm_setting(key::VAT_RATE);
         st.confirm_setting("surcharge.items.0");
@@ -270,22 +269,21 @@ fn screenshots_surcharge() {
         st.settings.as_mut().unwrap().edit.section = Section::Surcharge;
         st
     };
-    // 已生效：三项全部征收（城建按市区 7%）+ 减半征收
+    // 已生效：三项征收，城建改选市区 7% + 减半征收
     let three = || {
         let mut st = at();
         {
             let w = st.settings.as_mut().unwrap();
-            w.edit.items[0].enabled = true;
-            w.edit.items[2].enabled = true;
+            w.edit.urban_region = Some(labor_fee_core::UrbanRegion::Urban);
+            w.edit.items[0].rate = "7".into();
         }
         st.confirm_setting("surcharge.items.0");
-        st.confirm_setting("surcharge.items.2");
         st
     };
     for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
-        // 1. 默认：减征“是”50%，仅教育费附加征收，合计 3% → 1.5%
+        // 1. 默认：减征“是”50%，三项征收（城建 1%），合计 6% → 3%
         shoot("v1-surcharge-default", at(), theme, size, |_| {});
-        // 2. 三项征收 + 减征：合计 12% → 6%
+        // 2. 城建市区 7% + 减征：合计 12% → 6%
         shoot("v2-surcharge-three-relief", three(), theme, size, |_| {});
         if theme == ThemeChoice::Dark {
             continue;
@@ -299,15 +297,15 @@ fn screenshots_surcharge() {
                 h.get_by_label("城市维护建设税是否征收：是").scroll_to_me();
             },
         );
-        // 3. 编辑中：城建选“是”（未生效，展开纳税人所在地，合计比例显示预览）
+        // 3. 编辑中：城建选“否”（未生效，隐藏纳税人所在地，合计比例显示预览）
         let mut st = at();
-        st.settings.as_mut().unwrap().edit.items[0].enabled = true;
+        st.settings.as_mut().unwrap().edit.items[0].enabled = false;
         shoot("v3-surcharge-editing", st, theme, size, |_| {});
         let mut st = at();
-        st.settings.as_mut().unwrap().edit.items[0].enabled = true;
-        st.settings.as_mut().unwrap().edit.items[0].rate = "5".into();
+        st.settings.as_mut().unwrap().edit.urban_region =
+            Some(labor_fee_core::UrbanRegion::CountyTown);
         shoot("v3b-surcharge-editing-region", st, theme, size, |h| {
-            h.get_by_label("纳税人所在地在县城、镇：税率 5%")
+            h.get_by_label("纳税人所在地（城市维护建设税法第四条）")
                 .scroll_to_me();
         });
         // 3c. 单项“默认”：减征已改为“否”并生效，点“默认”后填入“是，50%”待确认
@@ -324,9 +322,8 @@ fn screenshots_surcharge() {
     // 5. 收入计算页：逐项列示减征前后金额
     for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
         let mut cfg = labor_fee_core::Config::default();
-        for it in &mut cfg.surcharge.items {
-            it.enabled = true;
-        }
+        cfg.surcharge.urban_construction.region = Some(labor_fee_core::UrbanRegion::Urban);
+        cfg.surcharge.items[0].rate = cfg.surcharge.urban_construction.urban;
         let mut st = AppState::new(cfg, "已保存的设置").unwrap();
         st.forward.input = "10000".into();
         st.calc_forward();
@@ -337,5 +334,69 @@ fn screenshots_surcharge() {
             st.calc_forward();
             shoot("v5b-forward-default", st, theme, size, |_| {});
         }
+    }
+}
+
+/// 第六轮：三项默认征收、城建档位税率可改、设置各页无口径徽章（v7 截图）。
+#[test]
+#[ignore = "需要 GPU / 软件渲染，手动运行"]
+fn screenshots_v7() {
+    let size = (1280.0, 820.0);
+    let at = |sec: Section| {
+        let mut st = AppState::with_default_config();
+        st.open_settings();
+        st.settings.as_mut().unwrap().edit.section = sec;
+        st
+    };
+    for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
+        // 1. 附加税费默认态：合计 6% → 3%
+        shoot(
+            "v7-1-surcharge-default",
+            at(Section::Surcharge),
+            theme,
+            size,
+            |_| {},
+        );
+        // 2. 城建“是”（默认）：纳税人所在地三档，默认选中 1%
+        shoot(
+            "v7-2-surcharge-urban-default",
+            at(Section::Surcharge),
+            theme,
+            size,
+            |h| {
+                h.get_by_label("纳税人所在地（城市维护建设税法第四条）")
+                    .scroll_to_me();
+            },
+        );
+        // 3. 编辑档位税率（未生效）：县城、镇 5% → 4%，并选中该档
+        let mut st = at(Section::Surcharge);
+        {
+            let d = &mut st.settings.as_mut().unwrap().edit;
+            d.urban_region = Some(labor_fee_core::UrbanRegion::CountyTown);
+            d.urban_rates[1] = "4".into();
+        }
+        shoot("v7-3-surcharge-urban-tier-editing", st, theme, size, |h| {
+            h.get_by_label("纳税人所在地（城市维护建设税法第四条）")
+                .scroll_to_me();
+        });
+        // 4. 增值税页、个税页（无口径状态徽章）
+        shoot("v7-4-vat", at(Section::Vat), theme, size, |_| {});
+        shoot("v7-5-iit", at(Section::Iit), theme, size, |_| {});
+        // 6. 收入计算页默认结果：四张 KPI（含增值税税额）
+        let mut st = AppState::with_default_config();
+        st.forward.input = "10000".into();
+        st.calc_forward();
+        shoot("v7-6-forward-default", st, theme, size, |_| {});
+        // 7. 实发测算、支出测算页同样四张 KPI
+        let mut st = AppState::with_default_config();
+        st.tab = Tab::Reverse;
+        st.reverse.input = "8400".into();
+        st.calc_reverse();
+        shoot("v7-7-reverse-default", st, theme, size, |_| {});
+        let mut st = AppState::with_default_config();
+        st.tab = Tab::FromCost;
+        st.from_cost.input = "10103.00".into();
+        st.calc_from_cost();
+        shoot("v7-8-from-cost-default", st, theme, size, |_| {});
     }
 }

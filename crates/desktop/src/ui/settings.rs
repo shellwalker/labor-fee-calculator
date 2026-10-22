@@ -6,7 +6,7 @@ use super::widgets::{badge, danger_button, primary_button, secondary_button, sma
 use crate::icons;
 use crate::settings::{
     key, prefer_text, rounding_mode_text, surcharge_base_text, surcharge_rounding_text,
-    BracketDraft, Dialog, Errors, Group, ItemDraft, Section, SettingsDraft, SettingsWindow, Tag,
+    BracketDraft, Dialog, Errors, Group, ItemDraft, Section, SettingsDraft, SettingsWindow,
     ThemeChoice,
 };
 use crate::state::AppState;
@@ -16,18 +16,6 @@ use eframe::egui::{
     Response, RichText, ScrollArea, Stroke, TextEdit, Ui, Vec2,
 };
 use labor_fee_core::{Prefer, RoundingMode, SurchargeBase, SurchargeRounding};
-
-pub fn tag_badge(ui: &mut Ui, t: Tag) {
-    let p = palette(ui);
-    let (fg, bg) = match t {
-        Tag::Confirmed => (p.success, p.success_soft),
-        Tag::Verified => (p.primary, p.primary_soft),
-        Tag::Pending => (p.warning, p.warning_soft),
-        Tag::Implementation => (p.text_weak, p.surface_alt),
-        Tag::Modified => (p.error, p.error_soft),
-    };
-    badge(ui, t.text(), fg, bg).on_hover_text(t.hint());
-}
 
 /// “未生效”标签（描边样式，与实心的状态标签区分）。
 fn unapplied_badge(ui: &mut Ui) {
@@ -48,8 +36,10 @@ fn unapplied_badge(ui: &mut Ui) {
         .on_hover_text("本项修改尚未生效：点击 ✔ 或按 Enter 生效，点击 ✖ 或按 Esc 放弃");
 }
 
-const LABEL_W: f32 = 168.0;
-const CTRL_W: f32 = 200.0;
+const LABEL_W: f32 = 180.0;
+const CTRL_W: f32 = 240.0;
+/// 城市维护建设税档位单选的宽度（使右侧税率输入框对齐）。
+const URBAN_RADIO_W: f32 = 290.0;
 const NAV_W: f32 = 176.0;
 
 /// 设置窗口内的操作（本帧绘制结束后执行）。
@@ -104,8 +94,11 @@ impl Form {
         }
     }
 
-    /// 行内操作区：未生效时 √ ×，然后状态标签、单项“默认”。
-    fn actions(&mut self, ui: &mut Ui, k: &str, tag: Option<Tag>, can_default: bool) {
+    /// 行内操作区：未生效时 √ × 与“未生效”，生效值与默认不同时单项“默认”。
+    ///
+    /// 不再显示口径状态徽章（已确认 / 已核实等，见 docs/ASSUMPTIONS.md）；“已修改”由下方常驻提示
+    /// “当前值与默认值不同（默认：…）”与左侧导航红点表达，不另设徽章。
+    fn actions(&mut self, ui: &mut Ui, k: &str, can_default: bool) {
         let p = palette(ui);
         if self.pending(k) {
             let err = self.row_error(k);
@@ -148,11 +141,7 @@ impl Form {
             }
             unapplied_badge(ui);
         }
-        let modified = self.modified(k);
-        if let Some(t) = tag {
-            tag_badge(ui, if modified { Tag::Modified } else { t });
-        }
-        if modified && can_default {
+        if self.modified(k) && can_default {
             ui.add_space(2.0);
             if ui
                 .small_button(format!("{} 默认", icons::RESET))
@@ -180,16 +169,11 @@ impl Form {
                     }
                 }
                 if self.modified(k) {
-                    if let Some(d) = default_text {
-                        ui.label(
-                            RichText::new(format!(
-                                "{} 当前值与默认值不同（默认：{d}）",
-                                icons::INFO
-                            ))
-                            .size(theme::FS_SMALL)
-                            .color(p.warning),
-                        );
-                    }
+                    let text = match default_text {
+                        Some(d) => format!("{} 当前值与默认值不同（默认：{d}）", icons::INFO),
+                        None => format!("{} 当前值与默认值不同（内置默认无此项目）", icons::INFO),
+                    };
+                    ui.label(RichText::new(text).size(theme::FS_SMALL).color(p.warning));
                 }
                 if !help.is_empty() {
                     small(ui, help);
@@ -213,16 +197,13 @@ fn mark_pending(ui: &Ui, r: &Response, pending: bool) {
     }
 }
 
-/// 一行设置：标签 | 控件 | √ × | 状态标签 | 单项默认；下方补充说明。
-// 参数与界面上一行的各组成部分一一对应，拆成结构体反而降低调用处可读性
-#[allow(clippy::too_many_arguments)]
+/// 一行设置：标签 | 控件 | √ × 未生效 | 单项默认；下方补充说明。
 fn row(
     ui: &mut Ui,
     f: &mut Form,
     k: &str,
     label: &str,
     help: &str,
-    tag: Tag,
     default_text: &str,
     control: impl FnOnce(&mut Ui, Id) -> Response,
 ) {
@@ -252,7 +233,7 @@ fn row(
         mark_pending(ui, &r, pending);
         let can = f.row_error(k).is_none();
         f.keys(ui, k, &r, can);
-        f.actions(ui, k, Some(tag), true);
+        f.actions(ui, k, true);
     });
     f.notes(ui, k, help, Some(default_text));
 }
@@ -657,7 +638,6 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::VAT_RATE,
         "增值税征收率",
         "当前按 1% 优惠征收率（小规模纳税人 3% 征收率减按 1%，财政部 税务总局公告2026年第10号）；可改为 3% 等",
-        Tag::Confirmed,
         &format!("{}%", def.vat_rate),
         |ui, l| text_field(ui, l, &mut d.vat_rate, "%", bg, true),
     );
@@ -668,7 +648,6 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::THRESHOLD_ENABLED,
         "启用增值税起征点",
         "未达到起征点时，不征收增值税及附加税费；个人所得税不受影响",
-        Tag::Confirmed,
         &on_off(def.threshold_enabled, "启用", "不启用"),
         |ui, _| ui.checkbox(&mut d.threshold_enabled, "启用"),
     );
@@ -684,7 +663,6 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::THRESHOLD,
         "起征点",
         "按不含增值税收入判断。按次纳税的起征点为每次（日）销售额 1000 元（财政部 税务总局公告2026年第10号）",
-        Tag::Confirmed,
         &format!("{} 元", def.threshold),
         |ui, l| text_field(ui, l, &mut d.threshold, "元", bg, en),
     );
@@ -694,7 +672,6 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::LEVY_AT,
         "恰好等于起征点时",
         "勾选：达到起征点即征收（含本数）；不勾选：超过起征点才征收",
-        Tag::Confirmed,
         &on_off(def.levy_at_threshold, "征收", "不征收"),
         |ui, _| ui.add_enabled(en, egui::Checkbox::new(&mut d.levy_at_threshold, "征收")),
     );
@@ -966,7 +943,7 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
             let r = control_cell(ui, |ui| yes_no(ui, &mut d.relief_enabled, "享受减征优惠"));
             mark_pending(ui, &r, pending);
             f.keys(ui, k, &r, can);
-            f.actions(ui, k, Some(Tag::Verified), true);
+            f.actions(ui, k, true);
         });
         if was && !d.relief_enabled {
             // 改为“否”时，隐藏的减征比例恢复为生效值，避免看不见的修改
@@ -1014,11 +991,15 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
                     });
                     mark_pending(ui, &r, pending);
                     f.keys(ui, &k, &r, can);
-                    f.actions(ui, &k, Some(Tag::Confirmed), true);
+                    f.actions(ui, &k, true);
                 });
                 if was && !it.enabled {
                     if let Some(r) = &applied_rate {
                         it.rate = r.clone();
+                    }
+                    if name == labor_fee_core::URBAN_CONSTRUCTION_TAX {
+                        d.urban_region = applied.urban_region;
+                        d.urban_rates = applied.urban_rates.clone();
                     }
                 }
                 let urban = name == labor_fee_core::URBAN_CONSTRUCTION_TAX;
@@ -1034,31 +1015,51 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
                                         .size(theme::FS_SMALL)
                                         .color(p.text_weak),
                                 );
-                                let cur = crate::settings::urban_region(&it.rate);
                                 let mut all: Option<Response> = None;
-                                for (idx, (region, rate)) in
-                                    labor_fee_core::URBAN_CONSTRUCTION_RATES.iter().enumerate()
+                                for (idx, region) in
+                                    labor_fee_core::UrbanRegion::ALL.into_iter().enumerate()
                                 {
-                                    let r = ui.radio(
-                                        cur == Some(idx),
-                                        format!("{region}：税率 {}", crate::rules::pct(*rate)),
-                                    );
-                                    if r.clicked() {
-                                        it.rate = crate::settings::pct_text(*rate);
-                                    }
-                                    all = Some(match all {
-                                        Some(a) => a.union(r),
-                                        None => r,
+                                    ui.horizontal(|ui| {
+                                        let r = ui.radio(
+                                            d.urban_region == Some(region),
+                                            format!("{}：税率", region.label()),
+                                        );
+                                        if r.clicked() {
+                                            d.urban_region = Some(region);
+                                        }
+                                        // 三档税率输入框左对齐
+                                        ui.add_space((URBAN_RADIO_W - r.rect.width()).max(0.0));
+                                        let t = ui
+                                            .add(
+                                                TextEdit::singleline(&mut d.urban_rates[idx])
+                                                    .font(theme::mono(14.0))
+                                                    .desired_width(56.0)
+                                                    .background_color(bg),
+                                            )
+                                            .labelled_by(r.id);
+                                        ui.label(RichText::new("%").color(p.text_weak));
+                                        let dv = &def.urban_rates[idx];
+                                        if !crate::settings::same_value(&d.urban_rates[idx], dv) {
+                                            small(ui, format!("（默认：{}%）", dv.trim()));
+                                        }
+                                        let u = r.union(t);
+                                        all = Some(match all.take() {
+                                            Some(a) => a.union(u),
+                                            None => u,
+                                        });
                                     });
+                                }
+                                if let Some(region) = d.urban_region {
+                                    it.rate = d.urban_rates[region.index()].clone();
                                 }
                                 if let Some(r) = &all {
                                     mark_pending(ui, r, pending);
                                     f.keys(ui, &k, r, can);
                                 }
-                                if cur.is_none() {
+                                if d.urban_region.is_none() {
                                     ui.label(
                                         RichText::new(format!(
-                                            "{} 当前税率 {}% 不是法定税率，请选择纳税人所在地",
+                                            "{} 当前税率 {}% 不属于任一档位，请选择纳税人所在地",
                                             icons::WARN,
                                             it.rate.trim()
                                         ))
@@ -1079,7 +1080,7 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
                 }
                 let help = match name.as_str() {
                     labor_fee_core::URBAN_CONSTRUCTION_TAX => {
-                        "税率按纳税人所在地：市区 7%、县城或镇 5%、其他地区 1%（《中华人民共和国城市维护建设税法》第四条）"
+                        "税率按纳税人所在地，默认为法定税率：市区 7%、县城或镇 5%、其他地区 1%（《中华人民共和国城市维护建设税法》第四条）；各档税率可修改"
                     }
                     labor_fee_core::EDUCATION_SURCHARGE => {
                         "征收率 3%（《征收教育费附加的暂行规定》第三条）"
@@ -1089,10 +1090,22 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
                     }
                     _ => "",
                 };
-                let default_text = if std_item.enabled {
+                let default_text = if std_item.enabled && urban {
+                    let r = def
+                        .urban_region
+                        .unwrap_or(labor_fee_core::DEFAULT_URBAN_REGION);
+                    format!(
+                        "征收，{} {}%",
+                        r.label().trim_start_matches("纳税人所在地"),
+                        def.urban_rates[r.index()]
+                    )
+                } else if std_item.enabled {
                     format!("征收，{}%", std_item.rate)
                 } else if urban {
-                    format!("不征收；选“是”时预填市区 {}%", std_item.rate)
+                    format!(
+                        "不征收；选“是”时预填“不在市区、县城或者镇”{}%",
+                        std_item.rate
+                    )
                 } else {
                     format!("不征收；选“是”时预填 {}%", std_item.rate)
                 };
@@ -1124,7 +1137,7 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
                     let all = a.union(r);
                     mark_pending(ui, &all, pending);
                     f.keys(ui, &k, &all, can);
-                    f.actions(ui, &k, Some(Tag::Confirmed), false);
+                    f.actions(ui, &k, false);
                     if !is_new
                         && ui
                             .small_button(format!("{} 删除", icons::ERROR))
@@ -1161,7 +1174,7 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
         ui.horizontal(|ui| {
             ui.add_space(LABEL_W + 8.0);
             small(ui, "已删除或调整默认项目顺序");
-            f.actions(ui, key::ITEMS_REMOVED, Some(Tag::Modified), true);
+            f.actions(ui, key::ITEMS_REMOVED, true);
         });
         f.notes(
             ui,
@@ -1193,7 +1206,6 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, applied: &SettingsDraft
         key::BASE,
         "计税依据",
         "依法以实际缴纳的增值税税额为计税依据",
-        Tag::Confirmed,
         surcharge_base_text(def.surcharge_base),
         |ui, l| {
             ComboBox::from_id_salt("surcharge_base")
@@ -1240,16 +1252,9 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         } else {
             format!("{dv} 元")
         };
-        row(
-            ui,
-            f,
-            k,
-            label,
-            help,
-            Tag::Verified,
-            &default_text,
-            |ui, l| text_field(ui, l, value, unit, bg, true),
-        );
+        row(ui, f, k, label, help, &default_text, |ui, l| {
+            text_field(ui, l, value, unit, bg, true)
+        });
     }
     group_title(
         ui,
@@ -1262,7 +1267,7 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
             ui,
             "上限含本数；最后一档无上限。整张表作为一项，修改后统一确认。",
         );
-        f.actions(ui, k, Some(Tag::Verified), true);
+        f.actions(ui, k, true);
     });
     let mut all: Option<Response> = None;
     let mut add = |r: Response| {
@@ -1403,7 +1408,6 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
     group_title(ui, "适用范围");
     ui.horizontal(|ui| {
         ui.label(RichText::new("非居民个人").color(p.text));
-        tag_badge(ui, Tag::Pending);
         small(ui, "仅适用于居民个人劳务报酬所得预扣预缴（预扣率表二）；非居民个人适用个人所得税税率表三，本工具未提供。");
     });
 }
@@ -1439,7 +1443,6 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::SCALE,
         "金额小数位",
         "2 表示到分；增值税税额、各项附加税费、20% 减除费用、应预扣预缴税额分别舍入",
-        Tag::Pending,
         &format!("{} 位", def.scale),
         |ui, l| text_field(ui, l, &mut d.scale, "位", bg, true),
     );
@@ -1449,7 +1452,6 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::MODE,
         "舍入方式",
         "请确认与开票、申报系统一致",
-        Tag::Pending,
         rounding_mode_text(def.mode),
         |ui, l| {
             combo(
@@ -1474,7 +1476,6 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::SURCHARGE_ROUNDING,
         "附加税费舍入方式",
         "征收多个项目时适用；默认各项目分别按分舍入",
-        Tag::Pending,
         surcharge_rounding_text(def.surcharge_rounding),
         |ui, l| {
             combo(
@@ -1501,7 +1502,6 @@ fn solving_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::PREFER,
         "多解时取值",
         "多个不含增值税收入得到同一税后实发金额时",
-        Tag::Confirmed,
         prefer_text(def.prefer),
         |ui, l| {
             combo(
@@ -1527,7 +1527,6 @@ fn solving_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::SEARCH_WINDOW,
         "逐分校准窗口",
         "二分定位后向前、向后逐分校准的范围",
-        Tag::Implementation,
         &format!("{} 分", def.search_window),
         |ui, l| text_field(ui, l, &mut d.search_window, "分", bg, true),
     );
@@ -1542,7 +1541,6 @@ fn solving_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         key::MAX_NET,
         "测算搜索上限",
         "不含增值税收入的最大值",
-        Tag::Implementation,
         &format!("{} 元", def.max_net_income),
         |ui, l| text_field(ui, l, &mut d.max_net_income, "元", bg, true),
     );
@@ -1591,7 +1589,7 @@ fn appearance_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         if let Some(r) = all {
             f.keys(ui, k, &r, true);
         }
-        f.actions(ui, k, None, false);
+        f.actions(ui, k, false);
     });
     small(
         ui,

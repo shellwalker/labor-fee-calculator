@@ -11,12 +11,12 @@ use super::widgets::{
 };
 use crate::icons;
 use crate::rules::{self, POLICY_NAME, POLICY_URL, POLICY_URL_GOV};
-use crate::settings::{modified_items, Tag};
+use crate::settings::modified_items;
 use crate::state::{AppState, Level, Outcome, SingleTab, Tab};
 use crate::theme::{self, palette};
 use eframe::egui::{
-    self, Align, CornerRadius, Grid, Key, Layout, RichText, ScrollArea, Sense, Stroke, TextEdit,
-    Ui, Vec2,
+    self, Align, Color32, CornerRadius, Grid, Key, Layout, RichText, ScrollArea, Sense, Stroke,
+    TextEdit, Ui, Vec2,
 };
 use labor_fee_core::{Breakdown, Config, CostGap, Decimal};
 
@@ -43,8 +43,8 @@ fn spec(tab: Tab) -> PageSpec {
         },
         _ => PageSpec {
             input_label: "企业总支出",
-            hint: "例如 10101.50",
-            examples: &["999.99", "1005", "1010.15", "10101.50", "50500"],
+            hint: "例如 10103.00",
+            examples: &["999.99", "1005", "1010.30", "10103.00", "50500"],
             page_note: "本页根据企业总支出测算不含增值税收入；金额不可达时，说明原因并给出两侧最近的有效金额。",
         },
     }
@@ -235,6 +235,44 @@ fn rate_label(statutory: Decimal, relief: Decimal) -> String {
     }
 }
 
+/// 按宽度排布 KPI：很宽一行排开；中等优先 3+2（五张时）或对半；较窄两列；更窄纵向。
+fn kpi_row(ui: &mut Ui, width: f32, cards: &[(&str, Option<&str>, Color32, &str)]) {
+    let n = cards.len();
+    if n == 0 {
+        return;
+    }
+    let paint = |ui: &mut Ui, slice: &[(&str, Option<&str>, Color32, &str)]| {
+        if slice.is_empty() {
+            return;
+        }
+        if slice.len() == 1 {
+            let (label, value, accent, note) = slice[0];
+            kpi_card(ui, label, value, accent, note, false);
+            return;
+        }
+        ui.columns(slice.len(), |cols| {
+            for (i, &(label, value, accent, note)) in slice.iter().enumerate() {
+                kpi_card(&mut cols[i], label, value, accent, note, false);
+            }
+        });
+    };
+    if width >= 880.0 {
+        paint(ui, cards);
+    } else if width >= 520.0 {
+        let mid = if n == 5 { 3 } else { n.div_ceil(2) };
+        paint(ui, &cards[..mid]);
+        paint(ui, &cards[mid..]);
+    } else if width >= 360.0 {
+        for chunk in cards.chunks(2) {
+            paint(ui, chunk);
+        }
+    } else {
+        for &(label, value, accent, note) in cards {
+            kpi_card(ui, label, value, accent, note, false);
+        }
+    }
+}
+
 fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
     let p = palette(ui);
     let outcome = tab_state(st, tab).outcome.clone();
@@ -255,8 +293,29 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
             }
         });
     }
-    // 关键指标
-    let vat_note = b.map_or("= 收入 + 增值税 + 附加税费".to_string(), |b| {
+    // 关键指标：用户输入项不做卡片；增值税税额必有；附加税费合计独立卡片（明细区已列项，
+    // 卡片给一眼合计）。各页 KPI 见 docs/UI_DESIGN.md。
+    let vat_card_note = b.map_or(format!("征收率 {vat_rate}"), |b| {
+        if b.vat_exempt {
+            "未达到起征点，不征收".to_string()
+        } else {
+            format!("征收率 {vat_rate}")
+        }
+    });
+    let surcharge_note = b.map_or("= 增值税税额 × 各项目费率".to_string(), |b| {
+        if b.vat_exempt {
+            "未达到起征点，不征收".to_string()
+        } else if b.surcharge_relief.is_zero() {
+            "各项分别按分舍入".to_string()
+        } else {
+            format!(
+                "减征前 {}，减征 {}",
+                money(b.surcharge_before_relief),
+                money(b.surcharge_relief)
+            )
+        }
+    });
+    let cost_note = b.map_or("= 收入 + 增值税 + 附加税费".to_string(), |b| {
         if b.vat_exempt {
             "未达到起征点，不征收增值税".to_string()
         } else {
@@ -266,47 +325,56 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
     let iit_note = b.map_or("劳务报酬所得预扣预缴".to_string(), |b| {
         format!("预扣率 {}", rules::pct(b.iit.rate))
     });
+    let net_note = "劳务报酬每次收入".to_string();
+    let home_note = "= 收入 − 应预扣预缴税额".to_string();
+    let net_amt = b.map(|b| money(b.net_income));
+    let vat_amt = b.map(|b| money(b.vat));
+    let surcharge_amt = b.map(|b| money(b.surcharge_total));
     let total = b.map(|b| money(b.total_cost));
     let tax = b.map(|b| money(b.iit.tax));
     let home = b.map(|b| money(b.take_home));
-    let cols = if width >= 500.0 { 3 } else { 1 };
-    let kpis = |ui: &mut Ui, i: usize| match i {
-        0 => kpi_card(
-            ui,
-            "企业总支出",
-            total.as_deref(),
-            p.primary,
-            &vat_note,
-            tab == Tab::FromCost,
-        ),
-        1 => kpi_card(
-            ui,
-            "应预扣预缴税额",
-            tax.as_deref(),
-            p.warning,
-            &iit_note,
-            false,
-        ),
-        _ => kpi_card(
-            ui,
-            "税后实发金额",
-            home.as_deref(),
-            p.success,
-            "= 收入 − 应预扣预缴税额",
-            tab == Tab::Reverse,
-        ),
+    // 各页 KPI（不含用户输入）：(标签, 金额, 色, 说明)
+    type Kpi<'a> = (&'a str, Option<&'a str>, Color32, &'a str);
+    let cards: Vec<Kpi<'_>> = match tab {
+        Tab::Forward => vec![
+            ("增值税税额", vat_amt.as_deref(), p.primary, &vat_card_note),
+            (
+                "附加税费合计",
+                surcharge_amt.as_deref(),
+                p.primary,
+                &surcharge_note,
+            ),
+            ("企业总支出", total.as_deref(), p.primary, &cost_note),
+            ("应预扣预缴税额", tax.as_deref(), p.warning, &iit_note),
+            ("税后实发金额", home.as_deref(), p.success, &home_note),
+        ],
+        Tab::Reverse => vec![
+            ("不含增值税收入", net_amt.as_deref(), p.primary, &net_note),
+            ("增值税税额", vat_amt.as_deref(), p.primary, &vat_card_note),
+            (
+                "附加税费合计",
+                surcharge_amt.as_deref(),
+                p.primary,
+                &surcharge_note,
+            ),
+            ("企业总支出", total.as_deref(), p.primary, &cost_note),
+            ("应预扣预缴税额", tax.as_deref(), p.warning, &iit_note),
+        ],
+        Tab::FromCost => vec![
+            ("不含增值税收入", net_amt.as_deref(), p.primary, &net_note),
+            ("增值税税额", vat_amt.as_deref(), p.primary, &vat_card_note),
+            (
+                "附加税费合计",
+                surcharge_amt.as_deref(),
+                p.primary,
+                &surcharge_note,
+            ),
+            ("应预扣预缴税额", tax.as_deref(), p.warning, &iit_note),
+            ("税后实发金额", home.as_deref(), p.success, &home_note),
+        ],
+        Tab::Batch => vec![],
     };
-    if cols == 3 {
-        ui.columns(3, |c| {
-            for (i, ui) in c.iter_mut().enumerate() {
-                kpis(ui, i);
-            }
-        });
-    } else {
-        for i in 0..3 {
-            kpis(ui, i);
-        }
-    }
+    kpi_row(ui, width, &cards);
     ui.add_space(theme::SP1);
     // 状态 / 警示
     match &outcome {
@@ -795,10 +863,8 @@ fn rules_card(ui: &mut Ui, st: &mut AppState, tab: Tab, collapsible: bool) {
             "附加税费项目及费率为可配置参数。本工具仅用于测算，不构成税务意见。",
         );
         ui.add_space(theme::SP1);
+        // 口径状态（已确认 / 已核实等）不在界面展示，见 docs/ASSUMPTIONS.md
         ui.horizontal(|ui| {
-            for t in [Tag::Confirmed, Tag::Verified, Tag::Pending] {
-                super::settings::tag_badge(ui, t);
-            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.link(format!("{} 修改参数…", icons::SETTINGS)).clicked() {
                     open_settings = true;

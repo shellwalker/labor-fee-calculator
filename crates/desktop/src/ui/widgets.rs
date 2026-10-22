@@ -8,7 +8,7 @@ use eframe::egui::{
 };
 use labor_fee_core::Decimal;
 
-/// 千分位分隔：`"10101.50"` → `"10,101.50"`；非数字原样返回。
+/// 千分位分隔：`"10103.00"` → `"10,103.00"`；非数字原样返回。
 pub fn group_digits(s: &str) -> String {
     let t = s.trim();
     let (sign, rest) = t.strip_prefix('-').map_or(("", t), |r| ("-", r));

@@ -36,6 +36,10 @@ fn configs() -> Vec<(&'static str, Config)> {
     relief30.rounding.surcharge = SurchargeRounding::Total;
     relief30.surcharge.items = three_items();
     relief30.surcharge.relief_rate = dec!(0.3);
+    // 仅征收教育费附加（城市维护建设税、地方教育附加选“否”）
+    let mut edu_only = base.clone();
+    edu_only.surcharge.items[0].enabled = false;
+    edu_only.surcharge.items[2].enabled = false;
     // 1% 征收率、三项全开（7% / 3% / 2%）、减半征收、各项分别按分舍入
     let mut three = base.clone();
     three.surcharge.items = three_items();
@@ -47,6 +51,7 @@ fn configs() -> Vec<(&'static str, Config)> {
         ("银行家舍入", half_even),
         ("不享受减征", no_relief),
         ("3%三项全开减征30%合计舍入", relief30),
+        ("仅教育费附加", edu_only),
         ("1%三项全开减半逐项舍入", three),
     ]
 }
@@ -257,8 +262,8 @@ fn threshold_table() {
     for (t, net, cost) in [
         (dec!(959.98), dec!(999.97), dec!(999.97)),
         (dec!(959.99), dec!(999.99), dec!(999.99)),
-        (dec!(960.00), dec!(1000.00), dec!(1010.15)),
-        (dec!(960.01), dec!(1000.01), dec!(1010.16)),
+        (dec!(960.00), dec!(1000.00), dec!(1010.30)),
+        (dec!(960.01), dec!(1000.01), dec!(1010.31)),
     ] {
         let r = check_exact_min(&rev, t);
         assert_eq!(r.breakdown.net_income, net);
@@ -292,7 +297,7 @@ fn from_total_cost_every_cent_to_70k() {
                 match g.reason {
                     CostGapReason::Threshold => {
                         threshold_gaps += 1;
-                        assert!((100_000..=101_014).contains(&c), "总成本 {cost}");
+                        assert!((100_000..=101_029).contains(&c), "总成本 {cost}");
                     }
                     CostGapReason::Rounding => rounding_gaps += 1,
                 }
@@ -301,8 +306,8 @@ fn from_total_cost_every_cent_to_70k() {
         }
     }
     assert_eq!(
-        threshold_gaps, 1015,
-        "门槛空白区间 1000.00 ~ 1010.14 共 1015 个分"
+        threshold_gaps, 1030,
+        "门槛空白区间 1000.00 ~ 1010.29 共 1030 个分"
     );
     assert!(rounding_gaps > 0);
 }
@@ -311,7 +316,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(3000))]
 
     #[test]
-    fn prop_roundtrip_from_net(n in 0i64..1_000_000_000, idx in 0usize..8) {
+    fn prop_roundtrip_from_net(n in 0i64..1_000_000_000, idx in 0usize..9) {
         // 任取不含税收入 → 到手 → 反算：精确，且不大于原收入（取最小）
         let (_, cfg) = configs().swap_remove(idx);
         let rev = Reverser::new(&cfg).unwrap();
@@ -321,14 +326,14 @@ proptest! {
     }
 
     #[test]
-    fn prop_roundtrip_from_target(t in 0i64..500_000_000, idx in 0usize..8) {
+    fn prop_roundtrip_from_target(t in 0i64..500_000_000, idx in 0usize..9) {
         let (_, cfg) = configs().swap_remove(idx);
         let rev = Reverser::new(&cfg).unwrap();
         check_exact_min(&rev, cents(t));
     }
 
     #[test]
-    fn prop_monotonic(a in 0i64..1_000_000_000, gap in 0i64..10_000_000, idx in 0usize..8) {
+    fn prop_monotonic(a in 0i64..1_000_000_000, gap in 0i64..10_000_000, idx in 0usize..9) {
         let (_, cfg) = configs().swap_remove(idx);
         let fa = forward(&cfg, cents(a)).unwrap();
         let fb = forward(&cfg, cents(a + gap)).unwrap();
@@ -341,7 +346,7 @@ proptest! {
     }
 
     #[test]
-    fn prop_from_total_cost(n in 0i64..1_000_000_000, delta in 0i64..3, idx in 0usize..8) {
+    fn prop_from_total_cost(n in 0i64..1_000_000_000, delta in 0i64..3, idx in 0usize..9) {
         // 可达总成本反推回同一收入；不可达总成本报空位且两侧可达
         let (_, cfg) = configs().swap_remove(idx);
         let b = forward(&cfg, cents(n)).unwrap();
