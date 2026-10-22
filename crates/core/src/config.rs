@@ -1,5 +1,6 @@
 use crate::error::CalcError;
 use rust_decimal::{Decimal, RoundingStrategy};
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 /// 内置默认配置（与仓库 `config/default.toml` 一致）。
@@ -106,12 +107,12 @@ impl SurchargeItem {
     }
 
     /// 标准三项：城市维护建设税、教育费附加、地方教育附加。
-    /// 教育费附加按 `education` 计征且启用，其余两项费率为 0、未启用。
+    /// 教育费附加按 `education` 计征且启用；城市维护建设税（预填 7%）与地方教育附加（预填 2%）不启用。
     pub fn standard(education: Decimal) -> Vec<SurchargeItem> {
         vec![
-            SurchargeItem::new(URBAN_CONSTRUCTION_TAX, Decimal::ZERO, false),
+            SurchargeItem::new(URBAN_CONSTRUCTION_TAX, Decimal::new(7, 2), false),
             SurchargeItem::new(EDUCATION_SURCHARGE, education, true),
-            SurchargeItem::new(LOCAL_EDUCATION_SURCHARGE, Decimal::ZERO, false),
+            SurchargeItem::new(LOCAL_EDUCATION_SURCHARGE, Decimal::new(2, 2), false),
         ]
     }
 }
@@ -121,26 +122,22 @@ impl SurchargeItem {
 #[serde(from = "SurchargeConfigRaw")]
 pub struct SurchargeConfig {
     pub base: SurchargeBase,
-    /// 是否启用减征（如“六税两费”减征政策，是否适用由使用者判断）。
-    pub relief_enabled: bool,
-    /// 减征比例，取值 [0, 1]：实际费率 = 费率 × (1 − 减征比例)；0.5 即减半征收。
-    pub relief_rate: Decimal,
     pub items: Vec<SurchargeItem>,
 }
 
 /// 读取用的原始结构，兼容旧版字段：
-/// - `halve = true`（减半征收）→ 启用减征、减征比例 50%；
+/// - `halve`、`relief_enabled`、`relief_rate`（减征，已不再支持）→ 忽略；
 /// - 单一 `rate`（未列 `items`）或名为“附加税”的项目 → 教育费附加，并补齐另外两项（未启用）。
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SurchargeConfigRaw {
     base: SurchargeBase,
-    #[serde(default)]
-    relief_enabled: bool,
-    #[serde(default)]
-    relief_rate: Option<Decimal>,
-    #[serde(default)]
-    halve: bool,
+    #[serde(default, rename = "relief_enabled")]
+    _relief_enabled: Option<IgnoredAny>,
+    #[serde(default, rename = "relief_rate")]
+    _relief_rate: Option<IgnoredAny>,
+    #[serde(default, rename = "halve")]
+    _halve: Option<IgnoredAny>,
     #[serde(default)]
     rate: Option<Decimal>,
     #[serde(default)]
@@ -149,12 +146,6 @@ struct SurchargeConfigRaw {
 
 impl From<SurchargeConfigRaw> for SurchargeConfig {
     fn from(r: SurchargeConfigRaw) -> Self {
-        let half = Decimal::new(5, 1);
-        let (relief_enabled, relief_rate) = if r.halve {
-            (true, half)
-        } else {
-            (r.relief_enabled, r.relief_rate.unwrap_or(half))
-        };
         let mut items = r.items;
         if items.is_empty() {
             if let Some(rate) = r.rate {
@@ -174,8 +165,6 @@ impl From<SurchargeConfigRaw> for SurchargeConfig {
         }
         SurchargeConfig {
             base: r.base,
-            relief_enabled,
-            relief_rate,
             items,
         }
     }
@@ -277,10 +266,6 @@ impl Config {
                 return bad("surcharge.items.name 不能为空");
             }
         }
-        let r = self.surcharge.relief_rate;
-        if r < Decimal::ZERO || r > one {
-            return bad("surcharge.relief_rate 必须在 [0, 1] 内");
-        }
         let iit = &self.iit;
         if iit.fixed_deduction < Decimal::ZERO || iit.fixed_deduction_limit < Decimal::ZERO {
             return bad("iit 减除费用参数不能为负");
@@ -325,17 +310,9 @@ impl Config {
         Decimal::new(1, self.rounding.scale)
     }
 
-    /// 已启用的附加税费各项目的实际费率（已考虑减征），与 [`SurchargeConfig::enabled_items`] 顺序一致。
+    /// 已启用的附加税费各项目的费率，与 [`SurchargeConfig::enabled_items`] 顺序一致。
     pub fn effective_surcharge_rates(&self) -> Vec<Decimal> {
-        let keep = if self.surcharge.relief_enabled {
-            Decimal::ONE - self.surcharge.relief_rate
-        } else {
-            Decimal::ONE
-        };
-        self.surcharge
-            .enabled_items()
-            .map(|it| it.rate * keep)
-            .collect()
+        self.surcharge.enabled_items().map(|it| it.rate).collect()
     }
 
     /// 不含增值税收入为 `amount` 时是否征收增值税及附加税费。
@@ -364,7 +341,10 @@ mod tests {
         assert_eq!(on[0].name, EDUCATION_SURCHARGE);
         assert_eq!(on[0].rate, Decimal::new(3, 2));
         assert_eq!(cfg.surcharge.items.len(), 3);
-        assert!(!cfg.surcharge.relief_enabled);
+        assert_eq!(cfg.surcharge.items[0].rate, Decimal::new(7, 2));
+        assert!(!cfg.surcharge.items[0].enabled);
+        assert_eq!(cfg.surcharge.items[2].rate, Decimal::new(2, 2));
+        assert!(!cfg.surcharge.items[2].enabled);
         let again = Config::from_toml_str(&cfg.to_toml_string()).unwrap();
         assert_eq!(cfg, again);
     }
@@ -402,20 +382,27 @@ mod tests {
         // 旧版：单一 rate 字段
         let b = legacy("[surcharge]\nbase = \"vat\"\nrate = \"0.03\"\n");
         assert_eq!(b, def);
-        // 旧版：halve = true → 减征 50%
-        let c = legacy(
-            "[surcharge]\nbase = \"vat\"\nhalve = true\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n",
-        );
-        assert!(c.surcharge.relief_enabled);
-        assert_eq!(c.surcharge.relief_rate, Decimal::new(5, 1));
-        assert_eq!(c.effective_surcharge_rates(), vec![Decimal::new(15, 3)]);
     }
 
     #[test]
-    fn relief_rate_validated() {
-        let mut cfg = Config::default();
-        cfg.surcharge.relief_rate = Decimal::new(11, 1);
-        assert!(cfg.validate().is_err());
+    fn legacy_relief_fields_ignored() {
+        // 减征已不再支持：旧版 halve / relief_* 字段读入时忽略，不报错、不影响费率
+        let def = Config::default();
+        let a = legacy(
+            "[surcharge]\nbase = \"vat\"\nhalve = true\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n",
+        );
+        assert_eq!(a, def);
+        assert_eq!(a.effective_surcharge_rates(), vec![Decimal::new(3, 2)]);
+        let mut s = DEFAULT_CONFIG_TOML.replace(
+            "base = \"vat\"",
+            "base = \"vat\"\nrelief_enabled = true\nrelief_rate = \"0.5\"",
+        );
+        let b = Config::from_toml_str(&s).unwrap();
+        assert_eq!(b, def);
+        s = s.replace("relief_rate = \"0.5\"", "relief_rate = \"9\"");
+        assert_eq!(Config::from_toml_str(&s).unwrap(), def);
+        // 重新保存时不再写出这些字段
+        assert!(!b.to_toml_string().contains("relief"));
     }
 
     #[test]

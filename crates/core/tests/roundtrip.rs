@@ -19,11 +19,9 @@ fn configs() -> Vec<(&'static str, Config)> {
     not_equal.vat.levy_at_threshold = false;
     let mut no_threshold = base.clone();
     no_threshold.vat.threshold_enabled = false;
-    // 3% 征收率、三项全开（7% / 3% / 2%）、减征 50%、合计后舍入
+    // 3% 征收率、三项全开（7% / 3% / 2%）、合计后舍入
     let mut itemized = base.clone();
     itemized.vat.rate = dec!(0.03);
-    itemized.surcharge.relief_enabled = true;
-    itemized.surcharge.relief_rate = dec!(0.5);
     itemized.rounding.surcharge = SurchargeRounding::Total;
     itemized.surcharge.items = three_items();
     let mut half_even = base.clone();
@@ -35,7 +33,7 @@ fn configs() -> Vec<(&'static str, Config)> {
         ("默认", base),
         ("门槛不含本数", not_equal),
         ("无门槛", no_threshold),
-        ("3%三项全开减征合计舍入", itemized),
+        ("3%三项全开合计舍入", itemized),
         ("银行家舍入", half_even),
         ("1%三项全开逐项舍入", three),
     ]
@@ -100,7 +98,7 @@ fn check_from_cost_sweep(cfg: &Config, upto_cents: i64) {
 
 #[test]
 fn from_total_cost_three_items_every_cent() {
-    // 7%/3%/2% 三项全开：1% 征收率逐项舍入、3% 征收率减征合计舍入
+    // 7%/3%/2% 三项全开：1% 征收率逐项舍入、3% 征收率合计舍入
     for (name, cfg) in configs() {
         if name.contains("三项") {
             check_from_cost_sweep(&cfg, 3_000_000);

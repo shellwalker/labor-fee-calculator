@@ -255,9 +255,6 @@ pub struct SettingsDraft {
     pub threshold: String,
     pub levy_at_threshold: bool,
     pub surcharge_base: SurchargeBase,
-    pub relief_enabled: bool,
-    /// 减征比例（百分数，如 "50"）。
-    pub relief_rate: String,
     pub items: Vec<ItemDraft>,
     pub fixed_limit: String,
     pub fixed_deduction: String,
@@ -271,6 +268,18 @@ pub struct SettingsDraft {
     pub max_net_income: String,
     /// 保存失败等提示。
     pub message: Option<String>,
+}
+
+/// 附加税费项目是否与默认一致：名称、是否计征相同，费率按数值比较（“7”与“7.0”视为相同）。
+pub fn item_same(a: &ItemDraft, b: &ItemDraft) -> bool {
+    a.name.trim() == b.name.trim()
+        && a.enabled == b.enabled
+        && parse_dec(&a.rate).is_some()
+        && parse_dec(&a.rate) == parse_dec(&b.rate)
+}
+
+pub fn items_same(a: &[ItemDraft], b: &[ItemDraft]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| item_same(x, y))
 }
 
 fn pct_text(d: Decimal) -> String {
@@ -289,7 +298,6 @@ pub mod key {
     pub const FIXED_DEDUCTION: &str = "iit.fixed_deduction";
     pub const PCT_DEDUCTION: &str = "iit.percent_deduction_rate";
     pub const ITEMS: &str = "surcharge.items";
-    pub const RELIEF: &str = "surcharge.relief_rate";
     pub const BRACKETS: &str = "iit.brackets";
     pub const SCALE: &str = "rounding.scale";
     pub const SEARCH_WINDOW: &str = "reverse.search_window";
@@ -318,8 +326,6 @@ impl SettingsDraft {
             threshold: num_text(cfg.vat.threshold),
             levy_at_threshold: cfg.vat.levy_at_threshold,
             surcharge_base: cfg.surcharge.base,
-            relief_enabled: cfg.surcharge.relief_enabled,
-            relief_rate: pct_text(cfg.surcharge.relief_rate),
             items: cfg
                 .surcharge
                 .items
@@ -387,11 +393,6 @@ impl SettingsDraft {
         }
         cfg.vat.levy_at_threshold = self.levy_at_threshold;
         cfg.surcharge.base = self.surcharge_base;
-        cfg.surcharge.relief_enabled = self.relief_enabled;
-        match rate(&self.relief_rate) {
-            Some(r) if r >= Decimal::ZERO && r <= Decimal::ONE => cfg.surcharge.relief_rate = r,
-            _ => err(key::RELIEF, "减征比例请输入 0～100 之间的百分数，如 50"),
-        }
         cfg.surcharge.items.clear();
         for (i, it) in self.items.iter().enumerate() {
             let k = format!("{}.{i}", key::ITEMS);
@@ -499,8 +500,7 @@ impl SettingsDraft {
             self.threshold_enabled == d.threshold_enabled && same(&self.threshold, &d.threshold),
             self.levy_at_threshold == d.levy_at_threshold,
             self.surcharge_base == d.surcharge_base,
-            self.relief_enabled == d.relief_enabled && same(&self.relief_rate, &d.relief_rate),
-            self.items == d.items,
+            items_same(&self.items, &d.items),
             same(&self.fixed_limit, &d.fixed_limit),
             same(&self.fixed_deduction, &d.fixed_deduction),
             same(&self.pct_deduction, &d.pct_deduction),

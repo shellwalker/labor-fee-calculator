@@ -115,25 +115,13 @@ pub fn vat_condition(cfg: &Config) -> String {
     )
 }
 
-/// 增值税附加税费的计算说明（每个已启用项目一行，另附合计与减征说明）。
+/// 增值税附加税费的计算说明（每个计征项目一行，另附合计与未计征项目）。
 pub fn surcharge_lines(cfg: &Config) -> Vec<String> {
     let base = surcharge_base_text(cfg.surcharge.base);
-    let relief = cfg.surcharge.relief_enabled;
     let mut v: Vec<String> = cfg
         .surcharge
         .enabled_items()
-        .map(|it| {
-            if relief {
-                format!(
-                    "{} = {base} × {} × (1 − {})",
-                    it.name,
-                    pct(it.rate),
-                    pct(cfg.surcharge.relief_rate)
-                )
-            } else {
-                format!("{} = {base} × {}", it.name, pct(it.rate))
-            }
-        })
+        .map(|it| format!("{} = {base} × {}", it.name, pct(it.rate)))
         .collect();
     if v.is_empty() {
         v.push("未启用任何附加税费项目".into());
@@ -152,21 +140,15 @@ pub fn surcharge_lines(cfg: &Config) -> Vec<String> {
             }
         ));
     }
-    if relief {
-        v.push(format!(
-            "已启用减征，减征比例 {}（可配置假设，是否适用请自行判断）",
-            pct(cfg.surcharge.relief_rate)
-        ));
-    }
-    let off: Vec<&str> = cfg
+    let off: Vec<String> = cfg
         .surcharge
         .items
         .iter()
         .filter(|i| !i.enabled)
-        .map(|i| i.name.as_str())
+        .map(|i| format!("{}（{}）", i.name, pct(i.rate)))
         .collect();
     if !off.is_empty() {
-        v.push(format!("未启用：{}", off.join("、")));
+        v.push(format!("未计征：{}", off.join("、")));
     }
     v
 }
@@ -245,7 +227,3 @@ pub fn rule_groups(cfg: &Config) -> Vec<RuleGroup> {
 /// 增值税起征点与 1% 优惠征收率依据。
 pub const POLICY_VAT_NAME: &str = "财政部 税务总局公告2026年第10号";
 pub const POLICY_VAT_URL: &str = "https://www.mof.gov.cn/jrttts/202602/t20260203_3983175.htm";
-/// “六税两费”减征依据。
-pub const POLICY_RELIEF_NAME: &str = "财政部 税务总局公告2023年第12号";
-pub const POLICY_RELIEF_URL: &str =
-    "https://www.gov.cn/zhengce/zhengceku/202308/content_6896379.htm";

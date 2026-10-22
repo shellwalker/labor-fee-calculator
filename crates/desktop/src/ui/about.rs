@@ -2,8 +2,7 @@
 
 use super::widgets::{card, small};
 use crate::rules::{
-    POLICY_DETAIL, POLICY_NAME, POLICY_RELIEF_NAME, POLICY_RELIEF_URL, POLICY_URL, POLICY_URL_GOV,
-    POLICY_VAT_NAME, POLICY_VAT_URL,
+    POLICY_DETAIL, POLICY_NAME, POLICY_URL, POLICY_URL_GOV, POLICY_VAT_NAME, POLICY_VAT_URL,
 };
 use crate::state::AppState;
 use crate::theme::{self, palette};
@@ -70,10 +69,6 @@ pub fn about_window(ctx: &egui::Context, st: &mut AppState) {
             ui.hyperlink_to(POLICY_VAT_NAME, POLICY_VAT_URL);
             ui.label(RichText::new("增值税起征点、1% 优惠征收率").color(p.text_weak));
         });
-        ui.horizontal_wrapped(|ui| {
-            ui.hyperlink_to(POLICY_RELIEF_NAME, POLICY_RELIEF_URL);
-            ui.label(RichText::new("“六税两费”减半征收（默认不启用）").color(p.text_weak));
-        });
         ui.add_space(theme::SP2);
         ui.label(RichText::new("字体").strong().color(p.text));
         small(
@@ -84,7 +79,7 @@ pub fn about_window(ctx: &egui::Context, st: &mut AppState) {
         ui.label(RichText::new("免责声明").strong().color(p.text));
         small(
             ui,
-            "本工具按所设参数进行测算，结果仅供参考，不构成税务意见。增值税起征点、征收率、附加税费项目及减征等参数请结合自身情况确认；正式结算、申报以主管税务机关的规定和核定为准。",
+            "本工具按所设参数进行测算，结果仅供参考，不构成税务意见。增值税起征点、征收率、附加税费项目及费率等参数请结合自身情况确认；正式结算、申报以主管税务机关的规定和核定为准。",
         );
         ui.add_space(theme::SP3);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {

@@ -431,20 +431,21 @@ mod tests {
     }
 
     #[test]
-    fn itemized_halved_surcharge() {
+    fn ticking_prefilled_items() {
+        // 默认配置中城市维护建设税（7%）、地方教育附加（2%）已预填费率，只需勾选即可生效
         let mut c = cfg();
-        c.surcharge.relief_enabled = true;
-        c.surcharge.relief_rate = dec!(0.5);
-        c.surcharge.items = vec![
-            crate::SurchargeItem::new("城市维护建设税", dec!(0.07), true),
-            crate::SurchargeItem::new("教育费附加", dec!(0.03), true),
-            crate::SurchargeItem::new("地方教育附加", dec!(0.02), true),
-        ];
+        for it in &mut c.surcharge.items {
+            it.enabled = true;
+        }
         let b = forward(&c, dec!(10000)).unwrap();
         let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
-        assert_eq!(amts, vec![dec!(3.50), dec!(1.50), dec!(1.00)]);
-        assert_eq!(b.surcharge_total, dec!(6.00));
-        assert_eq!(b.total_cost, dec!(10106.00));
+        assert_eq!(amts, vec![dec!(7.00), dec!(3.00), dec!(2.00)]);
+        assert_eq!(b.surcharge_total, dec!(12.00));
+        assert_eq!(b.total_cost, dec!(10112.00));
+        // 未勾选的项目不参与计算
+        let d = forward(&cfg(), dec!(10000)).unwrap();
+        assert_eq!(d.surcharges.len(), 1);
+        assert_eq!(d.total_cost, dec!(10103.00));
     }
 
     #[test]

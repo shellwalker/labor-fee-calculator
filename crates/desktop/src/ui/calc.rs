@@ -754,7 +754,7 @@ fn rules_card(ui: &mut Ui, st: &mut AppState, tab: Tab, collapsible: bool) {
         });
         small(
             ui,
-            "附加税费项目、费率及减征比例为可配置参数。本工具仅用于测算，不构成税务意见。",
+            "附加税费项目及费率为可配置参数。本工具仅用于测算，不构成税务意见。",
         );
         ui.add_space(theme::SP1);
         ui.horizontal(|ui| {

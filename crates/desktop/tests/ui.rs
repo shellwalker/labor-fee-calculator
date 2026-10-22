@@ -188,20 +188,25 @@ fn config_load_and_reset() {
 // ---------- 设置：编辑、校验、持久化 ----------
 
 #[test]
-fn settings_surcharge_items_and_relief() {
+fn settings_surcharge_items_prefilled() {
     let cfg = labor_fee_core::Config::default();
     let mut d = SettingsDraft::from_config(&cfg, ThemeChoice::System);
+    // 默认：城市维护建设税、地方教育附加不计征，但费率已预填 7%、2%
+    assert_eq!((d.items[0].enabled, d.items[0].rate.as_str()), (false, "7"));
+    assert_eq!((d.items[2].enabled, d.items[2].rate.as_str()), (false, "2"));
+    assert_eq!(d.modified_count(), 0);
+    // 只需勾选即可生效
     d.items[0].enabled = true;
-    d.items[0].rate = "7".into();
     d.items[2].enabled = true;
-    d.items[2].rate = "2".into();
     let c = d.build().unwrap();
     let b = labor_fee_core::forward(&c, dec!(10000)).unwrap();
     let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
     assert_eq!(amts, vec![dec!(7.00), dec!(3.00), dec!(2.00)]);
     assert_eq!(b.surcharge_total, dec!(12.00));
+    assert_eq!(b.total_cost, dec!(10112.00));
     assert_eq!(d.modified_count(), 1);
-    // 规则说明动态列出启用的项目
+    assert!(!settings::item_same(&d.items[0], &d.defaults().items[0]));
+    // 规则说明动态列出计征的项目
     let text: String = rules::rule_groups(&c)
         .into_iter()
         .flat_map(|g| g.lines)
@@ -212,29 +217,41 @@ fn settings_surcharge_items_and_relief() {
         "{text}"
     );
     assert!(text.contains("增值税附加税费 = 城市维护建设税 + 教育费附加 + 地方教育附加"));
-    // 减征 50%
-    d.relief_enabled = true;
+    assert!(!text.contains("减征"), "{text}");
+    // 取消勾选、费率写法不同（7.0）均视为恢复默认
+    d.items[0].enabled = false;
+    d.items[2].enabled = false;
+    d.items[0].rate = "7.0".into();
+    assert_eq!(d.modified_count(), 0);
+    // 改为 5%（县城、镇）但不勾选：记为已修改，但不参与计算
+    d.items[0].rate = "5".into();
+    assert_eq!(d.modified_count(), 1);
     let c = d.build().unwrap();
     assert_eq!(
-        labor_fee_core::forward(&c, dec!(10000))
-            .unwrap()
-            .surcharge_total,
-        dec!(6.00)
+        labor_fee_core::forward(&c, dec!(10000)).unwrap().total_cost,
+        dec!(10103.00)
     );
-    assert_eq!(d.modified_count(), 2);
-    d.relief_rate = "120".into();
-    assert!(d.build().unwrap_err().contains_key(settings::key::RELIEF));
+    // 默认规则说明列出未计征项目及预填费率
+    let text: String = rules::rule_groups(&labor_fee_core::Config::default())
+        .into_iter()
+        .flat_map(|g| g.lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("未计征：城市维护建设税（7%）、地方教育附加（2%）"),
+        "{text}"
+    );
 }
 
 #[test]
 fn legacy_rules_file_loads_as_default() {
-    // 旧版设置文件（单一“附加税”项目）读入后与内置默认一致
+    // 旧版设置文件（单一“附加税”项目、已不再支持的 halve 减征字段）读入后与内置默认一致
     let dir = tmp_dir("legacy");
     let store = SettingsStore::at(dir.clone());
     let legacy = labor_fee_core::DEFAULT_CONFIG_TOML.replace(
         &labor_fee_core::DEFAULT_CONFIG_TOML[labor_fee_core::DEFAULT_CONFIG_TOML.find("[surcharge]").unwrap()
             ..labor_fee_core::DEFAULT_CONFIG_TOML.find("[iit]").unwrap()],
-        "[surcharge]\nbase = \"vat\"\nhalve = false\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n\n",
+        "[surcharge]\nbase = \"vat\"\nhalve = true\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n\n",
     );
     std::fs::write(dir.join("rules.toml"), legacy).unwrap();
     let st = AppState::with_store(store);
@@ -356,7 +373,7 @@ fn rules_panel_follows_config() {
         "不含增值税收入达到 1000 元 的征收",
         "教育费附加 = 实际缴纳的增值税税额 × 3%",
         "增值税附加税费 = 教育费附加（各项分别按分舍入）",
-        "未启用：城市维护建设税、地方教育附加",
+        "未计征：城市维护建设税（7%）、地方教育附加（2%）",
         "企业承担",
         "每次收入不超过 4000 元 的，减除费用 800 元；4000 元 以上的，减除费用按 20% 计算",
         "四舍五入",

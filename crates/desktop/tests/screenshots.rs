@@ -128,12 +128,11 @@ fn screenshots() {
             h.get_by_label("文件").click();
         });
 
-        // 非默认参数：城市维护建设税 7%、教育费附加 3%、地方教育附加 2% 全部启用
+        // 非默认参数：勾选预填的城市维护建设税 7%、地方教育附加 2%，与教育费附加 3% 三项全开
         let mut cfg = labor_fee_core::Config::default();
-        cfg.surcharge.items[0].rate = rust_decimal_macros::dec!(0.07);
-        cfg.surcharge.items[0].enabled = true;
-        cfg.surcharge.items[2].rate = rust_decimal_macros::dec!(0.02);
-        cfg.surcharge.items[2].enabled = true;
+        for it in &mut cfg.surcharge.items {
+            it.enabled = true;
+        }
         st = AppState::new(cfg, "已保存的设置").unwrap();
         st.forward.input = "10000".into();
         st.calc_forward();
@@ -153,10 +152,16 @@ fn screenshots() {
         st.open_settings();
         if let Some(d) = &mut st.settings {
             d.section = Section::Surcharge;
+        }
+        shoot("5a-settings-surcharge-default", st, theme, size, |_| {});
+
+        // 只勾选，不改费率
+        st = AppState::with_default_config();
+        st.open_settings();
+        if let Some(d) = &mut st.settings {
+            d.section = Section::Surcharge;
             d.items[0].enabled = true;
-            d.items[0].rate = "7".into();
             d.items[2].enabled = true;
-            d.items[2].rate = "2".into();
         }
         shoot("5b-settings-surcharge", st, theme, size, |_| {});
 

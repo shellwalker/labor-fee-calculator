@@ -354,7 +354,7 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     group_title(ui, "增值税附加税费");
     small(
         ui,
-        "各项目以计税依据乘以费率，分别按分舍入，合计为增值税附加税费。未启用的项目不参与计算。",
+        "各项目以计税依据乘以费率，分别按分舍入，合计为增值税附加税费。未勾选“计征”的项目不参与计算；城市维护建设税、地方教育附加已预填法定费率，勾选即可生效。",
     );
     ui.add_space(theme::SP1);
     if row(
@@ -394,18 +394,17 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
             Some(std_item) => {
                 let help = match std_item.name.as_str() {
                     labor_fee_core::URBAN_CONSTRUCTION_TAX => {
-                        "法定税率：纳税人所在地在市区 7%、县城或镇 5%、其他地区 1%（城市维护建设税法第四条）"
+                        "默认不计征，费率预填 7%。法定税率按纳税人所在地：市区 7%、县城或镇 5%、其他地区 1%（城市维护建设税法第四条）"
                     }
                     labor_fee_core::EDUCATION_SURCHARGE => {
                         "费率 3%（《征收教育费附加的暂行规定》第三条）"
                     }
                     labor_fee_core::LOCAL_EDUCATION_SURCHARGE => {
-                        "征收标准 2%（财综〔2010〕98号）"
+                        "默认不计征，费率预填征收标准 2%（财综〔2010〕98号）"
                     }
                     _ => "",
                 };
-                let modified =
-                    it.enabled != std_item.enabled || !same_value(&it.rate, &std_item.rate);
+                let modified = !crate::settings::item_same(it, &std_item);
                 let name = it.name.clone();
                 if row(
                     ui,
@@ -489,7 +488,7 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
                 enabled: true,
             });
         }
-        if d.items != def.items
+        if !crate::settings::items_same(&d.items, &def.items)
             && ui
                 .small_button(format!("{} 恢复默认项目", icons::RESET))
                 .clicked()
@@ -497,35 +496,6 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
             d.items = def.items.clone();
         }
     });
-    ui.add_space(theme::SP1);
-    let relief_modified =
-        d.relief_enabled != def.relief_enabled || !same_value(&d.relief_rate, &def.relief_rate);
-    let relief_err = errors.contains_key(key::RELIEF);
-    if row(
-        ui,
-        "减征",
-        "如“六税两费”减半征收（财政部 税务总局公告2023年第12号，适用于符合条件的纳税人）。是否适用请自行判断；此项为可配置假设",
-        Tag::Pending,
-        relief_modified,
-        errors.get(key::RELIEF),
-        |ui, l| {
-            ui.checkbox(&mut d.relief_enabled, "启用").labelled_by(l);
-            ui.add_space(theme::SP1);
-            ui.label(RichText::new("减征比例").color(p.text_weak));
-            ui.add_enabled(
-                d.relief_enabled,
-                TextEdit::singleline(&mut d.relief_rate)
-                    .font(theme::mono(14.0))
-                    .desired_width(56.0)
-                    .background_color(if relief_err { p.error_soft } else { p.surface }),
-            )
-            .labelled_by(l);
-            ui.label(RichText::new("%").color(p.text_weak));
-        },
-    ) {
-        d.relief_enabled = def.relief_enabled;
-        d.relief_rate = def.relief_rate.clone();
-    }
 }
 
 fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
