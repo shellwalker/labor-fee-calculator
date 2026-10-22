@@ -30,22 +30,22 @@ struct PageSpec {
 fn spec(tab: Tab) -> PageSpec {
     match tab {
         Tab::Forward => PageSpec {
-            input_label: "不含税收入",
+            input_label: "不含增值税收入",
             hint: "例如 10000",
             examples: &["800", "999.99", "1000", "4000", "10000", "50000"],
-            page_note: "本页以不含税收入为输入（核心变量），其余金额均由它唯一确定。",
+            page_note: "本页以不含增值税收入为输入，其余各项金额均由其确定。",
         },
         Tab::Reverse => PageSpec {
-            input_label: "实际到手",
+            input_label: "税后实发金额",
             hint: "例如 8400",
             examples: &["959.99", "960", "3360", "8400", "20000", "50000"],
-            page_note: "本页由实际到手反算不含税收入，再正算全部金额；正算回去与输入到分一致。",
+            page_note: "本页根据税后实发金额测算不含增值税收入，并据此计算各项金额；复核结果与输入一致到分。",
         },
         _ => PageSpec {
-            input_label: "企业总成本",
+            input_label: "企业总支出",
             hint: "例如 10103",
             examples: &["999.99", "1005", "1010.30", "10103", "50500"],
-            page_note: "本页按企业总成本求不含税收入；落在真空区间或舍入空位时无解，会说明原因并给出两侧最近的有效值。",
+            page_note: "本页根据企业总支出测算不含增值税收入；金额不可达时，说明原因并给出两侧最近的有效金额。",
         },
     }
 }
@@ -166,7 +166,7 @@ fn input_column(ui: &mut Ui, st: &mut AppState, tab: Tab) {
                 go = true;
             }
         });
-        small(ui, "按回车也可计算；支持千分位逗号、¥ 符号。");
+        small(ui, "按回车键亦可计算；支持千分位分隔符和 ¥ 符号。");
         ui.add_space(theme::SP3);
         ui.label(
             RichText::new("快捷示例")
@@ -194,13 +194,13 @@ fn history_card(ui: &mut Ui, st: &mut AppState, tab: Tab) {
     let p = palette(ui);
     let mut pick = None;
     card(ui, |ui| {
-        card_title(ui, icons::CHART, "最近计算", |_| {});
+        card_title(ui, icons::CHART, "最近记录", |_| {});
         let t = tab_state(st, tab);
         if t.history.is_empty() {
-            small(ui, "计算过的金额会列在这里，点击可重新查看。");
+            small(ui, "已计算的金额将列示于此，点击可重新查看。");
         }
         for (i, h) in t.history.iter().enumerate() {
-            let text = format!("{}  →  到手 {}", money(h.input), money(h.take_home));
+            let text = format!("{}  →  实发 {}", money(h.input), money(h.take_home));
             let r = ui.add(
                 egui::Button::new(RichText::new(text).font(theme::mono(13.0)).color(p.text))
                     .fill(if i % 2 == 0 { p.surface_alt } else { p.surface })
@@ -208,7 +208,7 @@ fn history_card(ui: &mut Ui, st: &mut AppState, tab: Tab) {
                     .min_size(Vec2::new(ui.available_width(), 26.0)),
             );
             if r.on_hover_text(format!(
-                "不含税收入 {}，企业总成本 {}",
+                "不含增值税收入 {}，企业总支出 {}",
                 money(h.net_income),
                 money(h.total_cost)
             ))
@@ -233,34 +233,31 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
         Outcome::Done { breakdown, .. } => Some(breakdown),
         _ => None,
     };
+    let vat_rate = rules::pct(st.config().vat.rate);
+    let item_labels: Vec<(String, String)> = st
+        .config()
+        .surcharge
+        .enabled_items()
+        .zip(st.config().effective_surcharge_rates())
+        .map(|(i, r)| (i.name.clone(), rules::pct(r)))
+        .collect();
     if !st.show_rules && width >= 700.0 {
         ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
-            if secondary_button(ui, &format!("{} 显示试算规则", icons::RULES)).clicked() {
+            if secondary_button(ui, &format!("{} 显示计算规则", icons::RULES)).clicked() {
                 st.show_rules = true;
             }
         });
     }
     // 关键指标
-    let vat_note = b.map_or(
-        "= 不含税收入 + 增值税 + 附加税".to_string(),
-        |b| {
-            if b.vat_exempt {
-                "未达征收门槛，不征增值税及附加税".to_string()
-            } else {
-                format!(
-                    "含增值税 {} + 附加税 {}",
-                    money(b.vat),
-                    money(b.surcharge_total)
-                )
-            }
-        },
-    );
-    let iit_note = b.map_or("劳务报酬预扣预缴".to_string(), |b| {
-        format!(
-            "预扣率 {} · 速算扣除 {}",
-            rules::pct(b.iit.rate),
-            money(b.iit.quick_deduction)
-        )
+    let vat_note = b.map_or("= 收入 + 增值税 + 附加税费".to_string(), |b| {
+        if b.vat_exempt {
+            "未达到起征点，不征收增值税".to_string()
+        } else {
+            format!("其中税费 {}", money(b.vat + b.surcharge_total))
+        }
+    });
+    let iit_note = b.map_or("劳务报酬所得预扣预缴".to_string(), |b| {
+        format!("预扣率 {}", rules::pct(b.iit.rate))
     });
     let total = b.map(|b| money(b.total_cost));
     let tax = b.map(|b| money(b.iit.tax));
@@ -269,19 +266,26 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
     let kpis = |ui: &mut Ui, i: usize| match i {
         0 => kpi_card(
             ui,
-            "企业总成本",
+            "企业总支出",
             total.as_deref(),
             p.primary,
             &vat_note,
             tab == Tab::FromCost,
         ),
-        1 => kpi_card(ui, "个税", tax.as_deref(), p.warning, &iit_note, false),
+        1 => kpi_card(
+            ui,
+            "应预扣预缴税额",
+            tax.as_deref(),
+            p.warning,
+            &iit_note,
+            false,
+        ),
         _ => kpi_card(
             ui,
-            "实际到手",
+            "税后实发金额",
             home.as_deref(),
             p.success,
-            "= 不含税收入 − 个税",
+            "= 收入 − 应预扣预缴税额",
             tab == Tab::Reverse,
         ),
     };
@@ -332,27 +336,34 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
     // 明细分组
     let two = width >= 600.0;
     let is_input = |name: &str| match tab {
-        Tab::Forward => name == "不含税收入",
-        Tab::Reverse => name == "实际到手",
-        _ => name == "企业总成本",
+        Tab::Forward => name == "不含增值税收入",
+        Tab::Reverse => name == "税后实发金额",
+        _ => name == "企业总支出",
     };
     let vat_card = |ui: &mut Ui| {
         card(ui, |ui| {
-            card_title(ui, icons::TAX, "增值税与附加税", |ui| {
+            card_title(ui, icons::TAX, "增值税及附加税费", |ui| {
                 badge(ui, "企业承担", p.primary, p.primary_soft);
             });
             let v = |f: fn(&Breakdown) -> Decimal| b.map_or("—".into(), |b| money(f(b)));
             amount_row(
                 ui,
-                &mark("不含税收入", is_input("不含税收入")),
+                &mark("不含增值税收入", is_input("不含增值税收入")),
                 &v(|b| b.net_income),
                 "元",
                 false,
                 p.text,
             );
-            amount_row(ui, "增值税", &v(|b| b.vat), "元", false, p.text);
+            amount_row(
+                ui,
+                &format!("增值税税额（{vat_rate}）"),
+                &v(|b| b.vat),
+                "元",
+                false,
+                p.text,
+            );
             match b {
-                Some(b) if b.surcharges.len() > 1 => {
+                Some(b) => {
                     for l in &b.surcharges {
                         amount_row(
                             ui,
@@ -363,20 +374,24 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
                             p.text,
                         );
                     }
-                    amount_row(
-                        ui,
-                        "附加税合计",
-                        &money(b.surcharge_total),
-                        "元",
-                        false,
-                        p.text,
-                    );
                 }
-                _ => amount_row(ui, "附加税", &v(|b| b.surcharge_total), "元", false, p.text),
+                None => {
+                    for (name, rate) in &item_labels {
+                        amount_row(ui, &format!("　{name}（{rate}）"), "—", "元", false, p.text);
+                    }
+                }
             }
             amount_row(
                 ui,
-                &mark("企业总成本", is_input("企业总成本")),
+                "增值税附加税费合计",
+                &v(|b| b.surcharge_total),
+                "元",
+                false,
+                p.text,
+            );
+            amount_row(
+                ui,
+                &mark("企业总支出", is_input("企业总支出")),
                 &v(|b| b.total_cost),
                 "元",
                 true,
@@ -387,13 +402,13 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
     let iit_card = |ui: &mut Ui| {
         card(ui, |ui| {
             card_title(ui, icons::MONEY, "个人所得税", |ui| {
-                badge(ui, "劳务报酬预扣", p.warning, p.warning_soft);
+                badge(ui, "预扣预缴", p.warning, p.warning_soft);
             });
             let v = |f: fn(&Breakdown) -> Decimal| b.map_or("—".into(), |b| money(f(b)));
             amount_row(ui, "减除费用", &v(|b| b.iit.deduction), "元", false, p.text);
             amount_row(
                 ui,
-                "应纳税所得额",
+                "预扣预缴应纳税所得额",
                 &v(|b| b.iit.taxable_income),
                 "元",
                 false,
@@ -415,10 +430,10 @@ fn result_column(ui: &mut Ui, st: &mut AppState, tab: Tab, width: f32) {
                 false,
                 p.text,
             );
-            amount_row(ui, "个税", &v(|b| b.iit.tax), "元", false, p.text);
+            amount_row(ui, "应预扣预缴税额", &v(|b| b.iit.tax), "元", false, p.text);
             amount_row(
                 ui,
-                &mark("实际到手", is_input("实际到手")),
+                &mark("税后实发金额", is_input("税后实发金额")),
                 &v(|b| b.take_home),
                 "元",
                 true,
@@ -461,7 +476,7 @@ fn status_hint(ui: &mut Ui) {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icons::TIP).color(p.primary));
                 ui.label(
-                    RichText::new("输入金额后按回车或点击“计算”，也可以点左侧的快捷示例。")
+                    RichText::new("输入金额后按回车键或点击“计算”，也可选用左侧的快捷示例。")
                         .color(p.primary),
                 );
             });
@@ -486,7 +501,7 @@ fn formula_strip(ui: &mut Ui, b: &Breakdown) {
             );
             ui.label(
                 RichText::new(format!(
-                    "总成本 {} = 不含税收入 {} + 增值税 {} + 附加税 {}",
+                    "企业总支出 {} = 收入 {} + 增值税 {} + 附加税费 {}",
                     money(b.total_cost),
                     money(b.net_income),
                     money(b.vat),
@@ -497,7 +512,7 @@ fn formula_strip(ui: &mut Ui, b: &Breakdown) {
             );
             ui.label(
                 RichText::new(format!(
-                    "个税 {} = 应纳税所得额 {} × {} − {}",
+                    "应预扣预缴税额 {} = 应纳税所得额 {} × {} − {}",
                     money(b.iit.tax),
                     money(b.iit.taxable_income),
                     rules::pct(b.iit.rate),
@@ -508,7 +523,7 @@ fn formula_strip(ui: &mut Ui, b: &Breakdown) {
             );
             ui.label(
                 RichText::new(format!(
-                    "到手 {} = 不含税收入 {} − 个税 {}",
+                    "税后实发金额 {} = 收入 {} − 预扣税额 {}",
                     money(b.take_home),
                     money(b.net_income),
                     money(b.iit.tax)
@@ -519,7 +534,7 @@ fn formula_strip(ui: &mut Ui, b: &Breakdown) {
         });
 }
 
-/// 真空区间 / 舍入空位警示卡；返回被点击的有效总成本。
+/// 不可达金额警示卡；返回被点击的有效企业总支出。
 fn gap_card(ui: &mut Ui, cfg: &Config, g: &CostGap) -> Option<Decimal> {
     let p = palette(ui);
     let mut clicked = None;
@@ -533,7 +548,7 @@ fn gap_card(ui: &mut Ui, cfg: &Config, g: &CostGap) -> Option<Decimal> {
             ui.horizontal(|ui| {
                 ui.label(RichText::new(icons::WARN).size(18.0).color(p.error));
                 ui.label(
-                    RichText::new("该企业总成本没有对应的不含税收入")
+                    RichText::new("该企业总支出无对应的不含增值税收入")
                         .size(theme::FS_SECTION)
                         .color(p.error)
                         .strong(),
@@ -548,7 +563,10 @@ fn gap_card(ui: &mut Ui, cfg: &Config, g: &CostGap) -> Option<Decimal> {
             ui.add_space(theme::SP2);
             gap_line(ui, cfg, g);
             ui.add_space(theme::SP2);
-            ui.label(RichText::new("改用两侧最近的有效总成本（点击重算）：").color(p.text_weak));
+            ui.label(
+                RichText::new("可改用两侧最近的有效企业总支出（点击重新测算）：")
+                    .color(p.text_weak),
+            );
             ui.columns(2, |c| {
                 for (i, (side, arrow)) in [(g.lower, icons::LEFT), (g.upper, icons::RIGHT)]
                     .into_iter()
@@ -556,15 +574,9 @@ fn gap_card(ui: &mut Ui, cfg: &Config, g: &CostGap) -> Option<Decimal> {
                 {
                     let ui = &mut c[i];
                     let text = if i == 0 {
-                        format!(
-                            "{arrow} {}（不含税收入 {}）",
-                            side.total_cost, side.net_income
-                        )
+                        format!("{arrow} {}（收入 {}）", side.total_cost, side.net_income)
                     } else {
-                        format!(
-                            "{}（不含税收入 {}）{arrow}",
-                            side.total_cost, side.net_income
-                        )
+                        format!("{}（收入 {}）{arrow}", side.total_cost, side.net_income)
                     };
                     let b = egui::Button::new(
                         RichText::new(text).font(theme::mono(14.0)).color(p.primary),
@@ -662,7 +674,7 @@ fn rules_card(ui: &mut Ui, st: &mut AppState, tab: Tab, collapsible: bool) {
     let mut open_settings = false;
     let mut hide = false;
     card(ui, |ui| {
-        card_title(ui, icons::RULES, "试算规则", |ui| {
+        card_title(ui, icons::RULES, "计算规则", |ui| {
             if collapsible
                 && ui
                     .small_button("收起")
@@ -672,7 +684,7 @@ fn rules_card(ui: &mut Ui, st: &mut AppState, tab: Tab, collapsible: bool) {
                 hide = true;
             }
             if modified == 0 {
-                badge(ui, "内置默认口径", p.success, p.success_soft);
+                badge(ui, "默认参数", p.success, p.success_soft);
             } else {
                 badge(
                     ui,
@@ -682,7 +694,7 @@ fn rules_card(ui: &mut Ui, st: &mut AppState, tab: Tab, collapsible: bool) {
                 );
             }
         });
-        small(ui, "根据当前生效的口径自动生成。");
+        small(ui, "根据当前生效的计算参数自动生成。");
         ui.add_space(theme::SP1);
         egui::Frame::new()
             .fill(p.info_soft)
@@ -702,7 +714,7 @@ fn rules_card(ui: &mut Ui, st: &mut AppState, tab: Tab, collapsible: bool) {
                     ui.add(egui::Label::new(RichText::new(l).color(p.text_weak)).wrap());
                 });
             }
-            if g.title.starts_with("个税") {
+            if g.title.starts_with("个人所得税") {
                 bracket_table(ui, &cfg);
             }
         }
@@ -725,11 +737,24 @@ fn rules_card(ui: &mut Ui, st: &mut AppState, tab: Tab, collapsible: bool) {
                 RichText::new("国务院公报").size(theme::FS_SMALL),
                 POLICY_URL_GOV,
             );
-            ui.label(RichText::new("）").size(theme::FS_SMALL).color(p.text_weak));
+            ui.label(
+                RichText::new("）；")
+                    .size(theme::FS_SMALL)
+                    .color(p.text_weak),
+            );
+            ui.hyperlink_to(
+                RichText::new(rules::POLICY_VAT_NAME).size(theme::FS_SMALL),
+                rules::POLICY_VAT_URL,
+            );
+            ui.label(
+                RichText::new("（起征点、优惠征收率）")
+                    .size(theme::FS_SMALL)
+                    .color(p.text_weak),
+            );
         });
         small(
             ui,
-            "1000 元征收门槛为业务口径，不是增值税法定起征点。本工具仅用于试算，不构成税务意见。",
+            "附加税费项目、费率及减征比例为可配置参数。本工具仅用于测算，不构成税务意见。",
         );
         ui.add_space(theme::SP1);
         ui.horizontal(|ui| {
@@ -737,7 +762,7 @@ fn rules_card(ui: &mut Ui, st: &mut AppState, tab: Tab, collapsible: bool) {
                 super::settings::tag_badge(ui, t);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.link(format!("{} 修改口径…", icons::SETTINGS)).clicked() {
+                if ui.link(format!("{} 修改参数…", icons::SETTINGS)).clicked() {
                     open_settings = true;
                 }
             });

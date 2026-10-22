@@ -1,8 +1,9 @@
 //! 劳务报酬批量计算。
 //!
 //! 读取 xlsx/xls/ods（第一个工作表）或 csv，按输入类型取首行标题对应的列：
-//! - 默认“到手金额”（批量反算）；
-//! - 可选“不含税收入”（批量正算）或“企业总成本”（批量按总成本正算，落在空位的行在备注列写明原因）。
+//! - 默认“税后实发金额”（按税后实发金额批量测算；兼容旧列名“实发金额”“到手金额”）；
+//! - 可选“不含增值税收入”（批量计算；兼容“不含税收入”）或“企业总支出”（按企业总支出批量测算；
+//!   兼容“企业总成本”，无对应收入的行在备注列写明原因）。
 //!
 //! 对每一行计算，并在原表右侧追加各项结果列，输出新文件（表格输入输出 xlsx，csv 输入输出 csv）。
 //!
@@ -15,18 +16,29 @@ use std::io::Cursor;
 use std::str::FromStr;
 use thiserror::Error;
 
-/// 默认读取的列标题（批量反算）。
-pub const DEFAULT_COLUMN: &str = "到手金额";
+/// 默认读取的列标题（按税后实发金额测算）。
+pub const DEFAULT_COLUMN: &str = "税后实发金额";
+/// 旧版默认列标题，仍可识别。
+pub const LEGACY_COLUMN: &str = "到手金额";
+
+/// 结果表“测算状态”列：按收入计算、按企业总支出测算成功时的状态。
+pub const STATUS_DONE: &str = "已计算";
+/// 结果表“测算状态”列：数据错误。
+pub const STATUS_ERROR: &str = "数据错误";
+/// 结果表“测算状态”列：企业总支出无对应收入。
+pub const STATUS_UNREACHABLE: &str = "总支出不可达";
+/// 未达到起征点时的备注。
+pub const VAT_EXEMPT_NOTE: &str = "未达到增值税起征点，不征收增值税及附加税费";
 
 /// 输入列的含义。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InputKind {
-    /// 实际到手 → 反算（默认）。
+    /// 税后实发金额 → 测算不含增值税收入（默认）。
     #[default]
     TakeHome,
-    /// 不含税收入 → 正算。
+    /// 不含增值税收入 → 计算。
     NetIncome,
-    /// 企业总成本 → 辅助正算（空位报错）。
+    /// 企业总支出 → 测算不含增值税收入（不可达金额报错）。
     TotalCost,
 }
 
@@ -35,30 +47,54 @@ impl InputKind {
     pub fn default_column(self) -> &'static str {
         match self {
             InputKind::TakeHome => DEFAULT_COLUMN,
-            InputKind::NetIncome => "不含税收入",
-            InputKind::TotalCost => "企业总成本",
+            InputKind::NetIncome => "不含增值税收入",
+            InputKind::TotalCost => "企业总支出",
+        }
+    }
+
+    /// 未指定列名时可识别的列标题（按优先顺序；含旧版列名）。
+    pub fn column_aliases(self) -> &'static [&'static str] {
+        match self {
+            InputKind::TakeHome => &[DEFAULT_COLUMN, "实发金额", LEGACY_COLUMN],
+            InputKind::NetIncome => &["不含增值税收入", "不含税收入"],
+            InputKind::TotalCost => &["企业总支出", "企业总成本"],
+        }
+    }
+
+    /// 简短名称（界面与状态说明用）。
+    pub fn title(self) -> &'static str {
+        match self {
+            InputKind::TakeHome => "按税后实发金额测算",
+            InputKind::NetIncome => "按不含增值税收入计算",
+            InputKind::TotalCost => "按企业总支出测算",
         }
     }
 
     /// 由字符串解析：take-home / net-income / total-cost（也接受中文列名）。
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim() {
-            "take-home" | "take_home" | "到手金额" => Some(InputKind::TakeHome),
-            "net-income" | "net_income" | "不含税收入" => Some(InputKind::NetIncome),
-            "total-cost" | "total_cost" | "企业总成本" => Some(InputKind::TotalCost),
+            "take-home" | "take_home" | "税后实发金额" | "实发金额" | "到手金额" => {
+                Some(InputKind::TakeHome)
+            }
+            "net-income" | "net_income" | "不含增值税收入" | "不含税收入" => {
+                Some(InputKind::NetIncome)
+            }
+            "total-cost" | "total_cost" | "企业总支出" | "企业总成本" => {
+                Some(InputKind::TotalCost)
+            }
             _ => None,
         }
     }
 }
 
-/// 批量处理错误（文件级）。行级错误写入结果表的“校准状态”“备注”列，不中断处理。
+/// 批量处理错误（文件级）。行级错误写入结果表的“测算状态”“备注”列，不中断处理。
 #[derive(Debug, Error)]
 pub enum BatchError {
     #[error("不支持的文件类型：{0}（支持 .xlsx/.xlsm/.xls/.ods/.csv）")]
     UnsupportedFormat(String),
-    #[error("表格为空")]
+    #[error("表格内容为空")]
     Empty,
-    #[error("首行未找到标题为“{0}”的列")]
+    #[error("首行未找到标题为{0}的列")]
     ColumnNotFound(String),
     #[error("读取文件失败：{0}")]
     Read(String),
@@ -109,12 +145,12 @@ impl Format {
     }
 }
 
-/// 根据输入文件名生成输出文件名：`原名_反算结果.xlsx/csv`。
+/// 根据输入文件名生成输出文件名：`原名_测算结果.xlsx/csv`。
 pub fn output_file_name(input_name: &str) -> Result<String, BatchError> {
     output_file_name_for(input_name, InputKind::TakeHome)
 }
 
-/// 按输入类型生成输出文件名：反算为 `原名_反算结果`，正算为 `原名_计算结果`。
+/// 按输入类型生成输出文件名：按税后实发金额测算为 `原名_测算结果`，其余为 `原名_计算结果`。
 pub fn output_file_name_for(input_name: &str, kind: InputKind) -> Result<String, BatchError> {
     let fmt = Format::from_file_name(input_name)?;
     let stem = input_name
@@ -123,7 +159,7 @@ pub fn output_file_name_for(input_name: &str, kind: InputKind) -> Result<String,
         .unwrap_or(input_name);
     let stem = stem.rsplit(['/', '\\']).next().unwrap_or(stem);
     let suffix = match kind {
-        InputKind::TakeHome => "反算结果",
+        InputKind::TakeHome => "测算结果",
         _ => "计算结果",
     };
     Ok(format!("{stem}_{suffix}.{}", fmt.output_extension()))
@@ -132,7 +168,7 @@ pub fn output_file_name_for(input_name: &str, kind: InputKind) -> Result<String,
 /// 批量处理选项。
 #[derive(Debug, Clone, Default)]
 pub struct Options {
-    /// 输入列的含义（默认实际到手 → 反算）。
+    /// 输入列的含义（默认税后实发金额 → 测算）。
     pub kind: InputKind,
     /// 读取的列标题（首行精确匹配，忽略首尾空白）；为空时用输入类型的默认列名。
     pub column: Option<String>,
@@ -234,31 +270,29 @@ fn parse_amount(cell: &Cell, scale: u32) -> Result<Option<Decimal>, String> {
     };
     let r = d.round_dp(scale);
     if r != d && !(tolerant && (r - d).abs() < Decimal::new(1, 6)) {
-        return Err(format!("金额 {d} 超过 {scale} 位小数"));
+        return Err(format!("金额 {d} 的小数位数超过 {scale} 位"));
     }
     Ok(Some(r))
 }
 
 fn result_headers(cfg: &Config) -> Vec<String> {
-    let mut h: Vec<String> = ["不含税收入", "增值税"]
+    let mut h: Vec<String> = ["不含增值税收入", "增值税税额"]
         .iter()
         .map(|s| s.to_string())
         .collect();
-    if cfg.surcharge.items.len() > 1 {
-        h.extend(cfg.surcharge.items.iter().map(|i| i.name.clone()));
-    }
+    h.extend(cfg.surcharge.enabled_items().map(|i| i.name.clone()));
     h.extend(
         [
-            "附加税合计",
-            "企业总成本",
-            "收入额",
+            "增值税附加税费合计",
+            "企业总支出",
+            "每次收入",
             "减除费用",
-            "应纳税所得额",
+            "预扣预缴应纳税所得额",
             "预扣率",
             "速算扣除数",
-            "代扣个税",
-            "实际到手",
-            "校准状态",
+            "应预扣预缴税额",
+            "税后实发金额",
+            "测算状态",
             "差额",
             "备注",
         ]
@@ -276,12 +310,10 @@ struct RowResult {
     notes: Vec<String>,
 }
 
-fn result_values(cfg: &Config, r: &RowResult) -> Vec<Out> {
+fn result_values(r: &RowResult) -> Vec<Out> {
     let b = &r.breakdown;
     let mut v = vec![Out::Money(b.net_income), Out::Money(b.vat)];
-    if cfg.surcharge.items.len() > 1 {
-        v.extend(b.surcharges.iter().map(|l| Out::Money(l.amount)));
-    }
+    v.extend(b.surcharges.iter().map(|l| Out::Money(l.amount)));
     v.extend([
         Out::Money(b.surcharge_total),
         Out::Money(b.total_cost),
@@ -297,7 +329,7 @@ fn result_values(cfg: &Config, r: &RowResult) -> Vec<Out> {
     ]);
     let mut notes = Vec::new();
     if b.vat_exempt {
-        notes.push("不征增值税及附加税".to_string());
+        notes.push(VAT_EXEMPT_NOTE.to_string());
     }
     notes.extend(r.notes.iter().cloned());
     v.push(Out::Text(notes.join("；")));
@@ -492,11 +524,19 @@ pub fn process(
         return Err(BatchError::Empty);
     }
     let header = table.remove(0);
-    let column = opts.column_name();
-    let col = header
-        .iter()
-        .position(|c| c.text().trim() == column.trim())
-        .ok_or(BatchError::ColumnNotFound(column))?;
+    let find = |name: &str| header.iter().position(|c| c.text().trim() == name.trim());
+    let col = match &opts.column {
+        Some(c) if !c.trim().is_empty() => {
+            find(c).ok_or_else(|| BatchError::ColumnNotFound(format!("“{}”", c.trim())))?
+        }
+        _ => {
+            let names = opts.kind.column_aliases();
+            names.iter().find_map(|n| find(n)).ok_or_else(|| {
+                let quoted: Vec<String> = names.iter().map(|n| format!("“{n}”")).collect();
+                BatchError::ColumnNotFound(quoted.join("或"))
+            })?
+        }
+    };
     // 原表列数：取标题与各数据行的最大宽度，结果列统一追加在其右侧
     let width = table
         .iter()
@@ -521,7 +561,7 @@ pub fn process(
     for mut orig in table {
         orig.resize(width, Cell::Empty);
         summary.rows += 1;
-        // 出错行：校准状态写简短状态，备注写完整原因
+        // 出错行：测算状态写简短状态，备注写完整原因
         let err_row = |status: &str, msg: String| {
             let mut v = vec![Out::Empty; n];
             v[n - 3] = Out::Text(status.to_string());
@@ -536,7 +576,7 @@ pub fn process(
             }
             Err(e) => {
                 summary.errors += 1;
-                rows.push((orig, err_row("错误", e)));
+                rows.push((orig, err_row(STATUS_ERROR, e)));
                 continue;
             }
             Ok(Some(a)) => a,
@@ -546,7 +586,7 @@ pub fn process(
                 let mut notes = Vec::new();
                 if !r.other_solutions.is_empty() {
                     let s: Vec<String> = r.other_solutions.iter().map(|d| d.to_string()).collect();
-                    notes.push(format!("另有不含税收入 {} 亦可精确达到", s.join("、")));
+                    notes.push(format!("另有不含增值税收入 {} 亦可精确匹配", s.join("、")));
                 }
                 RowResult {
                     status: r.status_text(),
@@ -557,33 +597,33 @@ pub fn process(
             }),
             (InputKind::NetIncome, _) => forward(cfg, amount).map(|b| RowResult {
                 breakdown: b,
-                status: "正算".into(),
+                status: STATUS_DONE.into(),
                 diff: None,
                 notes: Vec::new(),
             }),
             _ => from_total_cost(cfg, amount).map(|b| RowResult {
                 breakdown: b,
-                status: "正算".into(),
+                status: STATUS_DONE.into(),
                 diff: None,
                 notes: Vec::new(),
             }),
         };
         let out = match res {
             Ok(r) => {
-                if r.status.starts_with("不可精确") {
+                if r.diff.is_some_and(|d| !d.is_zero()) {
                     summary.inexact += 1;
                 } else {
                     summary.exact += 1;
                 }
-                result_values(cfg, &r)
+                result_values(&r)
             }
             Err(e @ CalcError::CostUnreachable(_)) => {
                 summary.unreachable_cost += 1;
-                err_row("总成本不可达", e.to_string())
+                err_row(STATUS_UNREACHABLE, e.to_string())
             }
             Err(e) => {
                 summary.errors += 1;
-                err_row("错误", e.to_string())
+                err_row(STATUS_ERROR, e.to_string())
             }
         };
         rows.push((orig, out));
@@ -653,8 +693,8 @@ mod tests {
         assert!(Format::from_file_name("a.txt").is_err());
         assert_eq!(
             output_file_name("dir/工资.xls").unwrap(),
-            "工资_反算结果.xlsx"
+            "工资_测算结果.xlsx"
         );
-        assert_eq!(output_file_name("b.csv").unwrap(), "b_反算结果.csv");
+        assert_eq!(output_file_name("b.csv").unwrap(), "b_测算结果.csv");
     }
 }

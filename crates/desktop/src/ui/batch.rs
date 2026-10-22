@@ -15,11 +15,18 @@ use labor_fee_batch::InputKind;
 use labor_fee_core::Decimal;
 use std::str::FromStr;
 
+use labor_fee_batch::{STATUS_DONE, STATUS_ERROR};
+
+/// 正常完成的测算状态（精确匹配或已计算）。
+fn is_ok_status(s: &str) -> bool {
+    s == STATUS_DONE || s == "精确匹配"
+}
+
 pub fn kind_text(k: InputKind) -> &'static str {
     match k {
-        InputKind::TakeHome => "到手金额（反算）",
-        InputKind::NetIncome => "不含税收入（正算）",
-        InputKind::TotalCost => "企业总成本（按总成本）",
+        InputKind::TakeHome => "税后实发金额（测算收入）",
+        InputKind::NetIncome => "不含增值税收入（计算）",
+        InputKind::TotalCost => "企业总支出（测算收入）",
     }
 }
 
@@ -140,8 +147,8 @@ pub fn page(ui: &mut Ui, st: &mut AppState) {
             .labelled_by(l.id);
         }),
         2 => step_card(ui, step_h, |ui| {
-            step_header(ui, 3, "执行计算", has_result, has_file && !has_result);
-            small(ui, "按首行标题找到所选列，逐行计算，结果列追加在右侧。");
+            step_header(ui, 3, "执行测算", has_result, has_file && !has_result);
+            small(ui, "按首行标题识别所选列，逐行测算，结果列追加在右侧。");
             ui.add_space(theme::SP2);
             ui.horizontal(|ui| {
                 ui.scope(|ui| {
@@ -152,7 +159,7 @@ pub fn page(ui: &mut Ui, st: &mut AppState) {
                 });
                 if running {
                     ui.spinner();
-                    ui.label("计算中…");
+                    ui.label("测算中…");
                 }
             });
         }),
@@ -160,7 +167,7 @@ pub fn page(ui: &mut Ui, st: &mut AppState) {
             step_header(ui, 4, "导出结果", false, has_result);
             match &st.batch.result {
                 None => {
-                    small(ui, "执行后可导出为新文件（原文件不会被修改）。");
+                    small(ui, "执行后可导出为新文件（不修改原文件）。");
                 }
                 Some(res) => {
                     let name = res.default_file_name();
@@ -326,8 +333,8 @@ fn stats_row(ui: &mut Ui, st: &AppState) {
         .as_ref()
         .map(|r| (&r.output.summary, r.kind));
     let third_label = match st.batch.result.as_ref().map_or(st.batch.kind, |r| r.kind) {
-        InputKind::TakeHome => "不可精确达到",
-        InputKind::TotalCost => "总成本不可达",
+        InputKind::TakeHome => "无法精确匹配",
+        InputKind::TotalCost => "总支出不可达",
         InputKind::NetIncome => "需注意",
     };
     let third = s.map(|(s, k)| match k {
@@ -414,10 +421,10 @@ fn empty_preview(ui: &mut Ui, p: &Palette) {
             ui.label(RichText::new(icons::BATCH).size(40.0).color(p.primary.gamma_multiply(0.6)));
             ui.label(RichText::new("还没有结果").size(theme::FS_SECTION).color(p.text));
             ui.label(
-                RichText::new("表格首行为标题行，默认读取“到手金额”列；结果列（不含税收入、增值税、附加税、企业总成本、个税、实际到手、校准状态等）追加在原有列右侧。")
+                RichText::new("表格首行为标题行，默认读取“税后实发金额”列（兼容旧列名“实发金额”“到手金额”）；结果列（不含增值税收入、增值税税额、附加税费、企业总支出、应预扣预缴税额、税后实发金额、测算状态等）追加在原有列右侧。")
                     .color(p.text_weak),
             );
-            ui.label(RichText::new("非法金额（如“12元5角”）不会中断计算，对应行标记为错误并说明原因。").color(p.text_weak));
+            ui.label(RichText::new("无效金额（如“12元5角”）不会中断测算，对应行标记为“数据错误”并说明原因。").color(p.text_weak));
         },
     );
 }
@@ -428,9 +435,7 @@ fn preview_table(ui: &mut Ui, p: &Palette, rows: &[Vec<String>]) {
         .iter()
         .len()
         .max(rows.iter().map(Vec::len).max().unwrap_or(0));
-    let status_col = header
-        .iter()
-        .position(|h| h == "校准状态" || h == "校验状态");
+    let status_col = header.iter().position(|h| h == "测算状态");
     let widths: Vec<f32> = (0..ncol)
         .map(|c| {
             rows.iter()
@@ -490,8 +495,8 @@ fn preview_table(ui: &mut Ui, p: &Palette, rows: &[Vec<String>]) {
             .body(|mut body| {
                 for r in rows.iter().skip(1) {
                     let status = status_col.and_then(|c| r.get(c)).map(String::as_str);
-                    let bad = status == Some("错误") || r.iter().any(|c| c.starts_with("错误"));
-                    let warn = !bad && status.is_some_and(|s| s != "精确" && !s.is_empty());
+                    let bad = status == Some(STATUS_ERROR);
+                    let warn = !bad && status.is_some_and(|s| !s.is_empty() && !is_ok_status(s));
                     body.row(26.0, |mut row| {
                         for c in 0..ncol {
                             let cell = r.get(c).map(String::as_str).unwrap_or("");
@@ -506,8 +511,8 @@ fn preview_table(ui: &mut Ui, p: &Palette, rows: &[Vec<String>]) {
                                 }
                                 if Some(c) == status_col && !cell.is_empty() {
                                     let (fg, bg) = match cell {
-                                        "精确" => (p.success, p.success_soft),
-                                        "错误" => (p.error, p.surface),
+                                        s if is_ok_status(s) => (p.success, p.success_soft),
+                                        STATUS_ERROR => (p.error, p.surface),
                                         _ => (p.warning, p.surface),
                                     };
                                     badge(ui, cell, fg, bg);
@@ -520,9 +525,7 @@ fn preview_table(ui: &mut Ui, p: &Palette, rows: &[Vec<String>]) {
                                         );
                                     });
                                 } else {
-                                    let color = if cell.starts_with("错误")
-                                        || cell.contains("无法")
-                                        || cell.contains("不可达")
+                                    let color = if cell.contains("无法") || cell.contains("不可达")
                                     {
                                         p.error
                                     } else {

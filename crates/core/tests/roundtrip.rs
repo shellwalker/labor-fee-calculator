@@ -19,33 +19,112 @@ fn configs() -> Vec<(&'static str, Config)> {
     not_equal.vat.levy_at_threshold = false;
     let mut no_threshold = base.clone();
     no_threshold.vat.threshold_enabled = false;
+    // 3% 征收率、三项全开（7% / 3% / 2%）、减征 50%、合计后舍入
     let mut itemized = base.clone();
     itemized.vat.rate = dec!(0.03);
-    itemized.surcharge.halve = true;
+    itemized.surcharge.relief_enabled = true;
+    itemized.surcharge.relief_rate = dec!(0.5);
     itemized.rounding.surcharge = SurchargeRounding::Total;
-    itemized.surcharge.items = vec![
-        SurchargeItem {
-            name: "城市维护建设税".into(),
-            rate: dec!(0.07),
-        },
-        SurchargeItem {
-            name: "教育费附加".into(),
-            rate: dec!(0.03),
-        },
-        SurchargeItem {
-            name: "地方教育附加".into(),
-            rate: dec!(0.02),
-        },
-    ];
+    itemized.surcharge.items = three_items();
     let mut half_even = base.clone();
     half_even.rounding.mode = RoundingMode::HalfEven;
+    // 1% 征收率、三项全开（7% / 3% / 2%）、各项分别按分舍入
+    let mut three = base.clone();
+    three.surcharge.items = three_items();
     vec![
         ("默认", base),
         ("门槛不含本数", not_equal),
         ("无门槛", no_threshold),
-        ("3%分项减半合计舍入", itemized),
+        ("3%三项全开减征合计舍入", itemized),
         ("银行家舍入", half_even),
+        ("1%三项全开逐项舍入", three),
     ]
+}
+
+/// 城市维护建设税 7%、教育费附加 3%、地方教育附加 2%，全部启用。
+fn three_items() -> Vec<SurchargeItem> {
+    vec![
+        SurchargeItem::new("城市维护建设税", dec!(0.07), true),
+        SurchargeItem::new("教育费附加", dec!(0.03), true),
+        SurchargeItem::new("地方教育附加", dec!(0.02), true),
+    ]
+}
+
+/// 非默认口径（多项附加税费）下按企业总支出逐分测算：可达则与正算一致，
+/// 否则不可达原因正确（起征点区间恰为 [起征点, 起征点对应总支出 − 0.01]），两侧均可达。
+fn check_from_cost_sweep(cfg: &Config, upto_cents: i64) {
+    let thr = cfg.vat.threshold;
+    let thr_cost = forward(cfg, thr).unwrap().total_cost;
+    let (mut threshold_gaps, mut rounding_gaps) = (0i64, 0);
+    for c in 0..=upto_cents {
+        let cost = cents(c);
+        match from_total_cost(cfg, cost) {
+            Ok(b) => {
+                assert_eq!(b.total_cost, cost);
+                assert_eq!(forward(cfg, b.net_income).unwrap(), b);
+            }
+            Err(CalcError::CostUnreachable(g)) => {
+                assert!(g.lower.total_cost < cost && cost < g.upper.total_cost);
+                assert_eq!(g.upper.net_income - g.lower.net_income, dec!(0.01));
+                assert_eq!(
+                    forward(cfg, g.lower.net_income).unwrap().total_cost,
+                    g.lower.total_cost
+                );
+                assert_eq!(
+                    forward(cfg, g.upper.net_income).unwrap().total_cost,
+                    g.upper.total_cost
+                );
+                match g.reason {
+                    CostGapReason::Threshold => {
+                        threshold_gaps += 1;
+                        assert!(cost >= thr && cost < thr_cost, "总支出 {cost}");
+                        assert_eq!(g.upper.net_income, thr);
+                    }
+                    CostGapReason::Rounding => {
+                        rounding_gaps += 1;
+                        assert!(cost >= thr_cost, "总支出 {cost}");
+                    }
+                }
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let expect = ((thr_cost - thr) * dec!(100))
+        .trunc()
+        .to_string()
+        .parse::<i64>()
+        .unwrap();
+    assert_eq!(threshold_gaps, expect);
+    assert!(rounding_gaps > 0);
+}
+
+#[test]
+fn from_total_cost_three_items_every_cent() {
+    // 7%/3%/2% 三项全开：1% 征收率逐项舍入、3% 征收率减征合计舍入
+    for (name, cfg) in configs() {
+        if name.contains("三项") {
+            check_from_cost_sweep(&cfg, 3_000_000);
+        }
+    }
+}
+
+#[test]
+fn three_items_threshold_values() {
+    let (_, cfg) = configs().pop().unwrap();
+    // 1000 → 增值税 10.00，附加 0.70 + 0.30 + 0.20 = 1.20，企业总支出 1011.20
+    let b = forward(&cfg, dec!(1000)).unwrap();
+    assert_eq!(b.surcharge_total, dec!(1.20));
+    assert_eq!(b.total_cost, dec!(1011.20));
+    match from_total_cost(&cfg, dec!(1011.19)) {
+        Err(CalcError::CostUnreachable(g)) => {
+            assert_eq!(g.reason, CostGapReason::Threshold);
+            assert_eq!(
+                (g.lower.total_cost, g.upper.total_cost),
+                (dec!(999.99), dec!(1011.20))
+            );
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// 校验反算：精确、正算一致、取最小不含税收入。
@@ -212,7 +291,7 @@ proptest! {
     #![proptest_config(ProptestConfig::with_cases(3000))]
 
     #[test]
-    fn prop_roundtrip_from_net(n in 0i64..1_000_000_000, idx in 0usize..5) {
+    fn prop_roundtrip_from_net(n in 0i64..1_000_000_000, idx in 0usize..6) {
         // 任取不含税收入 → 到手 → 反算：精确，且不大于原收入（取最小）
         let (_, cfg) = configs().swap_remove(idx);
         let rev = Reverser::new(&cfg).unwrap();
@@ -222,14 +301,14 @@ proptest! {
     }
 
     #[test]
-    fn prop_roundtrip_from_target(t in 0i64..500_000_000, idx in 0usize..5) {
+    fn prop_roundtrip_from_target(t in 0i64..500_000_000, idx in 0usize..6) {
         let (_, cfg) = configs().swap_remove(idx);
         let rev = Reverser::new(&cfg).unwrap();
         check_exact_min(&rev, cents(t));
     }
 
     #[test]
-    fn prop_monotonic(a in 0i64..1_000_000_000, gap in 0i64..10_000_000, idx in 0usize..5) {
+    fn prop_monotonic(a in 0i64..1_000_000_000, gap in 0i64..10_000_000, idx in 0usize..6) {
         let (_, cfg) = configs().swap_remove(idx);
         let fa = forward(&cfg, cents(a)).unwrap();
         let fb = forward(&cfg, cents(a + gap)).unwrap();
@@ -242,7 +321,7 @@ proptest! {
     }
 
     #[test]
-    fn prop_from_total_cost(n in 0i64..1_000_000_000, delta in 0i64..3, idx in 0usize..5) {
+    fn prop_from_total_cost(n in 0i64..1_000_000_000, delta in 0i64..3, idx in 0usize..6) {
         // 可达总成本反推回同一收入；不可达总成本报空位且两侧可达
         let (_, cfg) = configs().swap_remove(idx);
         let b = forward(&cfg, cents(n)).unwrap();

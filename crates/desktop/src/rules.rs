@@ -1,10 +1,10 @@
-//! 试算规则说明：根据当前生效的口径动态生成，显示在正算 / 反算 / 按总成本页右侧。
+//! 计算规则说明：根据当前生效的计算参数动态生成，显示在各测算页右侧。
 
 use crate::settings::{prefer_text, rounding_mode_text, surcharge_base_text};
 use labor_fee_core::{forward, Config, Decimal, Prefer};
 
 /// 政策依据。
-pub const POLICY_NAME: &str = "国家税务总局公告 2018 年第 61 号";
+pub const POLICY_NAME: &str = "国家税务总局公告2018年第61号";
 pub const POLICY_DETAIL: &str =
     "《个人所得税扣缴申报管理办法（试行）》第八条及个人所得税预扣率表二";
 pub const POLICY_URL: &str =
@@ -26,7 +26,7 @@ pub struct BracketRow {
     pub quick: String,
 }
 
-/// 真空区间（按总成本无对应收入的一段）。
+/// 不可达区间（企业总支出无对应收入的一段）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VacuumGap {
     pub below_net: Decimal,
@@ -50,7 +50,7 @@ fn yuan(d: Decimal) -> String {
     format!("{} 元", d.normalize())
 }
 
-/// 门槛处的真空区间（未启用门槛或税率为 0 时没有）。
+/// 起征点处的不可达区间（未启用起征点或征收率为 0 时没有）。
 pub fn vacuum_gap(cfg: &Config) -> Option<VacuumGap> {
     if !cfg.vat.threshold_enabled || cfg.vat.rate.is_zero() {
         return None;
@@ -99,82 +99,113 @@ pub fn bracket_rows(cfg: &Config) -> Vec<BracketRow> {
         .collect()
 }
 
-/// 增值税征收条件的描述。
+/// 增值税起征点的描述。
 pub fn vat_condition(cfg: &Config) -> String {
     if !cfg.vat.threshold_enabled {
-        return "不设征收门槛，全部征收".into();
+        return "未启用起征点，全部金额均征收增值税".into();
     }
-    let op = if cfg.vat.levy_at_threshold {
-        "≥"
+    let how = if cfg.vat.levy_at_threshold {
+        "达到"
     } else {
-        ">"
+        "超过"
     };
     format!(
-        "不含税收入 {op} {} 才征收，低于门槛增值税、附加税均为 0",
+        "起征点：不含增值税收入{how} {} 的征收；未达到的，增值税及附加税费均为 0",
         yuan(cfg.vat.threshold)
     )
 }
 
-/// 附加税公式。
-pub fn surcharge_formula(cfg: &Config) -> String {
+/// 增值税附加税费的计算说明（每个已启用项目一行，另附合计与减征说明）。
+pub fn surcharge_lines(cfg: &Config) -> Vec<String> {
     let base = surcharge_base_text(cfg.surcharge.base);
-    let items: Vec<String> = cfg
+    let relief = cfg.surcharge.relief_enabled;
+    let mut v: Vec<String> = cfg
         .surcharge
-        .items
-        .iter()
-        .zip(cfg.effective_surcharge_rates())
-        .map(|(it, r)| {
-            if cfg.surcharge.items.len() == 1 {
-                pct(r)
+        .enabled_items()
+        .map(|it| {
+            if relief {
+                format!(
+                    "{} = {base} × {} × (1 − {})",
+                    it.name,
+                    pct(it.rate),
+                    pct(cfg.surcharge.relief_rate)
+                )
             } else {
-                format!("{} {}", it.name, pct(r))
+                format!("{} = {base} × {}", it.name, pct(it.rate))
             }
         })
         .collect();
-    let mut s = if items.is_empty() {
-        "不征附加税".to_string()
+    if v.is_empty() {
+        v.push("未启用任何附加税费项目".into());
     } else {
-        format!("附加税 = {base} × {}", items.join(" + "))
-    };
-    if cfg.surcharge.halve {
-        s += "（已减半）";
+        let names: Vec<&str> = cfg
+            .surcharge
+            .enabled_items()
+            .map(|i| i.name.as_str())
+            .collect();
+        v.push(format!(
+            "增值税附加税费 = {}（{}）",
+            names.join(" + "),
+            match cfg.rounding.surcharge {
+                labor_fee_core::SurchargeRounding::PerItem => "各项分别按分舍入",
+                labor_fee_core::SurchargeRounding::Total => "合计后一次舍入",
+            }
+        ));
     }
-    s
+    if relief {
+        v.push(format!(
+            "已启用减征，减征比例 {}（可配置假设，是否适用请自行判断）",
+            pct(cfg.surcharge.relief_rate)
+        ));
+    }
+    let off: Vec<&str> = cfg
+        .surcharge
+        .items
+        .iter()
+        .filter(|i| !i.enabled)
+        .map(|i| i.name.as_str())
+        .collect();
+    if !off.is_empty() {
+        v.push(format!("未启用：{}", off.join("、")));
+    }
+    v
 }
 
-/// 全部规则（`page_note` 为本页特有说明，显示在最前）。
+/// 全部规则。
 pub fn rule_groups(cfg: &Config) -> Vec<RuleGroup> {
     let iit = &cfg.iit;
+    let mut vat_lines = vec![
+        format!("增值税税额 = 不含增值税收入 × 征收率 {}", pct(cfg.vat.rate)),
+        vat_condition(cfg),
+    ];
+    vat_lines.extend(surcharge_lines(cfg));
+    vat_lines.push("企业总支出 = 不含增值税收入 + 增值税税额 + 增值税附加税费".into());
     let mut groups = vec![
         RuleGroup {
-            title: "增值税与附加税（企业承担）",
-            lines: vec![
-                format!("增值税 = 不含税收入 × {}", pct(cfg.vat.rate)),
-                vat_condition(cfg),
-                surcharge_formula(cfg),
-                "企业总成本 = 不含税收入 + 增值税 + 附加税".into(),
-            ],
+            title: "增值税及附加税费（企业承担）",
+            lines: vat_lines,
         },
         RuleGroup {
-            title: "个税（居民个人劳务报酬预扣预缴）",
+            title: "个人所得税（居民个人劳务报酬所得预扣预缴）",
             lines: vec![
                 format!(
-                    "每次收入 ≤ {} 减除费用 {}；> {} 减除 {}",
+                    "每次收入不超过 {} 的，减除费用 {}；{} 以上的，减除费用按 {} 计算",
                     yuan(iit.fixed_deduction_limit),
                     yuan(iit.fixed_deduction),
                     yuan(iit.fixed_deduction_limit),
                     pct(iit.percent_deduction_rate)
                 ),
-                "应纳税所得额 = 不含税收入 − 减除费用".into(),
-                "个税 = 应纳税所得额 × 预扣率 − 速算扣除数（见下表）".into(),
-                "实际到手 = 不含税收入 − 个税（附加税不从到手扣）".into(),
+                "预扣预缴应纳税所得额 = 每次收入 − 减除费用（每次收入即不含增值税收入）".into(),
+                "应预扣预缴税额 = 预扣预缴应纳税所得额 × 预扣率 − 速算扣除数（见下表）".into(),
+                "税后实发金额 = 不含增值税收入 − 应预扣预缴税额（附加税费由企业承担，不从中扣除）"
+                    .into(),
             ],
         },
         RuleGroup {
-            title: "舍入与反算",
+            title: "舍入与测算",
             lines: vec![
                 format!(
-                    "每一步金额按“{}”保留 {} 位小数{}",
+                    "各项金额按“{}”保留 {} 位小数{}",
                     rounding_mode_text(cfg.rounding.mode),
                     cfg.rounding.scale,
                     if cfg.rounding.scale == 2 {
@@ -184,10 +215,11 @@ pub fn rule_groups(cfg: &Config) -> Vec<RuleGroup> {
                     }
                 ),
                 format!(
-                    "反算：多个不含税收入得到同一到手时，{}",
+                    "按税后实发金额测算时，多个不含增值税收入对应同一金额的，{}",
                     prefer_text(cfg.reverse.prefer)
                 ),
-                "每笔单独计算，不做按月合并".into(),
+                "每笔收入单独计算；同一项目连续性收入以一个月内取得的收入为一次，请合并后录入"
+                    .into(),
             ],
         },
     ];
@@ -197,15 +229,23 @@ pub fn rule_groups(cfg: &Config) -> Vec<RuleGroup> {
     if let Some(g) = vacuum_gap(cfg) {
         let (lo, hi) = g.range(cfg.unit());
         groups.push(RuleGroup {
-            title: "真空区间（按总成本）",
+            title: "不可达区间（按企业总支出测算）",
             lines: vec![
                 format!(
-                    "不含税收入 {} → 总成本 {}；{} → {}",
+                    "不含增值税收入 {} → 企业总支出 {}；{} → {}",
                     g.below_net, g.below_cost, g.at_net, g.at_cost
                 ),
-                format!("总成本 {lo}～{hi} 没有对应的收入，正常业务不会出现，输入时会提示原因"),
+                format!("企业总支出 {lo}～{hi} 无对应的不含增值税收入，输入时将提示原因及两侧最近的有效金额"),
             ],
         });
     }
     groups
 }
+
+/// 增值税起征点与 1% 优惠征收率依据。
+pub const POLICY_VAT_NAME: &str = "财政部 税务总局公告2026年第10号";
+pub const POLICY_VAT_URL: &str = "https://www.mof.gov.cn/jrttts/202602/t20260203_3983175.htm";
+/// “六税两费”减征依据。
+pub const POLICY_RELIEF_NAME: &str = "财政部 税务总局公告2023年第12号";
+pub const POLICY_RELIEF_URL: &str =
+    "https://www.gov.cn/zhengce/zhengceku/202308/content_6896379.htm";

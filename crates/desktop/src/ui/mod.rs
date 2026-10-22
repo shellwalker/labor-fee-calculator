@@ -102,7 +102,7 @@ pub fn draw(ui: &mut Ui, st: &mut AppState) {
                 });
                 ui.add_space(theme::SP2);
             }
-            widgets::page_header(ui, st.tab.icon(), st.tab.title(), st.tab.description());
+            widgets::page_header(ui, st.tab.icon(), st.tab.full_title(), st.tab.description());
             match st.tab {
                 Tab::Batch => batch::page(ui, st),
                 t => calc::page(ui, st, t),
@@ -254,7 +254,7 @@ fn brand_bar(ui: &mut Ui, st: &mut AppState) {
                             .color(p.text),
                     );
                     ui.label(
-                        RichText::new("增值税 · 附加税 · 劳务报酬个税预扣")
+                        RichText::new("增值税及附加税费 · 个人所得税预扣预缴")
                             .size(theme::FS_SMALL)
                             .color(p.text_weak),
                     );
@@ -265,6 +265,8 @@ fn brand_bar(ui: &mut Ui, st: &mut AppState) {
                         st.tab = tab;
                     }
                 }
+                // 右侧剩余宽度不足时不显示参数徽章（状态栏仍有说明），避免遮挡导航
+                let room = ui.available_width();
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if widgets::secondary_button(ui, &format!("{} 设置", icons::SETTINGS))
                         .on_hover_text(format!(
@@ -287,6 +289,10 @@ fn brand_bar(ui: &mut Ui, st: &mut AppState) {
                         st.set_theme(t.next());
                     }
                     let n = modified_items(st.config());
+                    let need = if n == 0 { 290.0 } else { 380.0 };
+                    if room < need {
+                        return;
+                    }
                     if n == 0 {
                         badge(
                             ui,
@@ -301,7 +307,7 @@ fn brand_bar(ui: &mut Ui, st: &mut AppState) {
                             p.warning,
                             p.warning_soft,
                         )
-                        .on_hover_text("口径与内置默认不同，可在设置中查看或恢复默认");
+                        .on_hover_text("计算参数与内置默认不同，可在设置中查看或恢复默认");
                     }
                 });
             });
@@ -328,11 +334,14 @@ fn status_bar(ui: &mut Ui, st: &AppState) {
             ui.horizontal(|ui| {
                 let n = modified_items(st.config());
                 let (c, text) = if n == 0 {
-                    (p.success, format!("口径：{}（与内置默认一致）", st.source))
+                    (
+                        p.success,
+                        format!("计算参数：{}（与内置默认一致）", st.source),
+                    )
                 } else {
                     (
                         p.warning,
-                        format!("口径：{}（与内置默认不同 {n} 项）", st.source),
+                        format!("计算参数：{}（与内置默认不同 {n} 项）", st.source),
                     )
                 };
                 let (r, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
@@ -352,7 +361,7 @@ fn status_bar(ui: &mut Ui, st: &AppState) {
                     if st.batch_running() {
                         ui.spinner();
                         ui.label(
-                            RichText::new("批量计算中…")
+                            RichText::new("批量测算中…")
                                 .size(theme::FS_SMALL)
                                 .color(p.text_weak),
                         );

@@ -25,12 +25,23 @@ pub enum Tab {
 impl Tab {
     pub const ALL: [Tab; 4] = [Tab::Forward, Tab::Reverse, Tab::FromCost, Tab::Batch];
 
+    /// 导航中的短标题。
     pub fn title(self) -> &'static str {
         match self {
-            Tab::Forward => "正算",
-            Tab::Reverse => "反算",
-            Tab::FromCost => "按总成本",
-            Tab::Batch => "批量",
+            Tab::Forward => "收入计算",
+            Tab::Reverse => "实发测算",
+            Tab::FromCost => "支出测算",
+            Tab::Batch => "批量测算",
+        }
+    }
+
+    /// 页面标题（全称）。
+    pub fn full_title(self) -> &'static str {
+        match self {
+            Tab::Forward => "按不含增值税收入计算",
+            Tab::Reverse => "按税后实发金额测算",
+            Tab::FromCost => "按企业总支出测算",
+            Tab::Batch => "批量测算",
         }
     }
 
@@ -46,10 +57,12 @@ impl Tab {
     /// 页面标题下的一句话说明。
     pub fn description(self) -> &'static str {
         match self {
-            Tab::Forward => "输入不含税收入，计算增值税、附加税、企业总成本、个税和实际到手",
-            Tab::Reverse => "输入实际到手金额，反算不含税收入及全部金额，多解时取最小不含税收入",
-            Tab::FromCost => "输入企业总成本，求对应的不含税收入；落在真空区间或舍入空位时说明原因",
-            Tab::Batch => "读取表格中的一列金额，逐行计算并在右侧追加结果列，导出为新文件",
+            Tab::Forward => {
+                "以不含增值税收入为准，计算增值税及附加税费、企业总支出、个人所得税与税后实发金额"
+            }
+            Tab::Reverse => "根据税后实发金额，测算对应的不含增值税收入及各项金额",
+            Tab::FromCost => "根据企业总支出，测算对应的不含增值税收入；金额不可达时说明原因",
+            Tab::Batch => "读取表格中的金额列，逐行测算并追加结果列，导出为新文件",
         }
     }
 }
@@ -199,12 +212,12 @@ impl BatchResult {
         let s = &self.output.summary;
         let mut t = format!("共 {} 行：成功 {}", s.rows, s.exact);
         if self.kind == InputKind::TakeHome {
-            t += &format!("，不可精确达到 {}", s.inexact);
+            t += &format!("，无法精确匹配 {}", s.inexact);
         }
         if self.kind == InputKind::TotalCost {
-            t += &format!("，总成本不可达 {}", s.unreachable_cost);
+            t += &format!("，总支出不可达 {}", s.unreachable_cost);
         }
-        t += &format!("，错误 {}，空白 {}", s.errors, s.empty);
+        t += &format!("，数据错误 {}，空白 {}", s.errors, s.empty);
         t
     }
 
@@ -222,7 +235,7 @@ impl BatchResult {
 }
 
 /// 口径来源说明：内置默认。
-pub const SOURCE_DEFAULT: &str = "内置默认口径";
+pub const SOURCE_DEFAULT: &str = "内置默认参数";
 /// 口径来源说明：设置窗口保存的口径。
 pub const SOURCE_SAVED: &str = "已保存的设置";
 
@@ -277,28 +290,24 @@ pub fn fields(b: &Breakdown) -> Vec<Field> {
         value,
     };
     let mut v = vec![
-        f("不含税收入", b.net_income.to_string()),
-        f("增值税", b.vat.to_string()),
+        f("不含增值税收入", b.net_income.to_string()),
+        f("增值税税额", b.vat.to_string()),
     ];
-    if b.surcharges.len() > 1 {
-        for l in &b.surcharges {
-            v.push(f(
-                &format!("  {}（{}）", l.name, pct(l.rate)),
-                l.amount.to_string(),
-            ));
-        }
-        v.push(f("附加税合计", b.surcharge_total.to_string()));
-    } else {
-        v.push(f("附加税", b.surcharge_total.to_string()));
+    for l in &b.surcharges {
+        v.push(f(
+            &format!("  {}（{}）", l.name, pct(l.rate)),
+            l.amount.to_string(),
+        ));
     }
+    v.push(f("增值税附加税费合计", b.surcharge_total.to_string()));
     v.extend([
-        f("企业总成本", b.total_cost.to_string()),
+        f("企业总支出", b.total_cost.to_string()),
         f("减除费用", b.iit.deduction.to_string()),
-        f("应纳税所得额", b.iit.taxable_income.to_string()),
+        f("预扣预缴应纳税所得额", b.iit.taxable_income.to_string()),
         f("预扣率", pct(b.iit.rate)),
         f("速算扣除数", b.iit.quick_deduction.to_string()),
-        f("个税", b.iit.tax.to_string()),
-        f("实际到手", b.take_home.to_string()),
+        f("应预扣预缴税额", b.iit.tax.to_string()),
+        f("税后实发金额", b.take_home.to_string()),
     ]);
     v
 }
@@ -311,7 +320,7 @@ fn identity_ok(b: &Breakdown) -> bool {
 
 fn exempt_note(b: &Breakdown) -> &'static str {
     if b.vat_exempt {
-        "；未达征收门槛，不征增值税及附加税"
+        "；未达到增值税起征点，不征收增值税及附加税费"
     } else {
         ""
     }
@@ -321,12 +330,12 @@ fn exempt_note(b: &Breakdown) -> &'static str {
 pub fn gap_reason_text(g: &CostGap) -> String {
     match g.reason {
         CostGapReason::Threshold => format!(
-            "原因：{} 元增值税征收门槛形成的空白区间",
+            "原因：增值税起征点（{} 元）形成的不可达区间",
             g.threshold
                 .map(|t| t.normalize().to_string())
                 .unwrap_or_default()
         ),
-        CostGapReason::Rounding => "原因：增值税、附加税逐分舍入".to_string(),
+        CostGapReason::Rounding => "原因：增值税税额及附加税费按分舍入".to_string(),
     }
 }
 
@@ -369,7 +378,7 @@ impl AppState {
             Ok(Some(cfg)) => {
                 if let Err(e) = st.set_config(cfg, SOURCE_SAVED) {
                     st.notice = Some(Status::error(format!(
-                        "已保存的设置无法使用，已改用内置默认口径：{e}"
+                        "已保存的设置无法使用，已改用内置默认参数：{e}"
                     )));
                 }
             }
@@ -475,11 +484,11 @@ impl AppState {
             Ok(b) => {
                 let status = if identity_ok(&b) {
                     Status::ok(format!(
-                        "校验通过：总成本 = 不含税收入 + 增值税 + 附加税，到手 = 不含税收入 − 个税{}",
+                        "校验通过：企业总支出 = 不含增值税收入 + 增值税税额 + 附加税费，税后实发金额 = 不含增值税收入 − 应预扣预缴税额{}",
                         exempt_note(&b)
                     ))
                 } else {
-                    Status::error("校验失败：恒等式不成立")
+                    Status::error("校验未通过：金额勾稽关系不成立")
                 };
                 Outcome::Done {
                     fields: fields(&b),
@@ -515,12 +524,12 @@ impl AppState {
                 Ok(b) => Outcome::Done {
                     status: if identity_ok(&b) && b.total_cost == a {
                         Status::ok(format!(
-                            "可达：不含税收入 {} 正算的企业总成本正好等于输入{}",
+                            "校验通过：不含增值税收入 {} 对应的企业总支出与输入一致{}",
                             b.net_income,
                             exempt_note(&b)
                         ))
                     } else {
-                        Status::error("校验失败")
+                        Status::error("校验未通过")
                     },
                     fields: fields(&b),
                     breakdown: Box::new(b),
@@ -571,10 +580,10 @@ impl AppState {
             .and_then(|t| self.load_config_str(&t, format!("文件 {}", path.display())));
         self.notice = Some(match r {
             Ok(()) => Status::ok(format!(
-                "本次运行使用口径文件：{}（不会写入设置）",
+                "本次运行使用参数文件：{}（不写入设置）",
                 path.display()
             )),
-            Err(e) => Status::error(format!("口径文件加载失败（仍使用原口径）：{e}")),
+            Err(e) => Status::error(format!("参数文件加载失败（仍使用原参数）：{e}")),
         });
     }
 
@@ -582,7 +591,7 @@ impl AppState {
     pub fn reset_config(&mut self) {
         self.set_config(Config::default(), SOURCE_DEFAULT)
             .expect("默认配置有效");
-        self.notice = Some(Status::ok("已恢复内置默认口径"));
+        self.notice = Some(Status::ok("已恢复内置默认参数"));
     }
 
     fn batch_job(
@@ -671,7 +680,7 @@ impl AppState {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 self.batch.running = None;
-                self.finish_batch(Err("批量计算意外中止".into()));
+                self.finish_batch(Err("批量测算意外中止".into()));
             }
         }
     }
@@ -692,27 +701,27 @@ impl AppState {
 fn reverse_status(cfg: &Config, r: &ReverseOutcome) -> Status {
     if !r.exact {
         return Status::warn(format!(
-            "不可精确达到：已取最接近的不含税收入，正算到手 {}，差额 {}（正算到手 − 目标）",
+            "无法精确匹配：已取最接近的不含增值税收入，对应税后实发金额 {}，差额 {}（计算结果 − 目标）",
             r.breakdown.take_home, r.diff
         ));
     }
     // 自检：选中的不含税收入再正算一遍，到手与目标一致
     let again = forward(cfg, r.breakdown.net_income).ok();
     if again.as_ref() != Some(&r.breakdown) || r.breakdown.take_home != r.target {
-        return Status::error("校验失败：反算结果正算不一致");
+        return Status::error("校验未通过：测算结果复核不一致");
     }
     let mut t = format!(
-        "精确：不含税收入 {} 正算回去到手 {}，与输入一致",
+        "精确匹配：不含增值税收入 {} 对应税后实发金额 {}，与输入一致",
         r.breakdown.net_income, r.breakdown.take_home
     );
     if let Some((lo, hi)) = r.exact_net_income_range {
         if lo != hi {
-            t += &format!("（不含税收入 {lo}～{hi} 都得到同一到手，已取最小）");
+            t += &format!("（不含增值税收入 {lo}～{hi} 对应同一税后实发金额，已取最小值）");
         }
     }
     if !r.other_solutions.is_empty() {
         let s: Vec<String> = r.other_solutions.iter().map(|d| d.to_string()).collect();
-        t += &format!("；另有不含税收入 {} 也可精确达到", s.join("、"));
+        t += &format!("；另有不含增值税收入 {} 亦可精确匹配", s.join("、"));
     }
     t += exempt_note(&r.breakdown);
     Status::ok(t)

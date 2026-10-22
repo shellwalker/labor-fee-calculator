@@ -1,9 +1,9 @@
-//! 劳务报酬计算简易 Web 服务：正算/反算查询 + 批量上传下载。
+//! 劳务报酬计算简易 Web 服务：单笔计算/测算查询 + 批量上传下载。
 //!
 //! API（金额均为字符串，单位元，最多两位小数）：
-//! - `GET /api/forward?net_income=`：正算（主入口），不含税收入 → 全部金额；
-//! - `GET /api/from-cost?total_cost=`：辅助，按企业总成本正算；落在空位返回 422 及原因、两侧最近有效总成本；
-//! - `GET /api/reverse?take_home=`：反算；
+//! - `GET /api/forward?net_income=`：按不含增值税收入计算全部金额；
+//! - `GET /api/from-cost?total_cost=`：按企业总支出测算；不可达时返回 422 及原因、两侧最近的有效总支出；
+//! - `GET /api/reverse?take_home=`：按税后实发金额测算；
 //! - `POST /api/batch`：multipart，字段 file、input_kind（take-home/net-income/total-cost）、column。
 
 use anyhow::Context;
@@ -25,7 +25,7 @@ struct Args {
     /// 监听地址
     #[arg(long, default_value = "127.0.0.1:8080")]
     listen: SocketAddr,
-    /// 税务口径配置文件（TOML），缺省使用内置默认配置
+    /// 计算参数配置文件（TOML），缺省使用内置默认参数
     #[arg(short, long)]
     config: Option<PathBuf>,
     /// 上传文件大小上限（MB）
@@ -98,7 +98,7 @@ async fn api_forward(State(st): State<Shared>, Query(q): Query<ForwardQuery>) ->
     }
 }
 
-/// 辅助：按企业总成本正算。空位返回 422：`{ error, reason, gap: { total_cost, reason, lower, upper, threshold } }`。
+/// 按企业总支出测算。空位返回 422：`{ error, reason, gap: { total_cost, reason, lower, upper, threshold } }`。
 async fn api_from_cost(State(st): State<Shared>, Query(q): Query<CostQuery>) -> Response {
     let amount = match parse_amount(&q.total_cost) {
         Ok(a) => a,
@@ -131,7 +131,7 @@ async fn api_reverse(State(st): State<Shared>, Query(q): Query<ReverseQuery>) ->
 }
 
 /// 上传字段：file（必填）；input_kind（可选，take-home 默认 / net-income / total-cost）；
-/// column（可选，缺省按 input_kind 取“到手金额”/“不含税收入”/“企业总成本”）。
+/// column（可选，缺省按 input_kind 识别“税后实发金额”/“不含增值税收入”/“企业总支出”，兼容旧列名）。
 async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
     let mut file: Option<(String, Vec<u8>)> = None;
     let mut column: Option<String> = None;
@@ -339,9 +339,12 @@ mod tests {
         assert_eq!(v["gap"]["upper"]["total_cost"], "1010.30");
         assert_eq!(v["gap"]["upper"]["net_income"], "1000.00");
         let msg = v["error"].as_str().unwrap();
-        assert!(msg.contains("1000 元增值税征收门槛形成的空白区间"), "{msg}");
         assert!(
-            msg.contains("不含税收入 999.99 对应总成本 999.99，1000.00 对应 1010.30"),
+            msg.contains("增值税起征点（1000 元）形成的不可达区间"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.30"),
             "{msg}"
         );
     }
@@ -367,8 +370,8 @@ mod tests {
         );
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         let s = String::from_utf8(b.to_vec()).unwrap();
-        assert!(s.contains("总成本不可达"));
-        assert!(s.contains("1000 元增值税征收门槛形成的空白区间"));
+        assert!(s.contains("总支出不可达"));
+        assert!(s.contains("增值税起征点（1000 元）形成的不可达区间"));
     }
 
     #[tokio::test]

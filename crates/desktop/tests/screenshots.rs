@@ -127,5 +127,43 @@ fn screenshots() {
         shoot("9-menu", st, theme, size, |h| {
             h.get_by_label("文件").click();
         });
+
+        // 非默认参数：城市维护建设税 7%、教育费附加 3%、地方教育附加 2% 全部启用
+        let mut cfg = labor_fee_core::Config::default();
+        cfg.surcharge.items[0].rate = rust_decimal_macros::dec!(0.07);
+        cfg.surcharge.items[0].enabled = true;
+        cfg.surcharge.items[2].rate = rust_decimal_macros::dec!(0.02);
+        cfg.surcharge.items[2].enabled = true;
+        st = AppState::new(cfg, "已保存的设置").unwrap();
+        st.forward.input = "10000".into();
+        st.calc_forward();
+        shoot("10-forward-three-items", st, theme, size, |_| {});
+
+        st = AppState::with_default_config();
+        st.tab = Tab::FromCost;
+        st.from_cost.input = "1005".into();
+        st.calc_from_cost();
+        shoot("11-from-cost-min-size", st, theme, (960.0, 640.0), |_| {});
+
+        st = AppState::with_default_config();
+        st.open_settings();
+        shoot("12-settings-min-size", st, theme, (960.0, 640.0), |_| {});
+
+        st = AppState::with_default_config();
+        st.open_settings();
+        if let Some(d) = &mut st.settings {
+            d.section = Section::Surcharge;
+            d.items[0].enabled = true;
+            d.items[0].rate = "7".into();
+            d.items[2].enabled = true;
+            d.items[2].rate = "2".into();
+        }
+        shoot("5b-settings-surcharge", st, theme, size, |_| {});
+
+        st = AppState::with_default_config();
+        st.tab = Tab::Batch;
+        st.batch.path = sample_xlsx();
+        st.run_batch_blocking();
+        shoot("13-batch-min-size", st, theme, (960.0, 640.0), |_| {});
     }
 }

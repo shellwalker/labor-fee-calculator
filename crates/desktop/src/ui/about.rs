@@ -1,7 +1,10 @@
 //! “关于”与“使用说明”窗口。
 
 use super::widgets::{card, small};
-use crate::rules::{POLICY_DETAIL, POLICY_NAME, POLICY_URL, POLICY_URL_GOV};
+use crate::rules::{
+    POLICY_DETAIL, POLICY_NAME, POLICY_RELIEF_NAME, POLICY_RELIEF_URL, POLICY_URL, POLICY_URL_GOV,
+    POLICY_VAT_NAME, POLICY_VAT_URL,
+};
 use crate::state::AppState;
 use crate::theme::{self, palette};
 use crate::{icons, APP_NAME, BUILD_DATE, GIT_HASH, VERSION};
@@ -45,7 +48,7 @@ pub fn about_window(ctx: &egui::Context, st: &mut AppState) {
             ui.vertical(|ui| {
                 ui.label(RichText::new(APP_NAME).size(22.0).strong().color(p.text));
                 ui.label(RichText::new(format!("版本 {VERSION}")).color(p.primary));
-                small(ui, "劳务报酬增值税、附加税、个税预扣计算（正算 / 反算 / 按总成本 / 批量）");
+                small(ui, "劳务报酬所得增值税及附加税费、个人所得税预扣预缴的计算与测算");
             });
         });
         ui.add_space(theme::SP3);
@@ -54,7 +57,7 @@ pub fn about_window(ctx: &egui::Context, st: &mut AppState) {
             kv(ui, "构建", &format!("{GIT_HASH}（{BUILD_DATE}）"));
             kv(ui, "平台", &format!("{} / {}", std::env::consts::OS, std::env::consts::ARCH));
             kv(ui, "许可", "内部使用（UNLICENSED），版权归仓库所有者");
-            kv(ui, "当前口径", &st.source);
+            kv(ui, "计算参数", &st.source);
         });
         ui.add_space(theme::SP2);
         ui.label(RichText::new("政策依据").strong().color(p.text));
@@ -62,7 +65,15 @@ pub fn about_window(ctx: &egui::Context, st: &mut AppState) {
             ui.hyperlink_to(POLICY_NAME, POLICY_URL);
             ui.label(RichText::new(POLICY_DETAIL).color(p.text_weak));
         });
-        ui.hyperlink_to("中国政府网《国务院公报》2019 年第 12 号（含预扣率表）", POLICY_URL_GOV);
+        ui.hyperlink_to("中国政府网《国务院公报》2019年第12号（含预扣率表）", POLICY_URL_GOV);
+        ui.horizontal_wrapped(|ui| {
+            ui.hyperlink_to(POLICY_VAT_NAME, POLICY_VAT_URL);
+            ui.label(RichText::new("增值税起征点、1% 优惠征收率").color(p.text_weak));
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.hyperlink_to(POLICY_RELIEF_NAME, POLICY_RELIEF_URL);
+            ui.label(RichText::new("“六税两费”减半征收（默认不启用）").color(p.text_weak));
+        });
         ui.add_space(theme::SP2);
         ui.label(RichText::new("字体").strong().color(p.text));
         small(
@@ -73,7 +84,7 @@ pub fn about_window(ctx: &egui::Context, st: &mut AppState) {
         ui.label(RichText::new("免责声明").strong().color(p.text));
         small(
             ui,
-            "本工具按配置的口径进行试算，结果仅供参考，不构成税务意见。1000 元增值税征收门槛为业务口径，不是法定起征点。正式结算、申报前请以主管税务机关要求和财务确认为准。",
+            "本工具按所设参数进行测算，结果仅供参考，不构成税务意见。增值税起征点、征收率、附加税费项目及减征等参数请结合自身情况确认；正式结算、申报以主管税务机关的规定和核定为准。",
         );
         ui.add_space(theme::SP3);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -106,11 +117,11 @@ pub fn help_window(
         });
         ui.add_space(theme::SP2);
         let items = [
-            (icons::FORWARD, "正算", "输入不含税收入（核心变量），得到增值税、附加税、企业总成本、个税和实际到手。"),
-            (icons::REVERSE, "反算", "输入希望的实际到手，反算不含税收入；多解时取最小不含税收入，正算回去与输入到分一致。"),
-            (icons::COST, "按总成本", "输入企业总成本，求对应的不含税收入；1000.00～1010.29 等真空区间没有对应收入，会说明原因并给出两侧最近的有效值。"),
-            (icons::BATCH, "批量", "拖放或选择 xlsx / xls / ods / csv 文件，按首行标题选择输入列，执行后导出带结果列的新文件。"),
-            (icons::SETTINGS, "设置", "逐项修改口径（税率、门槛、减除费用、预扣率表、舍入等）和主题；保存后自动记住。"),
+            (icons::FORWARD, "收入计算", "按不含增值税收入计算：得出增值税税额、增值税附加税费、企业总支出、应预扣预缴税额和税后实发金额。"),
+            (icons::REVERSE, "实发测算", "按税后实发金额测算不含增值税收入；多解时取最小值，复核结果与输入一致到分。"),
+            (icons::COST, "支出测算", "按企业总支出测算不含增值税收入；起征点附近（默认 1000.00～1010.29）等不可达金额无对应收入，将说明原因并给出两侧最近的有效金额。"),
+            (icons::BATCH, "批量测算", "拖放或选择 xlsx / xls / ods / csv 文件，按首行标题识别输入列（兼容旧列名“到手金额”等），执行后导出带结果列的新文件。"),
+            (icons::SETTINGS, "设置", "逐项修改计算参数（征收率、起征点、附加税费项目、减除费用、预扣率表、舍入等）和主题；保存后自动生效。"),
         ];
         card(ui, |ui| {
             egui::Grid::new("help_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
@@ -123,7 +134,7 @@ pub fn help_window(
         });
         ui.add_space(theme::SP2);
         ui.label(RichText::new("快捷键").strong().color(p.text));
-        small(ui, format!("设置 {settings_shortcut}　·　打开批量文件 {open_shortcut}　·　计算：在输入框中按回车"));
+        small(ui, format!("设置 {settings_shortcut}　·　打开批量文件 {open_shortcut}　·　计算：在输入框中按回车键"));
         ui.add_space(theme::SP3);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if super::widgets::primary_button(ui, "  知道了  ", true).clicked() {

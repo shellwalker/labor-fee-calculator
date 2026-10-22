@@ -17,8 +17,10 @@ fn initial_state() -> AppState {
         match a.as_str() {
             "-c" | "--config" => config_path = args.next(),
             "-h" | "--help" => {
-                println!("用法：labor-fee-desktop [-c|--config 口径.toml]");
-                println!("主题与口径请在程序“设置”中修改（自动保存）；--config 只对本次运行生效。");
+                println!("用法：labor-fee-desktop [-c|--config 参数.toml]");
+                println!(
+                    "主题与计算参数请在程序“设置”中修改（自动保存）；--config 仅对本次运行生效。"
+                );
                 std::process::exit(0);
             }
             "-V" | "--version" => {

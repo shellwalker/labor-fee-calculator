@@ -31,17 +31,18 @@ fn status(o: &Outcome) -> (Level, String) {
     }
 }
 
-const ALL_FIELDS: [&str; 10] = [
-    "不含税收入",
-    "增值税",
-    "附加税",
-    "企业总成本",
+const ALL_FIELDS: [&str; 11] = [
+    "不含增值税收入",
+    "增值税税额",
+    "  教育费附加（3%）",
+    "增值税附加税费合计",
+    "企业总支出",
     "减除费用",
-    "应纳税所得额",
+    "预扣预缴应纳税所得额",
     "预扣率",
     "速算扣除数",
-    "个税",
-    "实际到手",
+    "应预扣预缴税额",
+    "税后实发金额",
 ];
 
 // ---------- 状态逻辑 ----------
@@ -55,23 +56,25 @@ fn forward_fields() {
     for f in ALL_FIELDS {
         value(o, f);
     }
-    assert_eq!(value(o, "不含税收入"), "10000.00");
-    assert_eq!(value(o, "增值税"), "100.00");
-    assert_eq!(value(o, "附加税"), "3.00");
-    assert_eq!(value(o, "企业总成本"), "10103.00");
+    assert_eq!(value(o, "不含增值税收入"), "10000.00");
+    assert_eq!(value(o, "增值税税额"), "100.00");
+    assert_eq!(value(o, "增值税附加税费合计"), "3.00");
+    assert_eq!(value(o, "企业总支出"), "10103.00");
     assert_eq!(value(o, "减除费用"), "2000.00");
-    assert_eq!(value(o, "应纳税所得额"), "8000.00");
+    assert_eq!(value(o, "预扣预缴应纳税所得额"), "8000.00");
     assert_eq!(value(o, "预扣率"), "20%");
-    assert_eq!(value(o, "个税"), "1600.00");
-    assert_eq!(value(o, "实际到手"), "8400.00");
+    assert_eq!(value(o, "应预扣预缴税额"), "1600.00");
+    assert_eq!(value(o, "税后实发金额"), "8400.00");
     let (lv, text) = status(o);
     assert_eq!(lv, Level::Ok);
     assert!(text.starts_with("校验通过"));
 
     st.forward.input = "999.99".into();
     st.calc_forward();
-    assert_eq!(value(&st.forward.outcome, "增值税"), "0.00");
-    assert!(status(&st.forward.outcome).1.contains("不征增值税及附加税"));
+    assert_eq!(value(&st.forward.outcome, "增值税税额"), "0.00");
+    assert!(status(&st.forward.outcome)
+        .1
+        .contains("不征收增值税及附加税费"));
 }
 
 #[test]
@@ -105,11 +108,11 @@ fn reverse_examples() {
         st.reverse.input = th.into();
         st.calc_reverse();
         let o = &st.reverse.outcome;
-        assert_eq!(value(o, "不含税收入"), net, "到手 {th}");
-        assert_eq!(value(o, "企业总成本"), cost, "到手 {th}");
+        assert_eq!(value(o, "不含增值税收入"), net, "到手 {th}");
+        assert_eq!(value(o, "企业总支出"), cost, "到手 {th}");
         let (lv, text) = status(o);
         assert_eq!(lv, Level::Ok);
-        assert!(text.starts_with("精确"), "{text}");
+        assert!(text.starts_with("精确匹配"), "{text}");
     }
     // 50000 有两个不含税收入，状态里说明已取最小
     assert!(status(&st.reverse.outcome).1.contains("63235.29～63235.30"));
@@ -129,19 +132,19 @@ fn from_cost_gap_and_click() {
         (g.lower.total_cost, g.upper.total_cost),
         (dec!(999.99), dec!(1010.30))
     );
-    assert!(labor_fee_desktop::state::gap_reason_text(&g).contains("1000 元增值税征收门槛"));
+    assert!(labor_fee_desktop::state::gap_reason_text(&g).contains("增值税起征点（1000 元）"));
     // 点击上侧有效值：填入并重算
     st.use_cost(g.upper.total_cost);
     assert_eq!(st.from_cost.input, "1010.30");
-    assert_eq!(value(&st.from_cost.outcome, "不含税收入"), "1000.00");
-    assert!(status(&st.from_cost.outcome).1.starts_with("可达"));
+    assert_eq!(value(&st.from_cost.outcome, "不含增值税收入"), "1000.00");
+    assert!(status(&st.from_cost.outcome).1.starts_with("校验通过"));
 
     st.from_cost.input = "1061.32".into();
     st.calc_from_cost();
     match &st.from_cost.outcome {
         Outcome::Gap(g) => {
             assert_eq!(g.reason, CostGapReason::Rounding);
-            assert!(labor_fee_desktop::state::gap_reason_text(g).contains("逐分舍入"));
+            assert!(labor_fee_desktop::state::gap_reason_text(g).contains("按分舍入"));
         }
         o => panic!("{o:?}"),
     }
@@ -169,20 +172,74 @@ fn config_load_and_reset() {
     assert!(!st.is_default_config());
     assert_eq!(settings::modified_items(st.config()), 1);
     // 已有结果按新口径重算
-    assert_eq!(value(&st.forward.outcome, "增值税"), "300.00");
+    assert_eq!(value(&st.forward.outcome, "增值税税额"), "300.00");
 
     let bad = dir.join("bad.toml");
     std::fs::write(&bad, "[vat]\nrate = \"x\"").unwrap();
     st.load_config_file(&bad);
     assert_eq!(st.notice.as_ref().unwrap().level, Level::Error);
-    assert_eq!(st.config().vat.rate, dec!(0.03), "加载失败时保留原口径");
+    assert_eq!(st.config().vat.rate, dec!(0.03), "加载失败时保留原参数");
 
     st.reset_config();
-    assert_eq!(st.source, "内置默认口径");
-    assert_eq!(value(&st.forward.outcome, "增值税"), "100.00");
+    assert_eq!(st.source, "内置默认参数");
+    assert_eq!(value(&st.forward.outcome, "增值税税额"), "100.00");
 }
 
 // ---------- 设置：编辑、校验、持久化 ----------
+
+#[test]
+fn settings_surcharge_items_and_relief() {
+    let cfg = labor_fee_core::Config::default();
+    let mut d = SettingsDraft::from_config(&cfg, ThemeChoice::System);
+    d.items[0].enabled = true;
+    d.items[0].rate = "7".into();
+    d.items[2].enabled = true;
+    d.items[2].rate = "2".into();
+    let c = d.build().unwrap();
+    let b = labor_fee_core::forward(&c, dec!(10000)).unwrap();
+    let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
+    assert_eq!(amts, vec![dec!(7.00), dec!(3.00), dec!(2.00)]);
+    assert_eq!(b.surcharge_total, dec!(12.00));
+    assert_eq!(d.modified_count(), 1);
+    // 规则说明动态列出启用的项目
+    let text: String = rules::rule_groups(&c)
+        .into_iter()
+        .flat_map(|g| g.lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        text.contains("城市维护建设税 = 实际缴纳的增值税税额 × 7%"),
+        "{text}"
+    );
+    assert!(text.contains("增值税附加税费 = 城市维护建设税 + 教育费附加 + 地方教育附加"));
+    // 减征 50%
+    d.relief_enabled = true;
+    let c = d.build().unwrap();
+    assert_eq!(
+        labor_fee_core::forward(&c, dec!(10000))
+            .unwrap()
+            .surcharge_total,
+        dec!(6.00)
+    );
+    assert_eq!(d.modified_count(), 2);
+    d.relief_rate = "120".into();
+    assert!(d.build().unwrap_err().contains_key(settings::key::RELIEF));
+}
+
+#[test]
+fn legacy_rules_file_loads_as_default() {
+    // 旧版设置文件（单一“附加税”项目）读入后与内置默认一致
+    let dir = tmp_dir("legacy");
+    let store = SettingsStore::at(dir.clone());
+    let legacy = labor_fee_core::DEFAULT_CONFIG_TOML.replace(
+        &labor_fee_core::DEFAULT_CONFIG_TOML[labor_fee_core::DEFAULT_CONFIG_TOML.find("[surcharge]").unwrap()
+            ..labor_fee_core::DEFAULT_CONFIG_TOML.find("[iit]").unwrap()],
+        "[surcharge]\nbase = \"vat\"\nhalve = false\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n\n",
+    );
+    std::fs::write(dir.join("rules.toml"), legacy).unwrap();
+    let st = AppState::with_store(store);
+    assert!(st.is_default_config(), "{}", st.source);
+}
 
 #[test]
 fn settings_draft_roundtrip_and_validation() {
@@ -190,7 +247,10 @@ fn settings_draft_roundtrip_and_validation() {
     let d = SettingsDraft::from_config(&cfg, ThemeChoice::System);
     assert_eq!(d.vat_rate, "1");
     assert_eq!(d.threshold, "1000");
-    assert_eq!(d.items[0].rate, "3");
+    assert_eq!(d.items.len(), 3);
+    assert_eq!(d.items[1].name, "教育费附加");
+    assert_eq!(d.items[1].rate, "3");
+    assert!(d.items[1].enabled && !d.items[0].enabled && !d.items[2].enabled);
     assert_eq!(d.pct_deduction, "20");
     assert_eq!(d.brackets.len(), 3);
     assert_eq!(d.build().unwrap(), cfg, "未修改时生成的配置与默认一致");
@@ -249,7 +309,7 @@ fn settings_save_persist_and_reload() {
     assert!(st.save_settings());
     assert!(st.settings.is_none());
     assert_eq!(st.source, "已保存的设置");
-    assert_eq!(value(&st.forward.outcome, "增值税"), "300.00");
+    assert_eq!(value(&st.forward.outcome, "增值税税额"), "300.00");
     assert!(store.rules_path().exists());
     assert!(std::fs::read_to_string(store.prefs_path())
         .unwrap()
@@ -292,14 +352,16 @@ fn rules_panel_follows_config() {
         .collect::<Vec<_>>()
         .join("\n");
     for s in [
-        "增值税 = 不含税收入 × 1%",
-        "不含税收入 ≥ 1000 元 才征收",
-        "附加税 = 增值税额 × 3%",
+        "增值税税额 = 不含增值税收入 × 征收率 1%",
+        "不含增值税收入达到 1000 元 的征收",
+        "教育费附加 = 实际缴纳的增值税税额 × 3%",
+        "增值税附加税费 = 教育费附加（各项分别按分舍入）",
+        "未启用：城市维护建设税、地方教育附加",
         "企业承担",
-        "每次收入 ≤ 4000 元 减除费用 800 元；> 4000 元 减除 20%",
+        "每次收入不超过 4000 元 的，减除费用 800 元；4000 元 以上的，减除费用按 20% 计算",
         "四舍五入",
-        "取最小不含税收入",
-        "总成本 1000.00～1010.29 没有对应的收入",
+        "取最小不含增值税收入",
+        "企业总支出 1000.00～1010.29 无对应的不含增值税收入",
     ] {
         assert!(text.contains(s), "规则缺少：{s}\n{text}");
     }
@@ -322,7 +384,7 @@ fn rules_panel_follows_config() {
         .into_iter()
         .flat_map(|g| g.lines)
         .collect();
-    assert!(t2.iter().any(|l| l.contains("不设征收门槛")));
+    assert!(t2.iter().any(|l| l.contains("未启用起征点")));
 }
 
 #[test]
@@ -356,9 +418,9 @@ fn batch_blocking_preview_and_save() {
     assert!(res.summary_text().starts_with("共 4 行：成功 3"));
     let pv = &res.output.preview;
     assert_eq!(pv.len(), 5);
-    assert_eq!(&pv[0][..3], &["姓名", "到手金额", "不含税收入"]);
+    assert_eq!(&pv[0][..3], &["姓名", "到手金额", "不含增值税收入"]);
     assert_eq!(pv[4][2], "10000.00");
-    assert_eq!(res.default_file_name(), "样例_反算结果.csv");
+    assert_eq!(res.default_file_name(), "样例_测算结果.csv");
 
     let out = res.default_save_path();
     st.save_batch(&out);
@@ -368,13 +430,13 @@ fn batch_blocking_preview_and_save() {
 
     // 按总成本：空位行写原因
     let p = dir.join("cost.csv");
-    std::fs::write(&p, "企业总成本\n1005\n10103\n").unwrap();
+    std::fs::write(&p, "企业总支出\n1005\n10103\n").unwrap();
     st.batch.path = p.display().to_string();
     st.batch.kind = InputKind::TotalCost;
     st.run_batch_blocking();
     let res = st.batch.result.as_ref().unwrap();
     assert_eq!(res.output.summary.unreachable_cost, 1);
-    assert!(res.output.preview[1].last().unwrap().contains("空白区间"));
+    assert!(res.output.preview[1].last().unwrap().contains("不可达区间"));
     assert_eq!(res.default_file_name(), "cost_计算结果.csv");
 
     st.batch.path = dir.join("x.txt").display().to_string();
@@ -451,42 +513,45 @@ fn has(h: &Harness<'_, AppState>, label: &str) -> bool {
 #[test]
 fn ui_forward_tab() {
     let mut h = harness(AppState::with_default_config());
-    for t in ["正算", "反算", "按总成本", "批量"] {
+    for t in ["收入计算", "实发测算", "支出测算", "批量测算"] {
         h.get_by_role_and_label(Role::Button, t);
     }
-    assert!(h.query_by_label("口径").is_none(), "不再有常驻口径页签");
-    h.get_by_label("不含税收入（元）");
-    h.get_by_label_contains("试算规则");
-    h.get_by_label_contains("国家税务总局公告 2018 年第 61 号");
+    assert!(h.query_by_label("口径").is_none(), "不再有常驻参数页签");
+    h.get_by_label("不含增值税收入（元）");
+    h.get_by_label("按不含增值税收入计算");
+    h.get_by_label_contains("计算规则");
+    h.get_by_label_contains("国家税务总局公告2018年第61号");
+    h.get_by_label_contains("财政部 税务总局公告2026年第10号");
     let input = h.get_by_role(Role::TextInput);
     input.click();
     input.type_text("10000");
     h.run();
     h.get_by_label("计算").click();
     h.run();
-    assert_eq!(value(&h.state().forward.outcome, "实际到手"), "8400.00");
+    assert_eq!(value(&h.state().forward.outcome, "税后实发金额"), "8400.00");
     for f in [
-        "增值税",
-        "附加税",
+        "增值税税额（1%）",
+        "　教育费附加（3%）",
+        "增值税附加税费合计",
         "减除费用",
-        "应纳税所得额",
+        "预扣预缴应纳税所得额",
         "预扣率",
         "速算扣除数",
     ] {
         assert!(has(&h, f), "缺少 {f}");
     }
-    for f in ["企业总成本", "个税", "实际到手"] {
+    for f in ["企业总支出", "应预扣预缴税额", "税后实发金额"] {
         assert!(has(&h, f), "缺少 {f}");
     }
-    h.get_by_label("不含税收入（输入）");
-    h.get_by_label("增值税与附加税");
+    h.get_by_label("不含增值税收入（输入）");
+    h.get_by_label("增值税及附加税费");
     h.get_by_label("个人所得税");
     assert!(has(&h, "10,103.00"), "千分位金额");
     assert!(has(&h, "8,400.00"));
     h.get_by_label("校验状态");
     h.get_by_label_contains("校验通过");
     // 最近计算
-    h.get_by_label_contains("10,000  →  到手 8,400.00");
+    h.get_by_label_contains("10,000  →  实发 8,400.00");
 }
 
 #[test]
@@ -495,13 +560,16 @@ fn ui_quick_example_chip() {
     h.get_by_label("4000").click();
     h.run();
     assert_eq!(h.state().forward.input, "4000");
-    assert_eq!(value(&h.state().forward.outcome, "个税"), "640.00");
+    assert_eq!(
+        value(&h.state().forward.outcome, "应预扣预缴税额"),
+        "640.00"
+    );
 }
 
 #[test]
 fn ui_reverse_tab_enter_key() {
     let mut h = harness(AppState::with_default_config());
-    h.get_by_label("反算").click();
+    h.get_by_label("实发测算").click();
     h.run();
     assert_eq!(h.state().tab, Tab::Reverse);
     let input = h.get_by_role(Role::TextInput);
@@ -510,11 +578,14 @@ fn ui_reverse_tab_enter_key() {
     h.run();
     h.key_press(eframe::egui::Key::Enter);
     h.run();
-    assert_eq!(value(&h.state().reverse.outcome, "不含税收入"), "4000.00");
+    assert_eq!(
+        value(&h.state().reverse.outcome, "不含增值税收入"),
+        "4000.00"
+    );
     assert!(has(&h, "4,041.20"));
-    h.get_by_label("实际到手（输入）");
-    h.get_by_label_contains("精确");
-    h.get_by_label_contains("由实际到手反算不含税收入");
+    h.get_by_label("税后实发金额（输入）");
+    h.get_by_label_contains("精确匹配");
+    h.get_by_label_contains("根据税后实发金额测算不含增值税收入");
 }
 
 #[test]
@@ -525,15 +596,15 @@ fn ui_from_cost_gap_click() {
     let mut h = harness(st);
     h.get_by_label("计算").click();
     h.run();
-    h.get_by_label("该企业总成本没有对应的不含税收入");
-    h.get_by_label_contains("原因：1000 元增值税征收门槛形成的空白区间");
-    h.get_by_label_contains("这一段没有对应的收入");
-    h.get_by_label("← 999.99（不含税收入 999.99）");
-    h.get_by_label("1010.30（不含税收入 1000.00）→").click();
+    h.get_by_label("该企业总支出无对应的不含增值税收入");
+    h.get_by_label_contains("原因：增值税起征点（1000 元）形成的不可达区间");
+    h.get_by_label_contains("其间的企业总支出均无对应收入");
+    h.get_by_label("← 999.99（收入 999.99）");
+    h.get_by_label("1010.30（收入 1000.00）→").click();
     h.run();
     assert_eq!(h.state().from_cost.input, "1010.30");
-    assert_eq!(value(&h.state().from_cost.outcome, "增值税"), "10.00");
-    h.get_by_label_contains("可达");
+    assert_eq!(value(&h.state().from_cost.outcome, "增值税税额"), "10.00");
+    h.get_by_label_contains("对应的企业总支出与输入一致");
 }
 
 #[test]
@@ -542,7 +613,7 @@ fn ui_rules_panel_collapse() {
     h.get_by_label("收起").click();
     h.run();
     assert!(!h.state().show_rules);
-    h.get_by_label_contains("显示试算规则").click();
+    h.get_by_label_contains("显示计算规则").click();
     h.run();
     assert!(h.state().show_rules);
 }
@@ -559,11 +630,11 @@ fn ui_batch_tab_preview() {
     for s in [
         "选择文件",
         "选择输入列",
-        "执行计算",
+        "执行测算",
         "导出结果",
         "总行数",
         "成功",
-        "错误",
+        "数据错误",
         "空白",
     ] {
         assert!(has(&h, s), "缺少 {s}");
@@ -572,7 +643,7 @@ fn ui_batch_tab_preview() {
     h.get_by_label("▶ 执行");
     h.get_by_label_contains("另存为…");
     h.get_by_label_contains("保存到输入文件旁");
-    h.get_by_label("样例_反算结果.csv");
+    h.get_by_label("样例_测算结果.csv");
     h.get_by_label_contains("共 4 行");
     h.get_by_label("甲");
     assert!(has(&h, "10,103.00"));
@@ -580,7 +651,7 @@ fn ui_batch_tab_preview() {
     // 切换输入列类型
     h.get_by_label("输入列").click();
     h.run();
-    h.get_by_label("企业总成本（按总成本）").click();
+    h.get_by_label("企业总支出（测算收入）").click();
     h.run();
     assert_eq!(h.state().batch.kind, InputKind::TotalCost);
 }
@@ -612,13 +683,12 @@ fn ui_settings_dialog() {
     assert!(h.state().settings.is_some());
     h.get_by_label("增值税征收率");
     assert!(has(&h, "已确认"));
-    h.get_by_role_and_label(Role::Button, "个税（劳务报酬）")
-        .click();
+    h.get_by_role_and_label(Role::Button, "个人所得税").click();
     h.run();
     h.get_by_label("定额减除费用");
-    h.get_by_label("预扣率表（居民个人劳务报酬，表二）");
+    h.get_by_label("预扣率表（个人所得税预扣率表二，居民个人劳务报酬所得适用）");
     assert!(has(&h, "已核实"));
-    h.get_by_role_and_label(Role::Button, "舍入与反算").click();
+    h.get_by_role_and_label(Role::Button, "舍入与测算").click();
     h.run();
     assert!(has(&h, "待确认"));
     h.get_by_role_and_label(Role::Button, "外观").click();
@@ -645,7 +715,7 @@ fn ui_settings_dialog() {
     assert!(h.state().settings.is_none());
     assert_eq!(h.state().config().vat.rate, dec!(0.03));
     assert!(h.query_all_by_label_contains("已修改 1 项").count() >= 1);
-    h.get_by_label_contains("增值税 = 不含税收入 × 3%");
+    h.get_by_label_contains("增值税税额 = 不含增值税收入 × 征收率 3%");
 }
 
 #[test]
@@ -656,7 +726,7 @@ fn ui_settings_validation_blocks_save() {
     let mut h = harness(st);
     h.run();
     h.get_by_label_contains("请输入 0～100 之间的百分数");
-    h.get_by_label("增值税与附加税  (1)");
+    h.get_by_label("增值税  (1)");
     h.get_by_label("保存").click();
     h.run();
     assert!(h.state().settings.is_some(), "有错误时“保存”不可用");
@@ -737,16 +807,16 @@ fn sample_xlsx() {
     let res = st.batch.result.as_ref().expect("有结果");
     let s = &res.output.summary;
     assert_eq!((s.rows, s.exact, s.errors), (7, 6, 1));
-    assert_eq!(res.default_file_name(), "到手样例_反算结果.xlsx");
+    assert_eq!(res.default_file_name(), "到手样例_测算结果.xlsx");
     let pv = &res.output.preview;
     let col = |n: &str| pv[0].iter().position(|x| x == n).unwrap();
     let nets: Vec<&str> = pv[1..]
         .iter()
-        .map(|r| r[col("不含税收入")].as_str())
+        .map(|r| r[col("不含增值税收入")].as_str())
         .collect();
     assert_eq!(
         nets,
         ["500.00", "999.99", "1000.00", "4000.00", "23809.52", "63235.29", ""]
     );
-    assert_eq!(pv[7][col("校准状态")], "错误");
+    assert_eq!(pv[7][col("测算状态")], "数据错误");
 }

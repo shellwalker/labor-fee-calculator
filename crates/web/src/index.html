@@ -18,34 +18,34 @@
 </head>
 <body>
 <h1>劳务报酬计算工具</h1>
-<p class="muted">增值税、附加税、劳务报酬个税（预扣预缴）正算（以不含税收入为输入）/ 反算 / 批量。口径以服务端配置为准（见页面底部），默认口径需业务确认。</p>
+<p class="muted">计算增值税及附加税费、居民个人劳务报酬所得个人所得税（预扣预缴）。支持按不含增值税收入计算、按税后实发金额测算、按企业总支出测算及批量测算。计算参数以服务端配置为准（见页面底部），结果仅供参考，以主管税务机关核定为准。</p>
 
-<h2>单笔计算</h2>
+<h2>单笔测算</h2>
 <section>
   <input type="text" id="amount" placeholder="金额（元）">
-  <button onclick="calc('forward')">正算（输入不含税收入）</button>
-  <button onclick="calc('reverse')">反算（输入实际到手）</button>
-  <button onclick="calc('from-cost')">按企业总成本正算（辅助）</button>
+  <button onclick="calc('forward')">按不含增值税收入计算</button>
+  <button onclick="calc('reverse')">按税后实发金额测算</button>
+  <button onclick="calc('from-cost')">按企业总支出测算</button>
   <div id="single"></div>
 </section>
 
-<h2>批量计算（xlsx / xls / csv）</h2>
+<h2>批量测算（xlsx / xls / csv）</h2>
 <section>
   <form id="batchForm">
     <input type="file" name="file" accept=".xlsx,.xlsm,.xls,.ods,.csv" required>
     输入列 <select name="input_kind">
-      <option value="take-home">到手金额（反算）</option>
-      <option value="net-income">不含税收入（正算）</option>
-      <option value="total-cost">企业总成本（辅助正算）</option>
+      <option value="take-home">税后实发金额</option>
+      <option value="net-income">不含增值税收入</option>
+      <option value="total-cost">企业总支出</option>
     </select>
-    列标题 <input type="text" name="column" placeholder="缺省同输入列" style="width:110px">
-    <button type="submit">上传并计算</button>
+    列标题 <input type="text" name="column" placeholder="缺省按输入列识别" style="width:110px">
+    <button type="submit">上传并测算</button>
   </form>
-  <p class="muted">读取首行标题为“到手金额”（或所选输入列）的列，在右侧追加不含税收入、各项税费、企业总成本、校准状态、备注等列，结果文件自动下载。企业总成本落在空位的行，备注列写明原因和两侧最近的有效总成本。</p>
+  <p class="muted">读取首行标题为“税后实发金额”（兼容旧列名“实发金额”“到手金额”）或所选输入列的列，在右侧追加不含增值税收入、增值税税额、附加税费、企业总支出、个人所得税、测算状态、备注等列，结果文件自动下载。企业总支出无对应收入的行，备注列写明原因和两侧最近的有效总支出。</p>
   <div id="batch"></div>
 </section>
 
-<h2>当前口径配置</h2>
+<h2>当前计算参数</h2>
 <pre id="cfg">加载中…</pre>
 
 <script>
@@ -53,18 +53,18 @@ const fmtPct = r => (Number(r) * 100).toFixed(2).replace(/\.?0+$/, '') + '%';
 function row(k, v) { return `<tr><td>${k}</td><td class="v">${v}</td></tr>`; }
 function render(b) {
   let h = '<table>';
-  h += row('不含税收入', b.net_income + (b.vat_exempt ? '（不征增值税及附加税）' : ''));
-  h += row('增值税', b.vat);
+  h += row('不含增值税收入', b.net_income + (b.vat_exempt ? '（未达到起征点，不征收增值税及附加税费）' : ''));
+  h += row('增值税税额', b.vat);
   for (const s of b.surcharges) h += row(`${s.name}（${fmtPct(s.rate)}）`, s.amount);
-  h += row('附加税合计', b.surcharge_total);
-  h += row('企业总成本', b.total_cost);
-  h += row('收入额', b.iit.income);
+  h += row('增值税附加税费合计', b.surcharge_total);
+  h += row('<b>企业总支出</b>', `<b>${b.total_cost}</b>`);
+  h += row('每次收入', b.iit.income);
   h += row('减除费用', b.iit.deduction);
-  h += row('应纳税所得额', b.iit.taxable_income);
+  h += row('预扣预缴应纳税所得额', b.iit.taxable_income);
   h += row('预扣率', fmtPct(b.iit.rate));
   h += row('速算扣除数', b.iit.quick_deduction);
-  h += row('代扣个税', b.iit.tax);
-  h += row('<b>实际到手金额</b>', `<b>${b.take_home}</b>`);
+  h += row('应预扣预缴税额', b.iit.tax);
+  h += row('<b>税后实发金额</b>', `<b>${b.take_home}</b>`);
   return h + '</table>';
 }
 async function calc(kind) {
@@ -78,17 +78,17 @@ async function calc(kind) {
     let h = `<p class="warn">${data.error}</p>`;
     if (data.gap) {
       const g = data.gap;
-      h += '<p class="muted">原因：' + (g.reason === 'threshold' ? `${g.threshold} 元增值税征收门槛形成的空白区间` : '增值税、附加税逐分舍入') + '</p>';
-      h += `<p>两侧最近的有效总成本：<a href="#" onclick="useCost('${g.lower.total_cost}');return false">${g.lower.total_cost}</a>（不含税收入 ${g.lower.net_income}）、<a href="#" onclick="useCost('${g.upper.total_cost}');return false">${g.upper.total_cost}</a>（不含税收入 ${g.upper.net_income}）</p>`;
+      h += '<p class="muted">原因：' + (g.reason === 'threshold' ? `增值税起征点（${g.threshold} 元）形成的不可达区间` : '增值税税额及附加税费按分舍入') + '</p>';
+      h += `<p>两侧最近的有效企业总支出：<a href="#" onclick="useCost('${g.lower.total_cost}');return false">${g.lower.total_cost}</a>（不含增值税收入 ${g.lower.net_income}）、<a href="#" onclick="useCost('${g.upper.total_cost}');return false">${g.upper.total_cost}</a>（不含增值税收入 ${g.upper.net_income}）</p>`;
     }
     el.innerHTML = h; return;
   }
   if (kind !== 'reverse') { el.innerHTML = render(data); return; }
   let head = data.exact
-    ? '<p class="ok">精确：正算回去与目标到手完全一致</p>'
-    : `<p class="warn">不可精确达到，已取最接近的不含税收入，差额 ${data.diff}（正算到手 − 目标）</p>`;
+    ? '<p class="ok">精确匹配：按测算结果计算的税后实发金额与目标一致</p>'
+    : `<p class="warn">无法精确匹配，已取最接近的不含增值税收入，差额 ${data.diff}（计算结果 − 目标）</p>`;
   if (data.other_solutions && data.other_solutions.length)
-    head += `<p class="muted">另有不含税收入 ${data.other_solutions.join('、')} 亦可精确达到（分段跳变导致多解）</p>`;
+    head += `<p class="muted">另有不含增值税收入 ${data.other_solutions.join('、')} 亦可精确匹配（分段变化导致多解）</p>`;
   el.innerHTML = head + render(data.breakdown);
 }
 function useCost(c) { document.getElementById('amount').value = c; calc('from-cost'); }
@@ -105,7 +105,7 @@ document.getElementById('batchForm').addEventListener('submit', async e => {
   const blob = await resp.blob();
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
   const s = Object.fromEntries((resp.headers.get('x-batch-summary') || '').split(';').filter(Boolean).map(kv => kv.split('=')));
-  el.innerHTML = `<p class="ok">已下载 ${name}：共 ${s.rows} 行，成功 ${s.exact}，不可精确达到 ${s.inexact}，总成本不可达 ${s.unreachable_cost}，错误 ${s.errors}，空白 ${s.empty}</p>`;
+  el.innerHTML = `<p class="ok">已下载 ${name}：共 ${s.rows} 行，成功 ${s.exact}，无法精确匹配 ${s.inexact}，总支出不可达 ${s.unreachable_cost}，数据错误 ${s.errors}，空白 ${s.empty}</p>`;
 });
 fetch('/api/config').then(r => r.text()).then(t => document.getElementById('cfg').textContent = t);
 </script>

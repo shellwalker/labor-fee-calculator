@@ -106,8 +106,7 @@ fn surcharges(cfg: &Config, vat: Decimal, net: Decimal) -> (Vec<SurchargeLine>, 
     };
     let lines = cfg
         .surcharge
-        .items
-        .iter()
+        .enabled_items()
         .zip(rates)
         .zip(amounts)
         .map(|((it, rate), amount)| SurchargeLine {
@@ -398,9 +397,12 @@ mod tests {
                 (dec!(1000.00), dec!(1010.30))
             );
             let msg = CalcError::CostUnreachable(Box::new(g)).to_string();
-            assert!(msg.contains("1000 元增值税征收门槛形成的空白区间"), "{msg}");
             assert!(
-                msg.contains("不含税收入 999.99 对应总成本 999.99，1000.00 对应 1010.30"),
+                msg.contains("增值税起征点（1000 元）形成的不可达区间"),
+                "{msg}"
+            );
+            assert!(
+                msg.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.30"),
                 "{msg}"
             );
         }
@@ -420,7 +422,7 @@ mod tests {
                     assert!(g.lower.total_cost < cost && cost < g.upper.total_cost);
                     assert_eq!(g.upper.net_income - g.lower.net_income, dec!(0.01));
                     let msg = CalcError::CostUnreachable(g).to_string();
-                    assert!(msg.contains("逐分舍入"), "{msg}");
+                    assert!(msg.contains("按分舍入"), "{msg}");
                 }
                 Err(e) => panic!("{e}"),
             }
@@ -431,20 +433,12 @@ mod tests {
     #[test]
     fn itemized_halved_surcharge() {
         let mut c = cfg();
-        c.surcharge.halve = true;
+        c.surcharge.relief_enabled = true;
+        c.surcharge.relief_rate = dec!(0.5);
         c.surcharge.items = vec![
-            crate::SurchargeItem {
-                name: "城市维护建设税".into(),
-                rate: dec!(0.07),
-            },
-            crate::SurchargeItem {
-                name: "教育费附加".into(),
-                rate: dec!(0.03),
-            },
-            crate::SurchargeItem {
-                name: "地方教育附加".into(),
-                rate: dec!(0.02),
-            },
+            crate::SurchargeItem::new("城市维护建设税", dec!(0.07), true),
+            crate::SurchargeItem::new("教育费附加", dec!(0.03), true),
+            crate::SurchargeItem::new("地方教育附加", dec!(0.02), true),
         ];
         let b = forward(&c, dec!(10000)).unwrap();
         let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
@@ -454,18 +448,43 @@ mod tests {
     }
 
     #[test]
+    fn three_items_per_item_rounding() {
+        // 7% / 3% / 2% 三项全开，分别按分舍入：增值税 10.51 → 0.7357→0.74、0.3153→0.32、0.2102→0.21
+        let mut c = cfg();
+        c.surcharge.items = crate::SurchargeItem::standard(dec!(0.03));
+        c.surcharge.items[0].rate = dec!(0.07);
+        c.surcharge.items[0].enabled = true;
+        c.surcharge.items[2].rate = dec!(0.02);
+        c.surcharge.items[2].enabled = true;
+        let b = forward(&c, dec!(1050.50)).unwrap();
+        assert_eq!(b.vat, dec!(10.51));
+        let amts: Vec<_> = b.surcharges.iter().map(|l| l.amount).collect();
+        assert_eq!(amts, vec![dec!(0.74), dec!(0.32), dec!(0.21)]);
+        assert_eq!(b.surcharge_total, dec!(1.27));
+        assert_eq!(b.total_cost, dec!(1062.28));
+        // 未启用的项目不列示
+        c.surcharge.items[2].enabled = false;
+        let b = forward(&c, dec!(1050.50)).unwrap();
+        assert_eq!(b.surcharges.len(), 2);
+        assert_eq!(b.surcharge_total, dec!(1.06));
+    }
+
+    #[test]
+    fn default_results_unchanged() {
+        let b = at(dec!(1000));
+        assert_eq!(b.surcharges.len(), 1);
+        assert_eq!(b.surcharges[0].name, "教育费附加");
+        assert_eq!(b.surcharges[0].amount, dec!(0.30));
+        assert_eq!(b.total_cost, dec!(1010.30));
+    }
+
+    #[test]
     fn surcharge_total_rounding_sums() {
         let mut c = cfg();
         c.rounding.surcharge = SurchargeRounding::Total;
         c.surcharge.items = vec![
-            crate::SurchargeItem {
-                name: "a".into(),
-                rate: dec!(0.035),
-            },
-            crate::SurchargeItem {
-                name: "b".into(),
-                rate: dec!(0.015),
-            },
+            crate::SurchargeItem::new("a", dec!(0.035), true),
+            crate::SurchargeItem::new("b", dec!(0.015), true),
         ];
         let b = forward(&c, dec!(1000)).unwrap();
         let s: Decimal = b.surcharges.iter().map(|l| l.amount).sum();

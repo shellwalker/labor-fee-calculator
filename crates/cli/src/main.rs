@@ -12,10 +12,10 @@ use std::str::FromStr;
 #[command(
     name = "labor-fee",
     version,
-    about = "劳务报酬计算：增值税、附加税、劳务报酬个税的正算与反算"
+    about = "劳务报酬计算：增值税及附加税费、个人所得税预扣预缴的计算与测算"
 )]
 struct Cli {
-    /// 税务口径配置文件（TOML），缺省使用内置默认配置
+    /// 计算参数配置文件（TOML），缺省使用内置默认参数
     #[arg(short, long, global = true)]
     config: Option<PathBuf>,
     /// 以 JSON 输出
@@ -27,38 +27,38 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// 正算（主入口）：不含税收入 → 增值税、附加税、企业总成本、个税、实际到手
+    /// 按不含增值税收入计算：增值税税额、附加税费、企业总支出、应预扣预缴税额、税后实发金额
     #[command(alias = "fwd")]
     Forward {
-        /// 不含税收入（元，最多两位小数）
+        /// 不含增值税收入（元，最多两位小数）
         net_income: String,
     },
-    /// 辅助：按企业总成本正算（内部求不含税收入；落在空位时报错并给出原因和两侧最近的有效总成本）
+    /// 按企业总支出测算不含增值税收入（金额不可达时报错，并给出原因和两侧最近的有效总支出）
     FromCost {
-        /// 企业总成本（元，最多两位小数）
+        /// 企业总支出（元，最多两位小数）
         total_cost: String,
     },
-    /// 反算：实际到手 → 不含税收入及全部金额（多解取最小不含税收入）
+    /// 按税后实发金额测算不含增值税收入及全部金额（多解时取最小不含增值税收入）
     #[command(alias = "rev")]
     Reverse {
-        /// 实际到手金额（元，最多两位小数）
+        /// 税后实发金额（元，最多两位小数）
         take_home: String,
     },
-    /// 批量：读取 xlsx/xls/ods/csv 中的金额列，追加计算结果列并输出新文件（默认按“到手金额”反算）
+    /// 批量测算：读取 xlsx/xls/ods/csv 中的金额列，追加结果列并输出新文件（默认读取“税后实发金额”列）
     Batch {
         /// 输入文件
         input: PathBuf,
-        /// 输出文件（缺省为 输入名_反算结果/计算结果.xlsx/csv，与输入同目录）
+        /// 输出文件（缺省为 输入名_测算结果/计算结果.xlsx/csv，与输入同目录）
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// 输入列含义：take-home（到手金额，反算）| net-income（不含税收入，正算）| total-cost（企业总成本，辅助正算）
+        /// 输入列含义：take-home（税后实发金额）| net-income（不含增值税收入）| total-cost（企业总支出）
         #[arg(long, default_value = "take-home", value_parser = parse_kind)]
         input_kind: labor_fee_batch::InputKind,
-        /// 读取的列标题（缺省按输入列含义：到手金额 / 不含税收入 / 企业总成本）
+        /// 读取的列标题（缺省按输入列含义识别：税后实发金额 / 不含增值税收入 / 企业总支出，兼容旧列名）
         #[arg(long)]
         column: Option<String>,
     },
-    /// 输出当前生效的配置（TOML）
+    /// 输出当前生效的计算参数（TOML）
     Config,
 }
 
@@ -87,53 +87,68 @@ fn pct(d: Decimal) -> String {
     format!("{}%", (d * Decimal::ONE_HUNDRED).normalize())
 }
 
+/// 按显示宽度（中文字符计 2）左对齐补齐标签。
+fn label(s: &str) -> String {
+    const WIDTH: usize = 24;
+    let w: usize = s.chars().map(|c| if c.is_ascii() { 1 } else { 2 }).sum();
+    format!("{s}{}", " ".repeat(WIDTH.saturating_sub(w)))
+}
+
+fn line(name: &str, value: impl std::fmt::Display) {
+    println!("{}{:>14}", label(name), value);
+}
+
 fn print_breakdown(b: &Breakdown) {
-    println!(
-        "不含税收入          {:>14}{}",
-        b.net_income,
-        if b.vat_exempt {
-            "  （不征增值税及附加税）"
-        } else {
-            ""
-        }
-    );
-    println!("增值税              {:>14}", b.vat);
+    println!("—— 增值税及附加税费（企业承担）——");
+    line("不含增值税收入", b.net_income);
+    line("增值税税额", b.vat);
+    if b.vat_exempt {
+        println!("  （未达到增值税起征点，不征收增值税及附加税费）");
+    }
     for l in &b.surcharges {
         println!(
-            "  {:<16}  {:>14}  （税率 {}）",
-            l.name,
+            "{}{:>14}  （费率 {}）",
+            label(&format!("  {}", l.name)),
             l.amount,
             pct(l.rate)
         );
     }
-    println!("附加税合计          {:>14}", b.surcharge_total);
-    println!("企业总成本          {:>14}", b.total_cost);
-    println!("—— 劳务报酬个税（预扣预缴）——");
-    println!("收入额              {:>14}", b.iit.income);
-    println!("减除费用            {:>14}", b.iit.deduction);
-    println!("应纳税所得额        {:>14}", b.iit.taxable_income);
-    println!("预扣率              {:>14}", pct(b.iit.rate));
-    println!("速算扣除数          {:>14}", b.iit.quick_deduction);
-    println!("代扣个税            {:>14}", b.iit.tax);
-    println!("实际到手金额        {:>14}", b.take_home);
+    line("增值税附加税费合计", b.surcharge_total);
+    line("企业总支出", b.total_cost);
+    println!("—— 个人所得税（居民个人劳务报酬所得预扣预缴）——");
+    line("每次收入", b.iit.income);
+    line("减除费用", b.iit.deduction);
+    line("预扣预缴应纳税所得额", b.iit.taxable_income);
+    line("预扣率", pct(b.iit.rate));
+    line("速算扣除数", b.iit.quick_deduction);
+    line("应预扣预缴税额", b.iit.tax);
+    line("税后实发金额", b.take_home);
 }
 
 fn print_reverse(r: &ReverseOutcome) {
-    println!("目标到手            {:>14}", r.target);
+    line("目标税后实发金额", r.target);
     if r.exact {
-        println!("校准结果            精确（正算到手与目标一致）");
+        println!("{}精确匹配（计算结果与目标一致）", label("测算结果"));
         if let Some((a, b)) = r.exact_net_income_range {
             if a != b {
-                println!("等效不含税收入区间  {a} ~ {b}（均得到相同到手，已取配置偏好值）");
+                println!(
+                    "{}{a} ~ {b}（税后实发金额相同，已按参数取值）",
+                    label("等效不含增值税收入区间")
+                );
             }
         }
         if !r.other_solutions.is_empty() {
             let s: Vec<String> = r.other_solutions.iter().map(|d| d.to_string()).collect();
-            println!("其它可行不含税收入  {}（分段跳变导致多解）", s.join(", "));
+            println!(
+                "{}{}（分段变化导致多解）",
+                label("其他可行不含增值税收入"),
+                s.join("、")
+            );
         }
     } else {
         println!(
-            "校准结果            不可精确达到，差额 {}（正算到手 − 目标）",
+            "{}无法精确匹配，差额 {}（计算结果 − 目标）",
+            label("测算结果"),
             r.diff
         );
     }
@@ -215,7 +230,7 @@ fn run() -> Result<()> {
             } else {
                 println!("已输出：{}", out_path.display());
                 println!(
-                    "共 {} 行：成功 {}，不可精确达到 {}，总成本不可达 {}，错误 {}，空白 {}",
+                    "共 {} 行：成功 {}，无法精确匹配 {}，总支出不可达 {}，数据错误 {}，空白 {}",
                     s.rows, s.exact, s.inexact, s.unreachable_cost, s.errors, s.empty
                 );
             }

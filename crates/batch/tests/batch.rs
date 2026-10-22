@@ -58,7 +58,7 @@ fn xlsx_roundtrip() {
     assert_eq!(out.summary.errors, 1);
     let rows = read_back(&out.bytes);
     let h: Vec<String> = rows[0].iter().map(|d| d.to_string()).collect();
-    assert_eq!(&h[..4], &["姓名", "身份证号", "到手金额", "不含税收入"]);
+    assert_eq!(&h[..4], &["姓名", "身份证号", "到手金额", "不含增值税收入"]);
     let col = |name: &str| h.iter().position(|x| x == name).unwrap();
     // 身份证号保持文本
     assert_eq!(rows[1][1], Data::String("110101199001011234".into()));
@@ -68,16 +68,16 @@ fn xlsx_roundtrip() {
         (3, dec!(12345.67)),
         (6, dec!(0.30)),
     ] {
-        let net = money(&rows[r][col("不含税收入")]);
+        let net = money(&rows[r][col("不含增值税收入")]);
         assert_eq!(forward(&cfg, net).unwrap().take_home, expect);
-        assert_eq!(money(&rows[r][col("实际到手")]), expect);
-        assert_eq!(rows[r][col("校准状态")], Data::String("精确".into()));
+        assert_eq!(money(&rows[r][col("税后实发金额")]), expect);
+        assert_eq!(rows[r][col("测算状态")], Data::String("精确匹配".into()));
     }
-    assert_eq!(money(&rows[1][col("企业总成本")]), dec!(10103));
-    assert_eq!(money(&rows[1][col("不含税收入")]), dec!(10000));
-    assert_eq!(rows[5][col("校准状态")].to_string(), "错误");
+    assert_eq!(money(&rows[1][col("企业总支出")]), dec!(10103));
+    assert_eq!(money(&rows[1][col("不含增值税收入")]), dec!(10000));
+    assert_eq!(rows[5][col("测算状态")].to_string(), "数据错误");
     assert!(rows[5][col("备注")].to_string().contains("无法解析金额"));
-    assert_eq!(rows[4][col("企业总成本")], Data::Empty);
+    assert_eq!(rows[4][col("企业总支出")], Data::Empty);
 }
 
 #[test]
@@ -97,10 +97,10 @@ fn csv_utf8_and_gbk() {
         let mut rdr = csv::Reader::from_reader(s.as_bytes());
         let h = rdr.headers().unwrap().clone();
         assert_eq!(&h[0], "序号");
-        assert_eq!(&h[3], "不含税收入");
+        assert_eq!(&h[3], "不含增值税收入");
         let recs: Vec<_> = rdr.records().map(|r| r.unwrap()).collect();
         assert_eq!(&recs[0][3], "10000.00");
-        let tc = h.iter().position(|x| x == "企业总成本").unwrap();
+        let tc = h.iter().position(|x| x == "企业总支出").unwrap();
         assert_eq!(&recs[0][tc], "10103.00");
         let ci = h.iter().position(|x| x == "预扣率").unwrap();
         assert_eq!(&recs[0][ci], "20%");
@@ -147,35 +147,35 @@ fn total_cost_gap_notes() {
     assert_eq!(out.preview.len(), 4);
     assert_eq!(out.preview[0][0], "企业总成本");
     assert_eq!(out.preview[0].last().unwrap(), "备注");
-    assert!(out.preview[2].last().unwrap().contains("空白区间"));
+    assert!(out.preview[2].last().unwrap().contains("不可达区间"));
     let s = String::from_utf8(out.bytes).unwrap();
     let s = s.trim_start_matches('\u{feff}');
     let mut rdr = csv::Reader::from_reader(s.as_bytes());
     let h = rdr.headers().unwrap().clone();
     let col = |n: &str| h.iter().position(|x| x == n).unwrap();
     let recs: Vec<_> = rdr.records().map(|r| r.unwrap()).collect();
-    assert_eq!(&recs[0][col("不含税收入")], "999.99");
-    assert!(recs[0][col("备注")].contains("不征增值税及附加税"));
+    assert_eq!(&recs[0][col("不含增值税收入")], "999.99");
+    assert!(recs[0][col("备注")].contains("未达到增值税起征点"));
     for r in [1, 2] {
-        assert_eq!(&recs[r][col("校准状态")], "总成本不可达");
-        assert_eq!(&recs[r][col("不含税收入")], "");
+        assert_eq!(&recs[r][col("测算状态")], "总支出不可达");
+        assert_eq!(&recs[r][col("不含增值税收入")], "");
         let note = &recs[r][col("备注")];
         assert!(
-            note.contains("1000 元增值税征收门槛形成的空白区间"),
+            note.contains("增值税起征点（1000 元）形成的不可达区间"),
             "{note}"
         );
         assert!(
-            note.contains("不含税收入 999.99 对应总成本 999.99，1000.00 对应 1010.30"),
+            note.contains("不含增值税收入 999.99 对应企业总支出 999.99，1000.00 对应 1010.30"),
             "{note}"
         );
-        assert!(note.contains("两侧最近的有效总成本：999.99"), "{note}");
+        assert!(note.contains("两侧最近的有效企业总支出：999.99"), "{note}");
     }
-    assert_eq!(&recs[3][col("不含税收入")], "1000.00");
-    assert_eq!(&recs[4][col("不含税收入")], "10000.00");
+    assert_eq!(&recs[3][col("不含增值税收入")], "1000.00");
+    assert_eq!(&recs[4][col("不含增值税收入")], "10000.00");
     // 1050.49 → 1061.31，1050.50 → 1061.33（增值税 10.50 → 10.51，附加税均为 0.32），中间 1061.32 不可达
-    assert_eq!(&recs[5][col("校准状态")], "总成本不可达");
+    assert_eq!(&recs[5][col("测算状态")], "总支出不可达");
     assert!(
-        recs[5][col("备注")].contains("逐分舍入"),
+        recs[5][col("备注")].contains("按分舍入"),
         "{}",
         &recs[5][col("备注")]
     );
@@ -192,4 +192,72 @@ fn net_income_kind() {
     let out = process(&cfg, "不含税收入\n10000\n".as_bytes(), Format::Csv, &opts).unwrap();
     let s = String::from_utf8(out.bytes).unwrap();
     assert!(s.contains("10103.00") && s.contains("8400.00"));
+}
+
+#[test]
+fn new_and_legacy_column_names() {
+    // 新正式列名与旧列名均可识别；新列名优先
+    let cfg = Config::default();
+    for (text, kind) in [
+        ("税后实发金额\n8400\n", InputKind::TakeHome),
+        ("实发金额\n8400\n", InputKind::TakeHome),
+        ("到手金额\n8400\n", InputKind::TakeHome),
+        ("不含增值税收入\n10000\n", InputKind::NetIncome),
+        ("不含税收入\n10000\n", InputKind::NetIncome),
+        ("企业总支出\n10103\n", InputKind::TotalCost),
+        ("企业总成本\n10103\n", InputKind::TotalCost),
+    ] {
+        let opts = Options {
+            kind,
+            ..Default::default()
+        };
+        let out = process(&cfg, text.as_bytes(), Format::Csv, &opts).unwrap();
+        let s = String::from_utf8(out.bytes).unwrap();
+        assert!(s.contains("10000.00"), "{text}: {s}");
+    }
+    let err = process(
+        &cfg,
+        "金额\n1\n".as_bytes(),
+        Format::Csv,
+        &Options::default(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "首行未找到标题为“税后实发金额”或“实发金额”或“到手金额”的列"
+    );
+}
+
+#[test]
+fn three_items_columns() {
+    // 三项附加税费全开时逐项列示
+    let mut cfg = Config::default();
+    cfg.surcharge.items[0].rate = dec!(0.07);
+    cfg.surcharge.items[0].enabled = true;
+    cfg.surcharge.items[2].rate = dec!(0.02);
+    cfg.surcharge.items[2].enabled = true;
+    let opts = Options {
+        kind: InputKind::NetIncome,
+        ..Default::default()
+    };
+    let out = process(
+        &cfg,
+        "不含增值税收入\n10000\n".as_bytes(),
+        Format::Csv,
+        &opts,
+    )
+    .unwrap();
+    let s = String::from_utf8(out.bytes).unwrap();
+    let mut lines = s.lines();
+    let h = lines.next().unwrap().trim_start_matches('\u{feff}');
+    assert!(
+        h.contains(
+            "增值税税额,城市维护建设税,教育费附加,地方教育附加,增值税附加税费合计,企业总支出"
+        ),
+        "{h}"
+    );
+    assert!(lines
+        .next()
+        .unwrap()
+        .contains("100.00,7.00,3.00,2.00,12.00,10112.00"));
 }

@@ -30,7 +30,7 @@ impl RoundingMode {
     }
 }
 
-/// 附加税的舍入时点。
+/// 增值税附加税费的舍入时点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SurchargeRounding {
@@ -51,39 +51,141 @@ pub struct RoundingConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct VatConfig {
-    /// 增值税征收率：增值税 = round(不含税收入 × 征收率)。
+    /// 增值税征收率：增值税税额 = round(不含增值税收入 × 征收率)。
     pub rate: Decimal,
-    /// 是否启用征收门槛：不含税收入低于门槛时增值税、附加税均为 0。
+    /// 是否启用起征点：不含增值税收入未达到起征点时，增值税及附加税费均为 0。
     pub threshold_enabled: bool,
-    /// 门槛金额（按不含税收入判断）。
+    /// 起征点金额（按不含增值税收入判断）。
     pub threshold: Decimal,
-    /// 不含税收入恰好等于门槛时是否征收（true：≥ 门槛征收；false：> 门槛才征收）。
+    /// 不含增值税收入恰好等于起征点时是否征收（true：达到即征收；false：超过才征收）。
     pub levy_at_threshold: bool,
 }
 
-/// 附加税计税基数（假设 B）。
+/// 增值税附加税费的计税依据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SurchargeBase {
-    /// 以实际缴纳的增值税额为基数（法定口径）。
+    /// 以实际缴纳的增值税税额为计税依据（法定口径）。
     Vat,
-    /// 以不含税开票收入为基数。
+    /// 以不含增值税收入为计税依据（非法定口径，仅供测算）。
     NetRevenue,
 }
 
+/// 城市维护建设税。
+pub const URBAN_CONSTRUCTION_TAX: &str = "城市维护建设税";
+/// 教育费附加。
+pub const EDUCATION_SURCHARGE: &str = "教育费附加";
+/// 地方教育附加。
+pub const LOCAL_EDUCATION_SURCHARGE: &str = "地方教育附加";
+/// 旧版配置中的合并项目名称，读入时视为教育费附加。
+pub const LEGACY_SURCHARGE_NAME: &str = "附加税";
+
+fn yes() -> bool {
+    true
+}
+
+/// 增值税附加税费的一个项目（如城市维护建设税、教育费附加、地方教育附加）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SurchargeItem {
     pub name: String,
+    /// 税（费）率，以计税依据为基数。
     pub rate: Decimal,
+    /// 是否计征；未启用的项目不参与计算，也不在结果中列示。
+    #[serde(default = "yes")]
+    pub enabled: bool,
 }
 
+impl SurchargeItem {
+    pub fn new(name: &str, rate: Decimal, enabled: bool) -> Self {
+        SurchargeItem {
+            name: name.to_string(),
+            rate,
+            enabled,
+        }
+    }
+
+    /// 标准三项：城市维护建设税、教育费附加、地方教育附加。
+    /// 教育费附加按 `education` 计征且启用，其余两项费率为 0、未启用。
+    pub fn standard(education: Decimal) -> Vec<SurchargeItem> {
+        vec![
+            SurchargeItem::new(URBAN_CONSTRUCTION_TAX, Decimal::ZERO, false),
+            SurchargeItem::new(EDUCATION_SURCHARGE, education, true),
+            SurchargeItem::new(LOCAL_EDUCATION_SURCHARGE, Decimal::ZERO, false),
+        ]
+    }
+}
+
+/// 增值税附加税费配置。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "SurchargeConfigRaw")]
 pub struct SurchargeConfig {
     pub base: SurchargeBase,
-    pub halve: bool,
+    /// 是否启用减征（如“六税两费”减征政策，是否适用由使用者判断）。
+    pub relief_enabled: bool,
+    /// 减征比例，取值 [0, 1]：实际费率 = 费率 × (1 − 减征比例)；0.5 即减半征收。
+    pub relief_rate: Decimal,
     pub items: Vec<SurchargeItem>,
+}
+
+/// 读取用的原始结构，兼容旧版字段：
+/// - `halve = true`（减半征收）→ 启用减征、减征比例 50%；
+/// - 单一 `rate`（未列 `items`）或名为“附加税”的项目 → 教育费附加，并补齐另外两项（未启用）。
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SurchargeConfigRaw {
+    base: SurchargeBase,
+    #[serde(default)]
+    relief_enabled: bool,
+    #[serde(default)]
+    relief_rate: Option<Decimal>,
+    #[serde(default)]
+    halve: bool,
+    #[serde(default)]
+    rate: Option<Decimal>,
+    #[serde(default)]
+    items: Vec<SurchargeItem>,
+}
+
+impl From<SurchargeConfigRaw> for SurchargeConfig {
+    fn from(r: SurchargeConfigRaw) -> Self {
+        let half = Decimal::new(5, 1);
+        let (relief_enabled, relief_rate) = if r.halve {
+            (true, half)
+        } else {
+            (r.relief_enabled, r.relief_rate.unwrap_or(half))
+        };
+        let mut items = r.items;
+        if items.is_empty() {
+            if let Some(rate) = r.rate {
+                items = SurchargeItem::standard(rate);
+            }
+        } else if items.len() == 1 && items[0].name == LEGACY_SURCHARGE_NAME {
+            let it = &items[0];
+            let mut std = SurchargeItem::standard(it.rate);
+            std[1].enabled = it.enabled;
+            items = std;
+        } else {
+            for it in &mut items {
+                if it.name == LEGACY_SURCHARGE_NAME {
+                    it.name = EDUCATION_SURCHARGE.to_string();
+                }
+            }
+        }
+        SurchargeConfig {
+            base: r.base,
+            relief_enabled,
+            relief_rate,
+            items,
+        }
+    }
+}
+
+impl SurchargeConfig {
+    /// 已启用的项目。
+    pub fn enabled_items(&self) -> impl Iterator<Item = &SurchargeItem> {
+        self.items.iter().filter(|i| i.enabled)
+    }
 }
 
 /// 预扣率表一档。`upper` 为应纳税所得额上限（含本数），最后一档为 `None`。
@@ -116,15 +218,15 @@ pub enum Prefer {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReverseConfig {
-    /// 多个不含税收入得到同一到手时取最小（默认）或最大。
+    /// 多个不含增值税收入得到同一税后实发金额时取最小（默认）或最大。
     pub prefer: Prefer,
     /// 二分定位后前后逐分扫描的范围（分）。
     pub search_window: u32,
-    /// 反算搜索的不含税收入上限。
+    /// 测算时不含增值税收入的搜索上限。
     pub max_net_income: Decimal,
 }
 
-/// 全部税务口径与舍入规则。
+/// 全部计算参数与舍入规则。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -171,6 +273,13 @@ impl Config {
             if it.rate < Decimal::ZERO || it.rate >= one {
                 return bad("surcharge.items.rate 必须在 [0, 1) 内");
             }
+            if it.name.trim().is_empty() {
+                return bad("surcharge.items.name 不能为空");
+            }
+        }
+        let r = self.surcharge.relief_rate;
+        if r < Decimal::ZERO || r > one {
+            return bad("surcharge.relief_rate 必须在 [0, 1] 内");
         }
         let iit = &self.iit;
         if iit.fixed_deduction < Decimal::ZERO || iit.fixed_deduction_limit < Decimal::ZERO {
@@ -216,23 +325,20 @@ impl Config {
         Decimal::new(1, self.rounding.scale)
     }
 
-    /// 附加税各税目的实际税率（考虑减半）。
+    /// 已启用的附加税费各项目的实际费率（已考虑减征），与 [`SurchargeConfig::enabled_items`] 顺序一致。
     pub fn effective_surcharge_rates(&self) -> Vec<Decimal> {
-        let half = Decimal::new(5, 1);
+        let keep = if self.surcharge.relief_enabled {
+            Decimal::ONE - self.surcharge.relief_rate
+        } else {
+            Decimal::ONE
+        };
         self.surcharge
-            .items
-            .iter()
-            .map(|it| {
-                if self.surcharge.halve {
-                    it.rate * half
-                } else {
-                    it.rate
-                }
-            })
+            .enabled_items()
+            .map(|it| it.rate * keep)
             .collect()
     }
 
-    /// 不含税收入为 `amount` 时是否征收增值税和附加税。
+    /// 不含增值税收入为 `amount` 时是否征收增值税及附加税费。
     pub fn levied(&self, amount: Decimal) -> bool {
         if !self.vat.threshold_enabled {
             return true;
@@ -253,7 +359,12 @@ mod tests {
     fn default_config_parses_and_roundtrips() {
         let cfg = Config::default();
         assert_eq!(cfg.vat.rate, Decimal::new(1, 2));
-        assert_eq!(cfg.surcharge.items[0].rate, Decimal::new(3, 2));
+        let on: Vec<_> = cfg.surcharge.enabled_items().collect();
+        assert_eq!(on.len(), 1);
+        assert_eq!(on[0].name, EDUCATION_SURCHARGE);
+        assert_eq!(on[0].rate, Decimal::new(3, 2));
+        assert_eq!(cfg.surcharge.items.len(), 3);
+        assert!(!cfg.surcharge.relief_enabled);
         let again = Config::from_toml_str(&cfg.to_toml_string()).unwrap();
         assert_eq!(cfg, again);
     }
@@ -265,6 +376,45 @@ mod tests {
         assert!(cfg.validate().is_err());
         let mut cfg = Config::default();
         cfg.iit.brackets.last_mut().unwrap().upper = Some(Decimal::new(1_000_000, 0));
+        assert!(cfg.validate().is_err());
+    }
+
+    fn legacy(surcharge: &str) -> Config {
+        let start = DEFAULT_CONFIG_TOML.find("[surcharge]").unwrap();
+        let end = DEFAULT_CONFIG_TOML.find("[iit]").unwrap();
+        let s = format!(
+            "{}{}\n{}",
+            &DEFAULT_CONFIG_TOML[..start],
+            surcharge,
+            &DEFAULT_CONFIG_TOML[end..]
+        );
+        Config::from_toml_str(&s).unwrap()
+    }
+
+    #[test]
+    fn legacy_single_surcharge_is_education() {
+        let def = Config::default();
+        // 旧版：单一“附加税”项目
+        let a = legacy(
+            "[surcharge]\nbase = \"vat\"\nhalve = false\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n",
+        );
+        assert_eq!(a, def);
+        // 旧版：单一 rate 字段
+        let b = legacy("[surcharge]\nbase = \"vat\"\nrate = \"0.03\"\n");
+        assert_eq!(b, def);
+        // 旧版：halve = true → 减征 50%
+        let c = legacy(
+            "[surcharge]\nbase = \"vat\"\nhalve = true\n[[surcharge.items]]\nname = \"附加税\"\nrate = \"0.03\"\n",
+        );
+        assert!(c.surcharge.relief_enabled);
+        assert_eq!(c.surcharge.relief_rate, Decimal::new(5, 1));
+        assert_eq!(c.effective_surcharge_rates(), vec![Decimal::new(15, 3)]);
+    }
+
+    #[test]
+    fn relief_rate_validated() {
+        let mut cfg = Config::default();
+        cfg.surcharge.relief_rate = Decimal::new(11, 1);
         assert!(cfg.validate().is_err());
     }
 

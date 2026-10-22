@@ -1,4 +1,4 @@
-//! 设置窗口：逐项编辑口径与外观，带校验、单项/整体恢复默认、保存/取消。
+//! 设置窗口：逐项编辑计算参数与外观，带校验、单项/整体恢复默认、保存/取消。
 
 use super::widgets::{badge, primary_button, secondary_button, small};
 use crate::icons;
@@ -208,6 +208,7 @@ pub fn window(ctx: &egui::Context, st: &mut AppState) {
                             .auto_shrink([false, false])
                             .show(ui, |ui| match d.section {
                                 Section::Vat => vat_section(ui, d, &errors),
+                                Section::Surcharge => surcharge_section(ui, d, &errors),
                                 Section::Iit => iit_section(ui, d, &errors),
                                 Section::Rounding => rounding_section(ui, d, &errors),
                                 Section::Appearance => {
@@ -226,7 +227,7 @@ pub fn window(ctx: &egui::Context, st: &mut AppState) {
             ui.separator();
             ui.horizontal(|ui| {
                 if secondary_button(ui, &format!("{} 全部恢复默认", icons::RESET))
-                    .on_hover_text("所有口径恢复为内置默认，主题恢复为跟随系统（保存后生效）")
+                    .on_hover_text("全部计算参数恢复为内置默认，主题恢复为跟随系统（保存后生效）")
                     .clicked()
                 {
                     d.reset_all();
@@ -267,7 +268,8 @@ fn section_errors(errors: &Errors, s: Section) -> usize {
     errors
         .keys()
         .filter(|k| match s {
-            Section::Vat => k.starts_with("vat.") || k.starts_with("surcharge."),
+            Section::Vat => k.starts_with("vat."),
+            Section::Surcharge => k.starts_with("surcharge."),
             Section::Iit => k.starts_with("iit."),
             Section::Rounding => k.starts_with("rounding.") || k.starts_with("reverse."),
             Section::Appearance => false,
@@ -281,7 +283,7 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     if row(
         ui,
         "增值税征收率",
-        "增值税 = round(不含税收入 × 征收率)",
+        "当前按 1% 优惠征收率（小规模纳税人 3% 征收率减按 1%，财政部 税务总局公告2026年第10号）；可改为 3% 等",
         Tag::Confirmed,
         !same_value(&d.vat_rate, &def.vat_rate),
         errors.get(key::VAT_RATE),
@@ -300,8 +302,8 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     }
     if row(
         ui,
-        "启用征收门槛",
-        "业务口径：低于门槛不征增值税和附加税（不是法定起征点；个税不受影响）",
+        "启用增值税起征点",
+        "未达到起征点时，不征收增值税及附加税费；个人所得税不受影响",
         Tag::Confirmed,
         d.threshold_enabled != def.threshold_enabled,
         None,
@@ -314,8 +316,8 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     let en = d.threshold_enabled;
     if row(
         ui,
-        "征收门槛（不含税收入）",
-        "按不含税收入判断，不用总成本",
+        "起征点",
+        "按不含增值税收入判断。按次纳税的起征点为每次（日）销售额 1000 元（财政部 税务总局公告2026年第10号）",
         Tag::Confirmed,
         !same_value(&d.threshold, &def.threshold),
         errors.get(key::THRESHOLD),
@@ -334,8 +336,8 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     }
     if row(
         ui,
-        "恰好等于门槛时",
-        "勾选：≥ 门槛征收（含本数）；不勾选：> 门槛才征收",
+        "恰好等于起征点时",
+        "勾选：达到起征点即征收（含本数）；不勾选：超过起征点才征收",
         Tag::Confirmed,
         d.levy_at_threshold != def.levy_at_threshold,
         None,
@@ -345,11 +347,20 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     ) {
         d.levy_at_threshold = def.levy_at_threshold;
     }
-    group_title(ui, "附加税");
+}
+
+fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
+    let def = d.defaults();
+    group_title(ui, "增值税附加税费");
+    small(
+        ui,
+        "各项目以计税依据乘以费率，分别按分舍入，合计为增值税附加税费。未启用的项目不参与计算。",
+    );
+    ui.add_space(theme::SP1);
     if row(
         ui,
         "计税依据",
-        "",
+        "依法以实际缴纳的增值税税额为计税依据",
         Tag::Confirmed,
         d.surcharge_base != def.surcharge_base,
         None,
@@ -368,107 +379,159 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     ) {
         d.surcharge_base = def.surcharge_base;
     }
-    if row(
-        ui,
-        "减半征收",
-        "对所有附加税目减半",
-        Tag::Confirmed,
-        d.halve != def.halve,
-        None,
-        |ui, _| {
-            ui.checkbox(&mut d.halve, "减半");
-        },
-    ) {
-        d.halve = def.halve;
-    }
-    // 税目列表
     let p = palette(ui);
-    let items_label = ui
-        .horizontal(|ui| {
-            let id = ui
-                .allocate_ui_with_layout(
-                    Vec2::new(LABEL_W, 26.0),
-                    Layout::left_to_right(Align::Center),
-                    |ui| {
-                        ui.set_width(LABEL_W);
-                        ui.label(RichText::new("附加税税目").color(p.text)).id
-                    },
-                )
-                .inner;
-            small(
-                ui,
-                "默认一个合计税目 3%；也可拆成城建税、教育费附加、地方教育附加",
-            );
-            id
-        })
-        .inner;
     let mut remove = None;
-    let n_items = d.items.len();
-    for (i, it) in d.items.iter_mut().enumerate() {
+    for i in 0..d.items.len() {
         let k = format!("{}.{i}", key::ITEMS);
-        ui.horizontal(|ui| {
-            ui.add_space(LABEL_W + 8.0);
-            ui.add(
-                TextEdit::singleline(&mut it.name)
-                    .desired_width(140.0)
-                    .hint_text("税目名称"),
-            )
-            .labelled_by(items_label);
-            ui.add(
-                TextEdit::singleline(&mut it.rate)
-                    .font(theme::mono(14.0))
-                    .desired_width(70.0)
-                    .background_color(if errors.contains_key(&k) {
-                        p.error_soft
-                    } else {
-                        p.surface
-                    }),
-            )
-            .labelled_by(items_label);
-            ui.label(RichText::new("%").color(p.text_weak));
-            if n_items > 0
-                && ui
-                    .small_button(icons::ERROR)
-                    .on_hover_text("删除该税目")
-                    .clicked()
-            {
-                remove = Some(i);
+        let standard = def
+            .items
+            .get(i)
+            .filter(|x| x.name == d.items[i].name)
+            .cloned();
+        let has_err = errors.contains_key(&k);
+        let it = &mut d.items[i];
+        match standard {
+            Some(std_item) => {
+                let help = match std_item.name.as_str() {
+                    labor_fee_core::URBAN_CONSTRUCTION_TAX => {
+                        "法定税率：纳税人所在地在市区 7%、县城或镇 5%、其他地区 1%（城市维护建设税法第四条）"
+                    }
+                    labor_fee_core::EDUCATION_SURCHARGE => {
+                        "费率 3%（《征收教育费附加的暂行规定》第三条）"
+                    }
+                    labor_fee_core::LOCAL_EDUCATION_SURCHARGE => {
+                        "征收标准 2%（财综〔2010〕98号）"
+                    }
+                    _ => "",
+                };
+                let modified =
+                    it.enabled != std_item.enabled || !same_value(&it.rate, &std_item.rate);
+                let name = it.name.clone();
+                if row(
+                    ui,
+                    &name,
+                    help,
+                    Tag::Confirmed,
+                    modified,
+                    errors.get(&k),
+                    |ui, l| {
+                        ui.checkbox(&mut it.enabled, "计征").labelled_by(l);
+                        ui.add_space(theme::SP1);
+                        let en = it.enabled;
+                        ui.add_enabled(
+                            en,
+                            TextEdit::singleline(&mut it.rate)
+                                .font(theme::mono(14.0))
+                                .desired_width(CTRL_W - 110.0)
+                                .background_color(if has_err { p.error_soft } else { p.surface }),
+                        )
+                        .labelled_by(l);
+                        ui.label(RichText::new("%").color(p.text_weak));
+                    },
+                ) {
+                    *it = std_item;
+                }
             }
-            if let Some(e) = errors.get(&k) {
-                ui.label(RichText::new(e).size(theme::FS_SMALL).color(p.error));
+            None => {
+                ui.horizontal(|ui| {
+                    let id = ui
+                        .allocate_ui_with_layout(
+                            Vec2::new(LABEL_W, 30.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.set_width(LABEL_W);
+                                ui.add(
+                                    TextEdit::singleline(&mut it.name)
+                                        .desired_width(LABEL_W - 12.0)
+                                        .hint_text("项目名称"),
+                                )
+                                .id
+                            },
+                        )
+                        .inner;
+                    ui.checkbox(&mut it.enabled, "计征").labelled_by(id);
+                    ui.add_enabled(
+                        it.enabled,
+                        TextEdit::singleline(&mut it.rate)
+                            .font(theme::mono(14.0))
+                            .desired_width(CTRL_W - 110.0)
+                            .background_color(if has_err { p.error_soft } else { p.surface }),
+                    )
+                    .labelled_by(id);
+                    ui.label(RichText::new("%").color(p.text_weak));
+                    tag_badge(ui, Tag::Modified);
+                    if ui
+                        .small_button(icons::ERROR)
+                        .on_hover_text("删除该项目")
+                        .clicked()
+                    {
+                        remove = Some(i);
+                    }
+                });
+                if let Some(e) = errors.get(&k) {
+                    ui.horizontal(|ui| {
+                        ui.add_space(LABEL_W + 8.0);
+                        ui.label(RichText::new(e).size(theme::FS_SMALL).color(p.error));
+                    });
+                }
             }
-        });
+        }
     }
     if let Some(i) = remove {
         d.items.remove(i);
     }
     ui.horizontal(|ui| {
         ui.add_space(LABEL_W + 8.0);
-        if ui.button("＋ 添加税目").clicked() {
+        if ui.button("＋ 添加其他项目").clicked() {
             d.items.push(ItemDraft {
-                name: "新税目".into(),
+                name: "其他附加".into(),
                 rate: "0".into(),
+                enabled: true,
             });
         }
-        let modified = d.items != def.items;
-        tag_badge(
-            ui,
-            if modified {
-                Tag::Modified
-            } else {
-                Tag::Confirmed
-            },
-        );
-        if modified && ui.small_button(format!("{} 默认", icons::RESET)).clicked() {
+        if d.items != def.items
+            && ui
+                .small_button(format!("{} 恢复默认项目", icons::RESET))
+                .clicked()
+        {
             d.items = def.items.clone();
         }
     });
+    ui.add_space(theme::SP1);
+    let relief_modified =
+        d.relief_enabled != def.relief_enabled || !same_value(&d.relief_rate, &def.relief_rate);
+    let relief_err = errors.contains_key(key::RELIEF);
+    if row(
+        ui,
+        "减征",
+        "如“六税两费”减半征收（财政部 税务总局公告2023年第12号，适用于符合条件的纳税人）。是否适用请自行判断；此项为可配置假设",
+        Tag::Pending,
+        relief_modified,
+        errors.get(key::RELIEF),
+        |ui, l| {
+            ui.checkbox(&mut d.relief_enabled, "启用").labelled_by(l);
+            ui.add_space(theme::SP1);
+            ui.label(RichText::new("减征比例").color(p.text_weak));
+            ui.add_enabled(
+                d.relief_enabled,
+                TextEdit::singleline(&mut d.relief_rate)
+                    .font(theme::mono(14.0))
+                    .desired_width(56.0)
+                    .background_color(if relief_err { p.error_soft } else { p.surface }),
+            )
+            .labelled_by(l);
+            ui.label(RichText::new("%").color(p.text_weak));
+        },
+    ) {
+        d.relief_enabled = def.relief_enabled;
+        d.relief_rate = def.relief_rate.clone();
+    }
 }
 
 fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     let def = d.defaults();
     let p = palette(ui);
-    group_title(ui, "减除费用（国家税务总局公告 2018 年第 61 号第八条）");
+    group_title(ui, "减除费用（国家税务总局公告2018年第61号第八条）");
     if row(
         ui,
         "定额减除适用上限",
@@ -529,7 +592,10 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     ) {
         d.pct_deduction = def.pct_deduction.clone();
     }
-    group_title(ui, "预扣率表（居民个人劳务报酬，表二）");
+    group_title(
+        ui,
+        "预扣率表（个人所得税预扣率表二，居民个人劳务报酬所得适用）",
+    );
     ui.horizontal(|ui| {
         let modified = d.brackets != def.brackets;
         tag_badge(
@@ -553,13 +619,20 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         .num_columns(6)
         .spacing([10.0, 6.0])
         .show(ui, |ui| {
-            let heads: Vec<Id> = ["档次", "应纳税所得额上限", "", "预扣率", "速算扣除数", ""]
-                .iter()
-                .map(|h| {
-                    ui.label(RichText::new(*h).size(theme::FS_SMALL).color(p.text_weak))
-                        .id
-                })
-                .collect();
+            let heads: Vec<Id> = [
+                "档次",
+                "预扣预缴应纳税所得额上限",
+                "",
+                "预扣率",
+                "速算扣除数",
+                "",
+            ]
+            .iter()
+            .map(|h| {
+                ui.label(RichText::new(*h).size(theme::FS_SMALL).color(p.text_weak))
+                    .id
+            })
+            .collect();
             ui.end_row();
             let n = d.brackets.len();
             let mut remove = None;
@@ -637,7 +710,7 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     ui.horizontal(|ui| {
         ui.label(RichText::new("非居民个人").color(p.text));
         tag_badge(ui, Tag::Pending);
-        small(ui, "仅实现居民个人预扣预缴（预扣率表二）；非居民个人适用税率表三，未实现。是否有非居民个人请确认。");
+        small(ui, "仅适用于居民个人劳务报酬所得预扣预缴（预扣率表二）；非居民个人适用个人所得税税率表三，本工具未提供。");
     });
 }
 
@@ -647,7 +720,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     if row(
         ui,
         "金额小数位",
-        "2 表示到分；每一步金额（增值税、附加税、20% 减除费用、个税）单独舍入",
+        "2 表示到分；增值税税额、各项附加税费、20% 减除费用、应预扣预缴税额分别舍入",
         Tag::Pending,
         d.scale.trim() != def.scale,
         errors.get(key::SCALE),
@@ -667,7 +740,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     if row(
         ui,
         "舍入方式",
-        "是否与开票、申报系统一致待确认",
+        "请确认与开票、申报系统一致",
         Tag::Pending,
         d.mode != def.mode,
         None,
@@ -693,8 +766,8 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     }
     if row(
         ui,
-        "附加税舍入时点",
-        "多个税目时生效",
+        "附加税费舍入方式",
+        "启用多个项目时生效；默认各项目分别按分舍入",
         Tag::Pending,
         d.surcharge_rounding != def.surcharge_rounding,
         None,
@@ -717,11 +790,11 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     ) {
         d.surcharge_rounding = def.surcharge_rounding;
     }
-    group_title(ui, "反算");
+    group_title(ui, "按税后实发金额测算");
     if row(
         ui,
         "多解时取值",
-        "多个不含税收入得到同一到手金额时",
+        "多个不含增值税收入得到同一税后实发金额时",
         Tag::Confirmed,
         d.prefer != def.prefer,
         None,
@@ -743,7 +816,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     if row(
         ui,
         "逐分校准窗口",
-        "二分定位后前后各逐分扫描的范围",
+        "二分定位后向前、向后逐分校准的范围",
         Tag::Implementation,
         d.search_window.trim() != def.search_window,
         errors.get(key::SEARCH_WINDOW),
@@ -762,8 +835,8 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     }
     if row(
         ui,
-        "反算搜索上限",
-        "不含税收入的最大值",
+        "测算搜索上限",
+        "不含增值税收入的最大值",
         Tag::Implementation,
         !same_value(&d.max_net_income, &def.max_net_income),
         errors.get(key::MAX_NET),
@@ -815,7 +888,7 @@ fn appearance_section(ui: &mut Ui, d: &mut SettingsDraft, store_dir: Option<&str
     match store_dir {
         Some(dir) => {
             ui.label(RichText::new(dir).font(theme::mono(13.0)).color(p.text));
-            small(ui, "主题保存在 preferences.toml，口径保存在 rules.toml（与内置默认相同时不保存）。由程序自动维护，无需手工编辑。");
+            small(ui, "主题保存在 preferences.toml，计算参数保存在 rules.toml（与内置默认相同时不保存）。由程序自动维护，无需手工编辑。");
         }
         None => {
             small(ui, "当前环境没有可用的配置目录，设置只在本次运行有效。");

@@ -39,9 +39,9 @@ impl ReverseOutcome {
     /// 中文状态说明。
     pub fn status_text(&self) -> String {
         if self.exact {
-            "精确".to_string()
+            "精确匹配".to_string()
         } else {
-            format!("不可精确达到，差额 {}", self.diff)
+            format!("无法精确匹配，差额 {}", self.diff)
         }
     }
 }

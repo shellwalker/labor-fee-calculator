@@ -117,7 +117,7 @@ impl SettingsStore {
             Err(e) => Err(format!("读取已保存的设置失败：{e}")),
             Ok(t) => Config::from_toml_str(&t).map(Some).map_err(|e| {
                 format!(
-                    "已保存的设置无效（{}），已改用内置默认口径：{e}",
+                    "已保存的设置无效（{}），已改用内置默认参数：{e}",
                     p.display()
                 )
             }),
@@ -130,7 +130,7 @@ impl SettingsStore {
         write_atomic(&self.prefs_path(), &text)
     }
 
-    /// 保存口径；等于内置默认时删除文件（以后内置默认更新也能自动跟上）。
+    /// 保存计算参数；等于内置默认时删除文件（以后内置默认更新也能自动跟上）。
     pub fn save_rules(&self, cfg: &Config) -> Result<(), String> {
         let p = self.rules_path();
         if *cfg == Config::default() {
@@ -143,7 +143,7 @@ impl SettingsStore {
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("创建设置目录失败：{e}"))?;
         let text = format!(
-            "# 劳务报酬计算工具的口径设置（由程序“设置”窗口生成，请在程序内修改）\n{}",
+            "# 劳务报酬计算工具的计算参数（由程序“设置”窗口生成，请在程序内修改）\n{}",
             cfg.to_toml_string()
         );
         write_atomic(&p, &text)
@@ -186,11 +186,11 @@ impl Tag {
 
     pub fn hint(self) -> &'static str {
         match self {
-            Tag::Confirmed => "业务方已确认的口径",
-            Tag::Verified => "已按国家税务总局公告 2018 年第 61 号核实",
-            Tag::Pending => "尚未确认，正式结算前请财务确认",
-            Tag::Implementation => "计算实现参数，不影响税务口径",
-            Tag::Modified => "已改为与内置默认不同的值，未经确认",
+            Tag::Confirmed => "用户已确认的参数",
+            Tag::Verified => "已对照公开政策文件核实",
+            Tag::Pending => "可配置假设，尚未确认；正式结算前请财务人员确认",
+            Tag::Implementation => "计算实现参数，不涉及税收政策",
+            Tag::Modified => "已改为与内置默认不同的值，尚未确认",
         }
     }
 }
@@ -202,13 +202,15 @@ impl Tag {
 pub enum Section {
     Appearance,
     Vat,
+    Surcharge,
     Iit,
     Rounding,
 }
 
 impl Section {
-    pub const ALL: [Section; 4] = [
+    pub const ALL: [Section; 5] = [
         Section::Vat,
+        Section::Surcharge,
         Section::Iit,
         Section::Rounding,
         Section::Appearance,
@@ -217,9 +219,10 @@ impl Section {
     pub fn title(self) -> &'static str {
         match self {
             Section::Appearance => "外观",
-            Section::Vat => "增值税与附加税",
-            Section::Iit => "个税（劳务报酬）",
-            Section::Rounding => "舍入与反算",
+            Section::Vat => "增值税",
+            Section::Surcharge => "附加税费",
+            Section::Iit => "个人所得税",
+            Section::Rounding => "舍入与测算",
         }
     }
 }
@@ -227,8 +230,10 @@ impl Section {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ItemDraft {
     pub name: String,
-    /// 税率（百分数，如 "3"）。
+    /// 费率（百分数，如 "3"）。
     pub rate: String,
+    /// 是否计征。
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,7 +255,9 @@ pub struct SettingsDraft {
     pub threshold: String,
     pub levy_at_threshold: bool,
     pub surcharge_base: SurchargeBase,
-    pub halve: bool,
+    pub relief_enabled: bool,
+    /// 减征比例（百分数，如 "50"）。
+    pub relief_rate: String,
     pub items: Vec<ItemDraft>,
     pub fixed_limit: String,
     pub fixed_deduction: String,
@@ -282,6 +289,7 @@ pub mod key {
     pub const FIXED_DEDUCTION: &str = "iit.fixed_deduction";
     pub const PCT_DEDUCTION: &str = "iit.percent_deduction_rate";
     pub const ITEMS: &str = "surcharge.items";
+    pub const RELIEF: &str = "surcharge.relief_rate";
     pub const BRACKETS: &str = "iit.brackets";
     pub const SCALE: &str = "rounding.scale";
     pub const SEARCH_WINDOW: &str = "reverse.search_window";
@@ -310,7 +318,8 @@ impl SettingsDraft {
             threshold: num_text(cfg.vat.threshold),
             levy_at_threshold: cfg.vat.levy_at_threshold,
             surcharge_base: cfg.surcharge.base,
-            halve: cfg.surcharge.halve,
+            relief_enabled: cfg.surcharge.relief_enabled,
+            relief_rate: pct_text(cfg.surcharge.relief_rate),
             items: cfg
                 .surcharge
                 .items
@@ -318,6 +327,7 @@ impl SettingsDraft {
                 .map(|i| ItemDraft {
                     name: i.name.clone(),
                     rate: pct_text(i.rate),
+                    enabled: i.enabled,
                 })
                 .collect(),
             fixed_limit: num_text(cfg.iit.fixed_deduction_limit),
@@ -377,22 +387,24 @@ impl SettingsDraft {
         }
         cfg.vat.levy_at_threshold = self.levy_at_threshold;
         cfg.surcharge.base = self.surcharge_base;
-        cfg.surcharge.halve = self.halve;
+        cfg.surcharge.relief_enabled = self.relief_enabled;
+        match rate(&self.relief_rate) {
+            Some(r) if r >= Decimal::ZERO && r <= Decimal::ONE => cfg.surcharge.relief_rate = r,
+            _ => err(key::RELIEF, "减征比例请输入 0～100 之间的百分数，如 50"),
+        }
         cfg.surcharge.items.clear();
         for (i, it) in self.items.iter().enumerate() {
             let k = format!("{}.{i}", key::ITEMS);
             let name = it.name.trim();
             if name.is_empty() {
-                err(&k, "税目名称不能为空");
+                err(&k, "项目名称不得为空");
             }
             match rate(&it.rate) {
-                Some(r) if r >= Decimal::ZERO && r < Decimal::ONE => {
-                    cfg.surcharge.items.push(SurchargeItem {
-                        name: name.to_string(),
-                        rate: r,
-                    })
-                }
-                _ => err(&k, "税率请输入 0～100 之间的百分数"),
+                Some(r) if r >= Decimal::ZERO && r < Decimal::ONE => cfg
+                    .surcharge
+                    .items
+                    .push(SurchargeItem::new(name, r, it.enabled)),
+                _ => err(&k, "费率请输入 0～100 之间的百分数"),
             }
         }
         match parse_dec(&self.fixed_limit) {
@@ -478,7 +490,7 @@ impl SettingsDraft {
         Ok(cfg)
     }
 
-    /// 与内置默认不同的口径项数（不含主题）。
+    /// 与内置默认不同的参数项数（不含主题）。
     pub fn modified_count(&self) -> usize {
         let d = self.defaults();
         let same = |a: &str, b: &str| parse_dec(a).is_some() && parse_dec(a) == parse_dec(b);
@@ -487,7 +499,7 @@ impl SettingsDraft {
             self.threshold_enabled == d.threshold_enabled && same(&self.threshold, &d.threshold),
             self.levy_at_threshold == d.levy_at_threshold,
             self.surcharge_base == d.surcharge_base,
-            self.halve == d.halve,
+            self.relief_enabled == d.relief_enabled && same(&self.relief_rate, &d.relief_rate),
             self.items == d.items,
             same(&self.fixed_limit, &d.fixed_limit),
             same(&self.fixed_deduction, &d.fixed_deduction),
@@ -510,7 +522,7 @@ pub fn same_value(a: &str, b: &str) -> bool {
     a.trim() == b.trim() || (parse_dec(a).is_some() && parse_dec(a) == parse_dec(b))
 }
 
-/// 口径与内置默认不同的项数（状态栏用）。
+/// 计算参数与内置默认不同的项数（状态栏用）。
 pub fn modified_items(cfg: &Config) -> usize {
     SettingsDraft::from_config(cfg, ThemeChoice::default()).modified_count()
 }
@@ -526,21 +538,21 @@ pub fn rounding_mode_text(m: RoundingMode) -> &'static str {
 
 pub fn surcharge_rounding_text(m: SurchargeRounding) -> &'static str {
     match m {
-        SurchargeRounding::PerItem => "各税目分别舍入后相加",
+        SurchargeRounding::PerItem => "各项目分别按分舍入后相加",
         SurchargeRounding::Total => "合计后一次舍入",
     }
 }
 
 pub fn surcharge_base_text(b: SurchargeBase) -> &'static str {
     match b {
-        SurchargeBase::Vat => "增值税额",
-        SurchargeBase::NetRevenue => "不含税收入",
+        SurchargeBase::Vat => "实际缴纳的增值税税额",
+        SurchargeBase::NetRevenue => "不含增值税收入",
     }
 }
 
 pub fn prefer_text(p: Prefer) -> &'static str {
     match p {
-        Prefer::MinCost => "取最小不含税收入（最小总成本）",
-        Prefer::MaxCost => "取最大不含税收入",
+        Prefer::MinCost => "取最小不含增值税收入（企业总支出最小）",
+        Prefer::MaxCost => "取最大不含增值税收入",
     }
 }
