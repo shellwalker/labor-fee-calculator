@@ -98,6 +98,7 @@ pub fn help_window(
     st: &mut AppState,
     settings_shortcut: &str,
     open_shortcut: &str,
+    close_shortcut: &str,
 ) {
     if !st.show_help {
         return;
@@ -116,7 +117,7 @@ pub fn help_window(
             (icons::REVERSE, "实发测算", "按税后实发金额测算不含增值税收入；多解时取最小值，复核结果与输入一致到分。"),
             (icons::COST, "支出测算", "按企业总支出测算不含增值税收入；起征点附近（默认 1000.00～1010.29）等不可达金额无对应收入，将说明原因并给出两侧最近的有效金额。"),
             (icons::BATCH, "批量测算", "拖放或选择 xlsx / xls / ods / csv 文件，按首行标题识别输入列（兼容旧列名“到手金额”等），执行后导出带结果列的新文件。"),
-            (icons::SETTINGS, "设置", "逐项修改计算参数（征收率、起征点、附加税费项目、减除费用、预扣率表、舍入等）和主题；保存后自动生效。"),
+            (icons::SETTINGS, "设置", "按“计税口径 / 计算规则 / 通用”分组逐项修改计算参数和外观；每项修改后点击 ✔（或按 Enter）生效并自动保存，点击 ✖（或按 Esc）放弃本项修改。"),
         ];
         card(ui, |ui| {
             egui::Grid::new("help_grid").num_columns(2).spacing([12.0, 10.0]).show(ui, |ui| {
@@ -129,7 +130,7 @@ pub fn help_window(
         });
         ui.add_space(theme::SP2);
         ui.label(RichText::new("快捷键").strong().color(p.text));
-        small(ui, format!("设置 {settings_shortcut}　·　打开批量文件 {open_shortcut}　·　计算：在输入框中按回车键"));
+        small(ui, format!("设置 {settings_shortcut}　·　打开批量文件 {open_shortcut}　·　关闭窗口 {close_shortcut}（关闭对话框；无对话框时最小化）　·　计算：在输入框中按回车键"));
         ui.add_space(theme::SP3);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if super::widgets::primary_button(ui, "  知道了  ", true).clicked() {

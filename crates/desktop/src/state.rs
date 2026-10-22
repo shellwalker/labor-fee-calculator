@@ -1,6 +1,8 @@
 //! 桌面程序的状态与操作逻辑（与界面绘制分离，便于测试）。所有计算都调用 labor-fee-core / labor-fee-batch。
 
-use crate::settings::{Prefs, SettingsDraft, SettingsStore, ThemeChoice};
+use crate::settings::{
+    item_index, key, Dialog, Prefs, SettingsDraft, SettingsStore, SettingsWindow, ThemeChoice,
+};
 use labor_fee_batch::{InputKind, Output};
 use labor_fee_core::{
     forward, from_total_cost, Breakdown, CalcError, Config, CostGap, CostGapReason, Decimal,
@@ -74,7 +76,22 @@ pub enum Action {
     Settings,
     Help,
     About,
+    /// 关闭窗口（Cmd/Ctrl+W）：先关闭最上层的子窗口，没有子窗口时最小化主窗口。
+    CloseWindow,
+    /// 最小化主窗口（macOS Cmd+M）。
+    Minimize,
     Quit,
+}
+
+/// “关闭窗口”作用的对象。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseTarget {
+    /// 关闭设置窗口（有未生效的修改时弹出放弃确认；确认框已打开时返回设置窗口）。
+    Settings,
+    About,
+    Help,
+    /// 没有子窗口：最小化主窗口（不退出程序）。
+    MainWindow,
 }
 
 /// 状态行的级别（决定颜色）。
@@ -256,7 +273,7 @@ pub struct AppState {
     /// 设置的保存位置；None 表示不持久化（测试或取不到配置目录）。
     pub store: Option<SettingsStore>,
     /// 打开中的设置窗口。
-    pub settings: Option<SettingsDraft>,
+    pub settings: Option<SettingsWindow>,
     pub show_about: bool,
     pub show_help: bool,
     /// 是否展开试算规则面板。
@@ -396,39 +413,79 @@ impl AppState {
     /// 打开设置窗口（以当前口径为初值）。
     pub fn open_settings(&mut self) {
         if self.settings.is_none() {
-            self.settings = Some(SettingsDraft::from_config(&self.cfg, self.prefs.theme));
+            self.settings = Some(SettingsWindow::new(&self.cfg, self.prefs.theme));
         }
     }
 
-    /// 取消设置：丢弃修改。
-    pub fn cancel_settings(&mut self) {
+    /// 请求关闭设置窗口：有未生效的修改时先弹出确认，返回是否已关闭。
+    pub fn request_close_settings(&mut self) -> bool {
+        match &mut self.settings {
+            None => true,
+            Some(w) if w.pending_count() > 0 => {
+                w.dialog = Some(Dialog::DiscardOnClose);
+                false
+            }
+            Some(_) => {
+                self.settings = None;
+                true
+            }
+        }
+    }
+
+    /// “关闭窗口”（Cmd/Ctrl+W）此刻作用的对象。
+    pub fn close_target(&self) -> CloseTarget {
+        if self.settings.is_some() {
+            CloseTarget::Settings
+        } else if self.show_about {
+            CloseTarget::About
+        } else if self.show_help {
+            CloseTarget::Help
+        } else {
+            CloseTarget::MainWindow
+        }
+    }
+
+    /// 执行“关闭窗口”：关闭最上层的子窗口并返回 true；没有子窗口时返回 false（由界面最小化主窗口）。
+    pub fn close_front_window(&mut self) -> bool {
+        match self.close_target() {
+            CloseTarget::Settings => {
+                match self.settings.as_mut().and_then(|w| w.dialog.take()) {
+                    // 确认框已打开：关闭确认框，回到设置窗口
+                    Some(_) => {}
+                    None => {
+                        self.request_close_settings();
+                    }
+                }
+                true
+            }
+            CloseTarget::About => {
+                self.show_about = false;
+                true
+            }
+            CloseTarget::Help => {
+                self.show_help = false;
+                true
+            }
+            CloseTarget::MainWindow => false,
+        }
+    }
+
+    /// 关闭设置窗口并放弃未生效的修改（已生效的设置不受影响）。
+    pub fn close_settings(&mut self) {
         self.settings = None;
     }
 
-    /// 保存设置：校验通过则应用并写入设置目录，关闭窗口，返回 true；否则保留窗口并给出错误。
-    pub fn save_settings(&mut self) -> bool {
-        let Some(draft) = &mut self.settings else {
-            return false;
-        };
-        let cfg = match draft.build() {
-            Ok(c) => c,
-            Err(errs) => {
-                draft.message = Some(format!(
-                    "有 {} 处输入需要修改，请检查标红的项目",
-                    errs.len()
-                ));
-                return false;
-            }
-        };
+    /// 应用一份完整的设置草稿：校验、写入 rules.toml / preferences.toml，并让主界面立即采用。
+    fn apply_draft(&mut self, draft: &SettingsDraft) -> Result<(), String> {
+        let cfg = draft.build().map_err(|errs| {
+            errs.into_values()
+                .next()
+                .unwrap_or_else(|| "设置无效".into())
+        })?;
         let theme = draft.theme;
         if let Some(store) = &self.store {
-            if let Err(e) = store
-                .save_rules(&cfg)
-                .and_then(|_| store.save_prefs(&Prefs { theme }))
-            {
-                draft.message = Some(e);
-                return false;
-            }
+            store.save_rules(&cfg)?;
+            store.save_prefs(&Prefs { theme })?;
         }
         let source = if cfg == Config::default() {
             SOURCE_DEFAULT
@@ -436,16 +493,152 @@ impl AppState {
             SOURCE_SAVED
         };
         if cfg != self.cfg || self.source != source {
-            if let Err(e) = self.set_config(cfg, source) {
-                if let Some(d) = &mut self.settings {
-                    d.message = Some(e.to_string());
-                }
-                return false;
-            }
+            self.set_config(cfg, source).map_err(|e| e.to_string())?;
         }
         self.prefs.theme = theme;
-        self.settings = None;
         self.notice = None;
+        Ok(())
+    }
+
+    /// 以 `candidate` 为新的生效值并同步设置行 `k`；失败时在窗口内提示。
+    fn commit(&mut self, candidate: SettingsDraft, k: &str) -> bool {
+        match self.apply_draft(&candidate) {
+            Ok(()) => {
+                let applied = SettingsDraft::from_config(&self.cfg, self.prefs.theme);
+                if let Some(w) = &mut self.settings {
+                    w.set_applied(applied, k);
+                    w.message = None;
+                }
+                true
+            }
+            Err(e) => {
+                if let Some(w) = &mut self.settings {
+                    w.message = Some(e);
+                }
+                false
+            }
+        }
+    }
+
+    /// 确认设置行 `k`（√ / Enter）：校验通过则立即生效并保存，返回 true。
+    pub fn confirm_setting(&mut self, k: &str) -> bool {
+        let Some(w) = &self.settings else {
+            return false;
+        };
+        if !w.is_pending(k) {
+            return true;
+        }
+        if let Some(e) = w.row_error(k) {
+            if let Some(w) = &mut self.settings {
+                w.message = Some(e);
+            }
+            return false;
+        }
+        match w.candidate(k) {
+            Ok(c) => self.commit(c, k),
+            Err(e) => {
+                if let Some(w) = &mut self.settings {
+                    w.message = Some(e);
+                }
+                false
+            }
+        }
+    }
+
+    /// 放弃设置行 `k` 的修改（× / Esc）。
+    pub fn discard_setting(&mut self, k: &str) {
+        if let Some(w) = &mut self.settings {
+            w.discard(k);
+            w.message = None;
+        }
+    }
+
+    /// 单项恢复默认：内置默认值总是有效，直接生效并保存（同时放弃本项未生效的输入）。
+    pub fn reset_setting(&mut self, k: &str) -> bool {
+        let Some(w) = &self.settings else {
+            return false;
+        };
+        let def = w.applied.defaults();
+        let mut c = w.applied.clone();
+        if let Some(i) = item_index(k) {
+            match w.applied.standard_item(i, &def) {
+                Some(it) => c.items[i] = it.clone(),
+                None => return false,
+            }
+        } else {
+            let _ = c.copy_row(&def, k);
+        }
+        let ok = self.commit(c, k);
+        if ok && k == key::ITEMS_REMOVED {
+            if let Some(w) = &mut self.settings {
+                w.edit.items = w.applied.items.clone();
+            }
+        }
+        ok
+    }
+
+    /// 删除附加税费项目：尚未生效的新增项目直接移除；已生效的自定义项目删除后立即生效。
+    pub fn delete_item(&mut self, i: usize) -> bool {
+        let Some(w) = &mut self.settings else {
+            return false;
+        };
+        if i >= w.applied.items.len() {
+            if i < w.edit.items.len() {
+                w.edit.items.remove(i);
+            }
+            return true;
+        }
+        let mut c = w.applied.clone();
+        c.items.remove(i);
+        let ok = self.apply_draft(&c);
+        match ok {
+            Ok(()) => {
+                let applied = SettingsDraft::from_config(&self.cfg, self.prefs.theme);
+                if let Some(w) = &mut self.settings {
+                    w.edit.items.remove(i);
+                    w.applied = applied;
+                    w.applied.section = w.edit.section;
+                    w.message = None;
+                }
+                true
+            }
+            Err(e) => {
+                if let Some(w) = &mut self.settings {
+                    w.message = Some(e);
+                }
+                false
+            }
+        }
+    }
+
+    /// 全部恢复默认：计算参数与外观偏好恢复为内置默认并立即生效，
+    /// rules.toml 删除（即内置默认）、preferences.toml 写为默认。未生效的输入一并放弃。
+    pub fn reset_all_settings(&mut self) -> bool {
+        let section = self.settings.as_ref().map(|w| w.edit.section);
+        let theme = ThemeChoice::default();
+        let saved = self.store.as_ref().map_or(Ok(()), |store| {
+            store
+                .save_rules(&Config::default())
+                .and_then(|_| store.save_prefs(&Prefs { theme }))
+        });
+        if let Err(e) = saved {
+            if let Some(w) = &mut self.settings {
+                w.message = Some(e);
+                w.dialog = None;
+            }
+            return false;
+        }
+        self.set_config(Config::default(), SOURCE_DEFAULT)
+            .expect("默认配置有效");
+        self.prefs.theme = theme;
+        self.notice = None;
+        if let Some(w) = &mut self.settings {
+            *w = SettingsWindow::new(&self.cfg, theme);
+            if let Some(s) = section {
+                w.edit.section = s;
+                w.applied.section = s;
+            }
+        }
         true
     }
 
@@ -459,9 +652,11 @@ impl AppState {
         }
     }
 
-    /// 当前应显示的主题（设置窗口打开时预览草稿中的选择）。
+    /// 当前应显示的主题（设置窗口打开时预览输入中的选择，确认后才保存）。
     pub fn effective_theme(&self) -> ThemeChoice {
-        self.settings.as_ref().map_or(self.prefs.theme, |d| d.theme)
+        self.settings
+            .as_ref()
+            .map_or(self.prefs.theme, |w| w.edit.theme)
     }
 
     /// 已打开的批量文件（菜单“打开批量文件…”、拖放）：切到批量页并填入路径。

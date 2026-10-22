@@ -144,6 +144,18 @@ pub fn primary_button(ui: &mut Ui, text: &str, enabled: bool) -> Response {
     )
 }
 
+/// 危险操作按钮（红色填充），用于“恢复默认”“放弃修改”等不可撤销的确认。
+pub fn danger_button(ui: &mut Ui, text: &str) -> Response {
+    let p = palette(ui);
+    ui.add(
+        egui::Button::new(RichText::new(text).color(Color32::WHITE).strong())
+            .fill(p.error)
+            .stroke(Stroke::NONE)
+            .corner_radius(CornerRadius::same(theme::RADIUS_CTRL))
+            .min_size(Vec2::new(0.0, 34.0)),
+    )
+}
+
 /// 次按钮（描边）。
 pub fn secondary_button(ui: &mut Ui, text: &str) -> Response {
     let p = palette(ui);

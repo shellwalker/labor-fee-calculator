@@ -1,5 +1,9 @@
 //! macOS 原生应用菜单（muda）：
-//! 应用菜单（关于… / 偏好设置… Cmd+, / 服务 / 隐藏 Cmd+H / 退出 Cmd+Q）、文件（打开批量文件… Cmd+O）、窗口、帮助。
+//! 应用菜单（关于… / 偏好设置… Cmd+, / 服务 / 隐藏 Cmd+H / 退出 Cmd+Q）、文件（打开批量文件… Cmd+O）、
+//! 窗口（最小化 Cmd+M / 关闭窗口 Cmd+W / 缩放 / 全屏）、帮助。
+//!
+//! “最小化”“关闭窗口”用自定义菜单项，由界面以 `ViewportCommand::Minimized(true)` 实现：
+//! 预置的 Close Window 会关闭主窗口并退出程序，不符合“先关对话框，否则最小化”的要求。
 //!
 //! 菜单事件经通道转给界面，并请求重绘。不提供“编辑”菜单：文本框的 Cmd+C/Cmd+V 由 egui 直接处理。
 
@@ -47,7 +51,9 @@ impl NativeMenu {
             "窗口",
             true,
             &[
-                &PredefinedMenuItem::minimize(None),
+                &item("minimize", "最小化", cmd(Code::KeyM)),
+                &item("close_window", "关闭窗口", cmd(Code::KeyW)),
+                &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::maximize(None),
                 &PredefinedMenuItem::separator(),
                 &PredefinedMenuItem::fullscreen(None),
@@ -68,6 +74,8 @@ impl NativeMenu {
                 "open" => Action::OpenBatchFile,
                 "help" => Action::Help,
                 "quit" => Action::Quit,
+                "minimize" => Action::Minimize,
+                "close_window" => Action::CloseWindow,
                 _ => return,
             };
             let _ = tx.send(a);

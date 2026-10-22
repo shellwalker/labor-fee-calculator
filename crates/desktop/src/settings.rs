@@ -197,33 +197,92 @@ impl Tag {
 
 // ---------------- 设置草稿（设置窗口的编辑状态） ----------------
 
-/// 设置窗口的分组。
+/// 设置窗口左侧导航的一级分组（标题，不可点击）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Group {
+    /// 计税口径：税种、税（费）率、起征点、减除费用、预扣率表等税收政策参数。
+    Tax,
+    /// 计算规则：舍入与测算求解等计算实现规则。
+    Calc,
+    /// 通用：外观偏好与设置存储。
+    General,
+}
+
+impl Group {
+    pub const ALL: [Group; 3] = [Group::Tax, Group::Calc, Group::General];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Tax => "计税口径",
+            Group::Calc => "计算规则",
+            Group::General => "通用",
+        }
+    }
+
+    pub fn sections(self) -> &'static [Section] {
+        match self {
+            Group::Tax => &[Section::Vat, Section::Surcharge, Section::Iit],
+            Group::Calc => &[Section::Rounding, Section::Solving],
+            Group::General => &[Section::Appearance, Section::Storage],
+        }
+    }
+}
+
+/// 设置窗口的页（左侧导航的二级项）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Section {
-    Appearance,
     Vat,
     Surcharge,
     Iit,
+    /// 金额舍入：小数位、舍入方式、附加税费舍入方式。
     Rounding,
+    /// 测算求解：按税后实发金额测算（含批量）的多解取值与搜索参数。
+    Solving,
+    Appearance,
+    /// 设置存储：保存位置说明。
+    Storage,
 }
 
 impl Section {
-    pub const ALL: [Section; 5] = [
+    pub const ALL: [Section; 7] = [
         Section::Vat,
         Section::Surcharge,
         Section::Iit,
         Section::Rounding,
+        Section::Solving,
         Section::Appearance,
+        Section::Storage,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
-            Section::Appearance => "外观",
             Section::Vat => "增值税",
             Section::Surcharge => "附加税费",
             Section::Iit => "个人所得税",
-            Section::Rounding => "舍入与测算",
+            Section::Rounding => "金额舍入",
+            Section::Solving => "测算求解",
+            Section::Appearance => "外观",
+            Section::Storage => "设置存储",
         }
+    }
+
+    /// 某个字段标识所在的页。
+    pub fn of_key(k: &str) -> Option<Section> {
+        Some(if k.starts_with("vat.") {
+            Section::Vat
+        } else if k.starts_with("surcharge.") {
+            Section::Surcharge
+        } else if k.starts_with("iit.") {
+            Section::Iit
+        } else if k.starts_with("rounding.") {
+            Section::Rounding
+        } else if k.starts_with("reverse.") {
+            Section::Solving
+        } else if k.starts_with("appearance.") {
+            Section::Appearance
+        } else {
+            return None;
+        })
     }
 }
 
@@ -266,8 +325,6 @@ pub struct SettingsDraft {
     pub prefer: Prefer,
     pub search_window: String,
     pub max_net_income: String,
-    /// 保存失败等提示。
-    pub message: Option<String>,
 }
 
 /// 附加税费项目是否与默认一致：名称、是否计征相同，费率按数值比较（“7”与“7.0”视为相同）。
@@ -309,6 +366,7 @@ pub mod key {
     pub const SCALE: &str = "rounding.scale";
     pub const SEARCH_WINDOW: &str = "reverse.search_window";
     pub const MAX_NET: &str = "reverse.max_net_income";
+    pub const THEME: &str = "appearance.theme";
     pub const GENERAL: &str = "_";
 }
 
@@ -362,7 +420,6 @@ impl SettingsDraft {
             prefer: cfg.reverse.prefer,
             search_window: cfg.reverse.search_window.to_string(),
             max_net_income: num_text(cfg.reverse.max_net_income),
-            message: None,
         }
     }
 
@@ -624,5 +681,287 @@ pub fn prefer_text(p: Prefer) -> &'static str {
     match p {
         Prefer::MinCost => "取最小不含增值税收入（企业总支出最小）",
         Prefer::MaxCost => "取最大不含增值税收入",
+    }
+}
+
+// ---------------- 逐项确认（编辑态 / 生效值） ----------------
+
+/// 两个附加税费项目的输入是否相同（名称、是否计征、费率数值）。
+fn item_input_same(a: &ItemDraft, b: &ItemDraft) -> bool {
+    a.name.trim() == b.name.trim() && a.enabled == b.enabled && same_value(&a.rate, &b.rate)
+}
+
+fn brackets_same(a: &[BracketDraft], b: &[BracketDraft]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).enumerate().all(|(i, (x, y))| {
+            (i + 1 == a.len() || same_value(&x.upper, &y.upper))
+                && same_value(&x.rate, &y.rate)
+                && same_value(&x.quick, &y.quick)
+        })
+}
+
+/// 附加税费项目的字段标识中的序号（`surcharge.items.3` → 3）。
+pub fn item_index(k: &str) -> Option<usize> {
+    k.strip_prefix(key::ITEMS)?.strip_prefix('.')?.parse().ok()
+}
+
+/// 某个错误字段是否属于设置行 `row`（行本身或其下的子字段，如预扣率表的各档）。
+fn key_in_row(err_key: &str, row: &str) -> bool {
+    err_key == row
+        || err_key
+            .strip_prefix(row)
+            .is_some_and(|rest| rest.starts_with('.'))
+}
+
+impl SettingsDraft {
+    /// 全部设置行的字段标识（每行一组 √ ×）。
+    pub fn row_keys(&self) -> Vec<String> {
+        let mut v: Vec<String> = [
+            key::VAT_RATE,
+            key::THRESHOLD_ENABLED,
+            key::THRESHOLD,
+            key::LEVY_AT,
+            key::BASE,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        v.extend((0..self.items.len()).map(|i| format!("{}.{i}", key::ITEMS)));
+        v.extend(
+            [
+                key::FIXED_LIMIT,
+                key::FIXED_DEDUCTION,
+                key::PCT_DEDUCTION,
+                key::BRACKETS,
+                key::SCALE,
+                key::MODE,
+                key::SURCHARGE_ROUNDING,
+                key::PREFER,
+                key::SEARCH_WINDOW,
+                key::MAX_NET,
+                key::THEME,
+            ]
+            .iter()
+            .map(|s| s.to_string()),
+        );
+        v
+    }
+
+    /// 设置行 `k` 的输入与 `other` 是否相同（数值按数值比较）。
+    pub fn row_same(&self, other: &SettingsDraft, k: &str) -> bool {
+        if let Some(i) = item_index(k) {
+            return match (self.items.get(i), other.items.get(i)) {
+                (Some(a), Some(b)) => item_input_same(a, b),
+                (None, None) => true,
+                _ => false,
+            };
+        }
+        match k {
+            key::VAT_RATE => same_value(&self.vat_rate, &other.vat_rate),
+            key::THRESHOLD_ENABLED => self.threshold_enabled == other.threshold_enabled,
+            key::THRESHOLD => same_value(&self.threshold, &other.threshold),
+            key::LEVY_AT => self.levy_at_threshold == other.levy_at_threshold,
+            key::BASE => self.surcharge_base == other.surcharge_base,
+            key::FIXED_LIMIT => same_value(&self.fixed_limit, &other.fixed_limit),
+            key::FIXED_DEDUCTION => same_value(&self.fixed_deduction, &other.fixed_deduction),
+            key::PCT_DEDUCTION => same_value(&self.pct_deduction, &other.pct_deduction),
+            key::BRACKETS => brackets_same(&self.brackets, &other.brackets),
+            key::SCALE => self.scale.trim() == other.scale.trim(),
+            key::MODE => self.mode == other.mode,
+            key::SURCHARGE_ROUNDING => self.surcharge_rounding == other.surcharge_rounding,
+            key::PREFER => self.prefer == other.prefer,
+            key::SEARCH_WINDOW => self.search_window.trim() == other.search_window.trim(),
+            key::MAX_NET => same_value(&self.max_net_income, &other.max_net_income),
+            key::THEME => self.theme == other.theme,
+            _ => true,
+        }
+    }
+
+    /// 把 `src` 中设置行 `k` 的值复制到本草稿。新增的附加税费项目须按顺序确认。
+    pub fn copy_row(&mut self, src: &SettingsDraft, k: &str) -> Result<(), String> {
+        if let Some(i) = item_index(k) {
+            let Some(it) = src.items.get(i) else {
+                return Ok(());
+            };
+            return match i.cmp(&self.items.len()) {
+                std::cmp::Ordering::Less => {
+                    self.items[i] = it.clone();
+                    Ok(())
+                }
+                std::cmp::Ordering::Equal => {
+                    self.items.push(it.clone());
+                    Ok(())
+                }
+                std::cmp::Ordering::Greater => Err("请先确认上方新增的项目".into()),
+            };
+        }
+        match k {
+            key::VAT_RATE => self.vat_rate = src.vat_rate.clone(),
+            key::THRESHOLD_ENABLED => self.threshold_enabled = src.threshold_enabled,
+            key::THRESHOLD => self.threshold = src.threshold.clone(),
+            key::LEVY_AT => self.levy_at_threshold = src.levy_at_threshold,
+            key::BASE => self.surcharge_base = src.surcharge_base,
+            key::ITEMS_REMOVED => self.items = src.items.clone(),
+            key::FIXED_LIMIT => self.fixed_limit = src.fixed_limit.clone(),
+            key::FIXED_DEDUCTION => self.fixed_deduction = src.fixed_deduction.clone(),
+            key::PCT_DEDUCTION => self.pct_deduction = src.pct_deduction.clone(),
+            key::BRACKETS => self.brackets = src.brackets.clone(),
+            key::SCALE => self.scale = src.scale.clone(),
+            key::MODE => self.mode = src.mode,
+            key::SURCHARGE_ROUNDING => self.surcharge_rounding = src.surcharge_rounding,
+            key::PREFER => self.prefer = src.prefer,
+            key::SEARCH_WINDOW => self.search_window = src.search_window.clone(),
+            key::MAX_NET => self.max_net_income = src.max_net_income.clone(),
+            key::THEME => self.theme = src.theme,
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// 设置窗口上的二次确认对话框。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dialog {
+    /// 全部恢复默认（危险操作）。
+    ResetAll,
+    /// 关闭窗口时存在尚未生效的修改。
+    DiscardOnClose,
+}
+
+/// 打开中的设置窗口：编辑态（界面上的输入）与生效值（已应用并保存）。
+///
+/// 每一行的输入与生效值不同时处于“未生效”状态，点击 √（或 Enter）生效并立即保存，
+/// 点击 ×（或 Esc）放弃本项修改、恢复为生效值。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsWindow {
+    /// 界面上的输入（含当前分页 `section`）。
+    pub edit: SettingsDraft,
+    /// 当前生效的设置（与主界面计算所用参数一致）。
+    pub applied: SettingsDraft,
+    /// 打开中的二次确认对话框。
+    pub dialog: Option<Dialog>,
+    /// 保存失败等提示。
+    pub message: Option<String>,
+}
+
+impl SettingsWindow {
+    pub fn new(cfg: &Config, theme: ThemeChoice) -> Self {
+        Self::from_draft(SettingsDraft::from_config(cfg, theme))
+    }
+
+    /// 以给定草稿同时作为输入与生效值（测试、截图用）。
+    pub fn from_draft(d: SettingsDraft) -> Self {
+        SettingsWindow {
+            edit: d.clone(),
+            applied: d,
+            dialog: None,
+            message: None,
+        }
+    }
+
+    /// 输入与生效值不同（尚未生效）的设置行。
+    pub fn pending_rows(&self) -> Vec<String> {
+        self.edit
+            .row_keys()
+            .into_iter()
+            .filter(|k| !self.edit.row_same(&self.applied, k))
+            .collect()
+    }
+
+    pub fn is_pending(&self, k: &str) -> bool {
+        !self.edit.row_same(&self.applied, k)
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.pending_rows().len()
+    }
+
+    /// 某页尚未生效的行数。
+    pub fn section_pending(&self, s: Section) -> usize {
+        self.pending_rows()
+            .iter()
+            .filter(|k| Section::of_key(k) == Some(s))
+            .count()
+    }
+
+    /// 某页生效值与内置默认不同（标“已修改”）的行数。
+    pub fn section_modified(&self, s: Section) -> usize {
+        self.applied
+            .modified_rows()
+            .iter()
+            .filter(|k| Section::of_key(k) == Some(s))
+            .count()
+    }
+
+    /// 生效值加上设置行 `k` 的输入：确认该行后的完整设置。
+    pub fn candidate(&self, k: &str) -> Result<SettingsDraft, String> {
+        let mut c = self.applied.clone();
+        c.copy_row(&self.edit, k)?;
+        Ok(c)
+    }
+
+    /// 各未生效行确认后的校验错误（字段标识 → 说明）；有错误的行 √ 不可用。
+    pub fn row_errors(&self) -> Errors {
+        let mut out = Errors::new();
+        for k in self.pending_rows() {
+            if k == key::THEME {
+                continue;
+            }
+            match self.candidate(&k) {
+                Err(e) => {
+                    out.insert(k, e);
+                }
+                Ok(c) => {
+                    if let Err(errs) = c.build() {
+                        for (ek, m) in errs {
+                            if key_in_row(&ek, &k) {
+                                out.entry(ek).or_insert(m);
+                            } else {
+                                // 与其他参数组合后不成立（如测算搜索上限与预扣率表）：记在本行
+                                out.entry(k.clone()).or_insert(m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// 设置行 `k` 不能生效的原因（无则可以确认）。
+    pub fn row_error(&self, k: &str) -> Option<String> {
+        let errs = self.row_errors();
+        errs.iter()
+            .find(|(ek, _)| key_in_row(ek, k))
+            .map(|(_, m)| m.clone())
+    }
+
+    /// 放弃设置行 `k` 的修改：恢复为生效值；尚未生效的新增项目直接移除。
+    pub fn discard(&mut self, k: &str) {
+        if let Some(i) = item_index(k) {
+            if i >= self.applied.items.len() {
+                if i < self.edit.items.len() {
+                    self.edit.items.remove(i);
+                }
+                return;
+            }
+        }
+        let applied = self.applied.clone();
+        let _ = self.edit.copy_row(&applied, k);
+    }
+
+    /// 放弃全部未生效的修改。
+    pub fn discard_all(&mut self) {
+        let section = self.edit.section;
+        self.edit = self.applied.clone();
+        self.edit.section = section;
+    }
+
+    /// 生效值更新后同步：设置行 `k` 的输入改为新的生效值（规范写法），其他行的未生效输入保留。
+    pub fn set_applied(&mut self, applied: SettingsDraft, k: &str) {
+        self.applied = applied;
+        self.applied.section = self.edit.section;
+        let a = self.applied.clone();
+        let _ = self.edit.copy_row(&a, k);
     }
 }

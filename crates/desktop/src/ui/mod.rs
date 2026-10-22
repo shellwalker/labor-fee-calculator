@@ -19,6 +19,16 @@ use widgets::{badge, status_banner};
 pub const SC_SETTINGS: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma);
 pub const SC_OPEN: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::O);
 pub const SC_QUIT: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::Q);
+pub const SC_CLOSE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::W);
+
+/// 执行“关闭窗口”“最小化”：先关闭最上层子窗口；没有子窗口时返回最小化主窗口的指令。
+pub fn window_action(st: &mut AppState, a: Action) -> Option<egui::ViewportCommand> {
+    match a {
+        Action::CloseWindow if st.close_front_window() => None,
+        Action::CloseWindow | Action::Minimize => Some(egui::ViewportCommand::Minimized(true)),
+        _ => None,
+    }
+}
 
 /// 快捷键显示文字（“Ctrl+Comma”显示为“Ctrl+,”）。
 pub fn shortcut_text(ctx: &egui::Context, sc: &KeyboardShortcut) -> String {
@@ -62,6 +72,9 @@ pub fn draw(ui: &mut Ui, st: &mut AppState) {
             }
             if i.consume_shortcut(&SC_QUIT) {
                 st.actions.push(Action::Quit);
+            }
+            if i.consume_shortcut(&SC_CLOSE) {
+                st.actions.push(Action::CloseWindow);
             }
         });
     }
@@ -113,7 +126,8 @@ pub fn draw(ui: &mut Ui, st: &mut AppState) {
     about::about_window(&ctx, st);
     let sc_settings = shortcut_text(&ctx, &SC_SETTINGS);
     let sc_open = shortcut_text(&ctx, &SC_OPEN);
-    about::help_window(&ctx, st, &sc_settings, &sc_open);
+    let sc_close = shortcut_text(&ctx, &SC_CLOSE);
+    about::help_window(&ctx, st, &sc_settings, &sc_open, &sc_close);
 
     for a in std::mem::take(&mut st.actions) {
         match a {
@@ -121,6 +135,11 @@ pub fn draw(ui: &mut Ui, st: &mut AppState) {
             Action::About => st.show_about = true,
             Action::Help => st.show_help = true,
             Action::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            Action::CloseWindow | Action::Minimize => {
+                if let Some(cmd) = window_action(st, a) {
+                    ctx.send_viewport_cmd(cmd);
+                }
+            }
             Action::OpenBatchFile => {
                 if let Some(pth) = batch::pick_batch_file() {
                     st.open_batch_file(&pth);
@@ -161,6 +180,16 @@ fn menu_bar(ui: &mut Ui, st: &mut AppState) {
                         st.actions.push(Action::Settings);
                     }
                     ui.separator();
+                    if ui
+                        .add(
+                            egui::Button::new("关闭窗口")
+                                .shortcut_text(shortcut_text(&ctx, &SC_CLOSE)),
+                        )
+                        .on_hover_text("关闭当前对话框；没有对话框时最小化主窗口")
+                        .clicked()
+                    {
+                        st.actions.push(Action::CloseWindow);
+                    }
                     if ui
                         .add(egui::Button::new("退出").shortcut_text(shortcut_text(&ctx, &SC_QUIT)))
                         .clicked()

@@ -3,7 +3,7 @@
 //! kittest 默认在遇到任何字体都画不出的字符时直接 panic，所以这里的界面测试同时验证内嵌中文字体覆盖了界面上出现的文字。
 
 use eframe::egui::accesskit::Role;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 use egui_kittest::Harness;
 use labor_fee_batch::InputKind;
 use labor_fee_core::CostGapReason;
@@ -298,7 +298,8 @@ fn settings_draft_roundtrip_and_validation() {
 }
 
 #[test]
-fn settings_save_persist_and_reload() {
+fn settings_confirm_persist_and_reload() {
+    use settings::key;
     let dir = tmp_dir("store");
     let store = SettingsStore::at(dir.join("labor-fee-desktop"));
     let mut st = AppState::with_store(store.clone());
@@ -309,28 +310,47 @@ fn settings_save_persist_and_reload() {
     st.calc_forward();
     st.open_settings();
     {
-        let d = st.settings.as_mut().unwrap();
-        d.vat_rate = "3".into();
-        d.theme = ThemeChoice::Dark;
+        let w = st.settings.as_mut().unwrap();
+        w.edit.vat_rate = "3".into();
+        w.edit.theme = ThemeChoice::Dark;
+        assert_eq!(w.pending_rows(), vec![key::VAT_RATE, key::THEME]);
     }
     assert_eq!(
         st.effective_theme(),
         ThemeChoice::Dark,
         "设置窗口内预览主题"
     );
-    // 校验失败不保存
-    st.settings.as_mut().unwrap().threshold = "-1".into();
-    assert!(!st.save_settings());
-    assert!(st.settings.as_ref().unwrap().message.is_some());
-    st.settings.as_mut().unwrap().threshold = "1000".into();
-    assert!(st.save_settings());
-    assert!(st.settings.is_none());
+    // 未确认：不生效、不保存
+    assert_eq!(st.config().vat.rate, dec!(0.01));
+    assert_eq!(value(&st.forward.outcome, "增值税税额"), "100.00");
+    assert!(!store.rules_path().exists());
+    // 非法值：不能确认
+    st.settings.as_mut().unwrap().edit.threshold = "-1".into();
+    assert!(st
+        .settings
+        .as_ref()
+        .unwrap()
+        .row_error(key::THRESHOLD)
+        .is_some());
+    assert!(!st.confirm_setting(key::THRESHOLD));
+    st.discard_setting(key::THRESHOLD);
+    assert_eq!(st.settings.as_ref().unwrap().edit.threshold, "1000");
+    // √：立即生效并保存，其他未确认的行保留
+    assert!(st.confirm_setting(key::VAT_RATE));
     assert_eq!(st.source, "已保存的设置");
     assert_eq!(value(&st.forward.outcome, "增值税税额"), "300.00");
     assert!(store.rules_path().exists());
+    assert_eq!(
+        st.settings.as_ref().unwrap().pending_rows(),
+        vec![key::THEME.to_string()]
+    );
+    assert_eq!(st.prefs.theme, ThemeChoice::System, "主题尚未确认");
+    assert!(st.confirm_setting(key::THEME));
     assert!(std::fs::read_to_string(store.prefs_path())
         .unwrap()
         .contains("dark"));
+    assert_eq!(st.settings.as_ref().unwrap().pending_count(), 0);
+    assert!(st.request_close_settings());
 
     // 重新启动：读回主题与口径
     let st2 = AppState::with_store(store.clone());
@@ -338,20 +358,54 @@ fn settings_save_persist_and_reload() {
     assert_eq!(st2.config().vat.rate, dec!(0.03));
     assert_eq!(st2.source, "已保存的设置");
 
-    // 取消：丢弃修改
+    // 关闭时有未生效的修改：先确认；放弃后不改变已生效的设置
     let mut st3 = AppState::with_store(store.clone());
     st3.open_settings();
-    st3.settings.as_mut().unwrap().vat_rate = "5".into();
-    st3.cancel_settings();
+    st3.settings.as_mut().unwrap().edit.vat_rate = "5".into();
+    assert!(!st3.request_close_settings());
+    assert_eq!(
+        st3.settings.as_ref().unwrap().dialog,
+        Some(settings::Dialog::DiscardOnClose)
+    );
+    st3.close_settings();
     assert_eq!(st3.config().vat.rate, dec!(0.03));
 
-    // 全部恢复默认并保存：删除 rules.toml
+    // 单项恢复默认：直接生效
     st3.open_settings();
-    st3.settings.as_mut().unwrap().reset_all();
-    assert!(st3.save_settings());
+    assert!(st3.reset_setting(key::VAT_RATE));
+    assert!(st3.is_default_config());
+    assert!(
+        !store.rules_path().exists(),
+        "与内置默认相同时不保存 rules.toml"
+    );
+
+    // 自行添加的项目：新增行须确认，删除已生效的项目立即生效
+    {
+        let w = st3.settings.as_mut().unwrap();
+        w.edit.items.push(settings::ItemDraft {
+            name: "其他附加".into(),
+            rate: "1".into(),
+            enabled: true,
+        });
+        assert!(w.is_pending("surcharge.items.3"));
+    }
+    assert!(st3.confirm_setting("surcharge.items.3"));
+    assert_eq!(st3.config().surcharge.items.len(), 4);
+    assert!(st3.delete_item(3));
+    assert_eq!(st3.config().surcharge.items.len(), 3);
+    assert_eq!(st3.settings.as_ref().unwrap().pending_count(), 0);
+
+    // 全部恢复默认：rules.toml 删除、preferences.toml 还原
+    st3.settings.as_mut().unwrap().edit.scale = "3".into();
+    assert!(st3.confirm_setting(settings::key::SCALE));
+    assert!(store.rules_path().exists());
+    assert!(st3.reset_all_settings());
     assert!(st3.is_default_config());
     assert!(!store.rules_path().exists());
     assert_eq!(st3.prefs.theme, ThemeChoice::System);
+    assert_eq!(store.load_prefs().theme, ThemeChoice::System);
+    let w = st3.settings.as_ref().unwrap();
+    assert_eq!((w.applied.modified_count(), w.pending_count()), (0, 0));
 
     // 损坏的设置文件：回退默认并提示
     std::fs::write(store.rules_path(), "garbage = [").unwrap();
@@ -692,12 +746,45 @@ fn ui_batch_execute_button() {
     h.get_by_label_contains("共 4 行");
 }
 
+/// 打开设置窗口并切到指定页。
+fn settings_at(sec: settings::Section) -> AppState {
+    let mut st = AppState::with_default_config();
+    st.open_settings();
+    st.settings.as_mut().unwrap().edit.section = sec;
+    st
+}
+
+fn edit<'a>(h: &'a mut Harness<'_, AppState>) -> &'a mut SettingsDraft {
+    &mut h.state_mut().settings.as_mut().unwrap().edit
+}
+
 #[test]
 fn ui_settings_dialog() {
     let mut h = harness(AppState::with_default_config());
     h.get_by_label_contains("设置").click();
     h.run();
     assert!(h.state().settings.is_some());
+    h.get_by_label_contains("修改后点击 ✔ 生效，点击 ✖ 放弃本项修改");
+    // 分组导航：一级分组标题 + 二级页
+    for g in ["计税口径", "计算规则", "通用"] {
+        assert!(has(&h, g), "缺少分组 {g}");
+    }
+    for s in [
+        "增值税",
+        "附加税费",
+        "个人所得税",
+        "金额舍入",
+        "测算求解",
+        "外观",
+        "设置存储",
+    ] {
+        h.get_by_role_and_label(Role::Button, s);
+    }
+    assert!(
+        h.query_by_label("状态说明：").is_none(),
+        "不再显示状态说明图例"
+    );
+    assert!(h.query_by_label("保存").is_none() && h.query_by_label("取消").is_none());
     h.get_by_label("增值税征收率");
     assert!(has(&h, "已确认"));
     h.get_by_role_and_label(Role::Button, "个人所得税").click();
@@ -705,52 +792,223 @@ fn ui_settings_dialog() {
     h.get_by_label("定额减除费用");
     h.get_by_label("预扣率表（个人所得税预扣率表二，居民个人劳务报酬所得适用）");
     assert!(has(&h, "已核实"));
-    h.get_by_role_and_label(Role::Button, "舍入与测算").click();
+    h.get_by_role_and_label(Role::Button, "金额舍入").click();
     h.run();
     assert!(has(&h, "待确认"));
+    h.get_by_label("舍入方式");
+    h.get_by_role_and_label(Role::Button, "测算求解").click();
+    h.run();
+    h.get_by_label("多解时取值");
+    h.get_by_label("测算搜索上限");
+    h.get_by_role_and_label(Role::Button, "设置存储").click();
+    h.run();
+    h.get_by_label("设置保存位置");
     h.get_by_role_and_label(Role::Button, "外观").click();
     h.run();
     h.get_by_label("🌙  深色").click();
     h.run();
-    assert_eq!(h.state().effective_theme(), ThemeChoice::Dark);
-    h.get_by_label("取消").click();
+    assert_eq!(h.state().effective_theme(), ThemeChoice::Dark, "预览");
+    assert_eq!(h.state().prefs.theme, ThemeChoice::Light, "未确认不保存");
+    h.get_by_label("未生效");
+    h.get_by_role_and_label(Role::Button, "✔").click();
     h.run();
-    assert!(h.state().settings.is_none());
-    assert_eq!(h.state().prefs.theme, ThemeChoice::Light, "取消后主题不变");
-
-    // 编辑并保存
-    h.state_mut().open_settings();
-    h.state_mut().settings.as_mut().unwrap().vat_rate = "3".into();
+    assert_eq!(h.state().prefs.theme, ThemeChoice::Dark);
+    h.get_by_label("关闭").click();
     h.run();
-    assert!(
-        h.query_all_by_label("已修改").count() >= 2,
-        "图例 + 被修改项"
-    );
-    h.get_by_label_contains("与内置默认不同 1 项");
-    h.get_by_label("保存").click();
-    h.run();
-    assert!(h.state().settings.is_none());
-    assert_eq!(h.state().config().vat.rate, dec!(0.03));
-    assert!(h.query_all_by_label_contains("已修改 1 项").count() >= 1);
-    h.get_by_label_contains("增值税税额 = 不含增值税收入 × 征收率 3%");
+    assert!(h.state().settings.is_none(), "无未生效修改时直接关闭");
 }
 
 #[test]
-fn ui_settings_validation_blocks_save() {
-    let mut st = AppState::with_default_config();
+fn ui_settings_unconfirmed_edit_not_applied() {
+    let mut h = harness(settings_at(settings::Section::Vat));
+    h.run();
+    assert!(
+        h.query_by_role_and_label(Role::Button, "✔").is_none(),
+        "未修改时不显示 √ ×"
+    );
+    let input = h.get_by_label("增值税征收率");
+    input.click();
+    h.run();
+    h.get_by_label("增值税征收率").type_text("5");
+    h.run();
+    assert_eq!(h.state().settings.as_ref().unwrap().edit.vat_rate, "15");
+    // 编辑态：出现 √ ×、“未生效”，参数不变
+    h.get_by_role_and_label(Role::Button, "✔");
+    h.get_by_label("✖");
+    h.get_by_label("未生效");
+    h.get_by_label("1 项修改未生效");
+    assert_eq!(h.state().config().vat.rate, dec!(0.01));
+    assert!(h.query_by_label_contains("当前值与默认值不同").is_none());
+    // ×：恢复为生效值
+    h.get_by_label("✖").click();
+    h.run();
+    assert_eq!(h.state().settings.as_ref().unwrap().edit.vat_rate, "1");
+    assert!(h.query_by_label("未生效").is_none());
+}
+
+#[test]
+fn ui_settings_confirm_applies_and_persists() {
+    let dir = tmp_dir("ui-confirm");
+    let store = SettingsStore::at(dir.join("labor-fee-desktop"));
+    let mut st = AppState::with_store(store.clone());
+    st.forward.input = "10000".into();
+    st.calc_forward();
     st.open_settings();
-    st.settings.as_mut().unwrap().vat_rate = "abc".into();
     let mut h = harness(st);
+    h.run();
+    edit(&mut h).vat_rate = "3".into();
+    h.run();
+    h.get_by_role_and_label(Role::Button, "✔").click();
+    h.run();
+    assert_eq!(h.state().config().vat.rate, dec!(0.03));
+    assert_eq!(value(&h.state().forward.outcome, "增值税税额"), "300.00");
+    assert!(store.rules_path().exists());
+    assert_eq!(store.load_rules().unwrap().unwrap().vat.rate, dec!(0.03));
+    // 生效值与默认不同：常驻提示、“已修改”标签、单项“默认”、计数
+    h.get_by_label("ℹ 当前值与默认值不同（默认：1%）");
+    assert_eq!(modified_tags(&h), 1);
+    h.get_by_label("与内置默认不同 1 项");
+    assert!(h.query_by_label("未生效").is_none());
+    // 单项“默认”：直接生效，提示消失
+    h.get_by_label("🔃 默认").click();
+    h.run();
+    assert_eq!(h.state().config().vat.rate, dec!(0.01));
+    assert!(h.query_by_label_contains("当前值与默认值不同").is_none());
+    assert!(!store.rules_path().exists());
+    // 改回与默认数值相同（1.0）：生效后不显示提示
+    edit(&mut h).vat_rate = "1.0".into();
+    h.run();
+    assert!(
+        h.query_by_role_and_label(Role::Button, "✔").is_none(),
+        "数值相同不算修改"
+    );
+}
+
+#[test]
+fn ui_settings_enter_and_escape() {
+    let mut h = harness(settings_at(settings::Section::Vat));
+    h.run();
+    let input = h.get_by_label("起征点");
+    input.click();
+    h.run();
+    h.get_by_label("起征点").type_text("0");
+    h.run();
+    assert_eq!(h.state().settings.as_ref().unwrap().edit.threshold, "10000");
+    h.key_press(eframe::egui::Key::Enter);
+    h.run();
+    assert_eq!(
+        h.state().config().vat.threshold,
+        dec!(10000),
+        "Enter 等同 √"
+    );
+    // Esc：放弃本项修改，不关闭窗口
+    h.get_by_label("起征点").click();
+    h.run();
+    h.get_by_label("起征点").type_text("5");
+    h.run();
+    assert!(h
+        .state()
+        .settings
+        .as_ref()
+        .unwrap()
+        .is_pending("vat.threshold"));
+    h.key_press(eframe::egui::Key::Escape);
+    h.run();
+    let w = h.state().settings.as_ref().expect("Esc 不关闭窗口");
+    assert_eq!(w.edit.threshold, "10000");
+    assert_eq!(w.pending_count(), 0);
+    // 无未生效修改时 Esc 关闭窗口
+    h.key_press(eframe::egui::Key::Escape);
+    h.run();
+    assert!(h.state().settings.is_none());
+}
+
+#[test]
+fn ui_settings_validation_disables_confirm() {
+    let mut h = harness(settings_at(settings::Section::Vat));
+    edit(&mut h).vat_rate = "abc".into();
     h.run();
     h.get_by_label_contains("请输入 0～100 之间的百分数");
     h.get_by_label("增值税  (1)");
-    h.get_by_label("保存").click();
+    assert!(
+        h.get_by_role_and_label(Role::Button, "✔")
+            .accesskit_node()
+            .is_disabled(),
+        "非法值时 √ 不可用"
+    );
+    h.key_press(eframe::egui::Key::Enter);
     h.run();
-    assert!(h.state().settings.is_some(), "有错误时“保存”不可用");
-    // 单项恢复默认
-    h.get_by_label("🔃 默认").click();
+    assert_eq!(h.state().config().vat.rate, dec!(0.01));
+    h.get_by_label("✖").click();
     h.run();
-    assert_eq!(h.state().settings.as_ref().unwrap().vat_rate, "1");
+    assert_eq!(h.state().settings.as_ref().unwrap().edit.vat_rate, "1");
+    assert!(h.query_by_label("增值税  (1)").is_none());
+}
+
+#[test]
+fn ui_settings_close_with_pending_asks() {
+    let mut h = harness(settings_at(settings::Section::Iit));
+    edit(&mut h).fixed_deduction = "1000".into();
+    h.run();
+    h.get_by_label("关闭").click();
+    h.run();
+    h.get_by_label("有 1 项修改尚未生效");
+    h.get_by_label_contains("已生效的设置不受影响");
+    // 返回：窗口与输入保留
+    h.get_by_label("返回").click();
+    h.run();
+    let w = h.state().settings.as_ref().unwrap();
+    assert_eq!((w.dialog, w.edit.fixed_deduction.as_str()), (None, "1000"));
+    // Esc（无焦点）同样询问
+    h.key_press(eframe::egui::Key::Escape);
+    h.run();
+    h.get_by_label("有 1 项修改尚未生效");
+    h.get_by_label("放弃未生效的修改").click();
+    h.run();
+    assert!(h.state().settings.is_none());
+    assert_eq!(h.state().config().iit.fixed_deduction, dec!(800));
+}
+
+#[test]
+fn ui_settings_reset_all() {
+    let dir = tmp_dir("ui-reset");
+    let store = SettingsStore::at(dir.join("labor-fee-desktop"));
+    let mut st = AppState::with_store(store.clone());
+    st.open_settings();
+    {
+        let w = st.settings.as_mut().unwrap();
+        w.edit.vat_rate = "3".into();
+        w.edit.items[0].enabled = true;
+        w.edit.theme = ThemeChoice::Dark;
+    }
+    for k in ["vat.rate", "surcharge.items.0", "appearance.theme"] {
+        assert!(st.confirm_setting(k), "{k}");
+    }
+    st.settings.as_mut().unwrap().edit.scale = "3".into(); // 未生效
+    let mut h = harness(st);
+    h.state_mut().prefs.theme = ThemeChoice::Dark;
+    h.run();
+    h.get_by_label("与内置默认不同 2 项");
+    h.get_by_label("🔃 全部恢复默认").click();
+    h.run();
+    h.get_by_label("全部恢复默认");
+    h.get_by_label_contains("当前有 2 项与内置默认不同");
+    // 取消：不变
+    h.get_by_label("取消").click();
+    h.run();
+    assert_eq!(h.state().config().vat.rate, dec!(0.03));
+    h.get_by_label("🔃 全部恢复默认").click();
+    h.run();
+    h.get_by_label("恢复默认").click();
+    h.run();
+    let w = h.state().settings.as_ref().unwrap();
+    assert_eq!((w.applied.modified_count(), w.pending_count()), (0, 0));
+    assert!(h.state().is_default_config());
+    assert_eq!(h.state().prefs.theme, ThemeChoice::System);
+    assert!(!store.rules_path().exists());
+    assert_eq!(store.load_prefs().theme, ThemeChoice::System);
+    assert!(h.query_by_label_contains("与内置默认不同").is_none());
+    assert_eq!(modified_tags(&h), 0);
 }
 
 #[test]
@@ -788,6 +1046,70 @@ fn ui_shortcut_opens_settings() {
     h.key_press_modifiers(eframe::egui::Modifiers::COMMAND, eframe::egui::Key::Comma);
     h.run();
     assert!(h.state().settings.is_some());
+}
+
+#[test]
+fn close_window_dispatch() {
+    use labor_fee_desktop::state::{Action, CloseTarget};
+    use labor_fee_desktop::ui::window_action;
+    let minimize = Some(eframe::egui::ViewportCommand::Minimized(true));
+    let mut st = AppState::with_default_config();
+    // 没有子窗口：最小化主窗口（不退出）
+    assert_eq!(st.close_target(), CloseTarget::MainWindow);
+    assert_eq!(window_action(&mut st, Action::CloseWindow), minimize);
+    assert_eq!(window_action(&mut st, Action::Minimize), minimize);
+    // 关于、使用说明：先关闭子窗口
+    st.show_about = true;
+    st.show_help = true;
+    assert_eq!(window_action(&mut st, Action::CloseWindow), None);
+    assert!(!st.show_about && st.show_help);
+    assert_eq!(window_action(&mut st, Action::CloseWindow), None);
+    assert!(!st.show_help);
+    // 设置窗口：无未生效修改直接关闭
+    st.open_settings();
+    assert_eq!(st.close_target(), CloseTarget::Settings);
+    assert_eq!(window_action(&mut st, Action::CloseWindow), None);
+    assert!(st.settings.is_none());
+    // 有未生效修改：弹出放弃确认；再按一次关闭确认框、回到设置窗口
+    st.open_settings();
+    st.settings.as_mut().unwrap().edit.vat_rate = "3".into();
+    assert_eq!(window_action(&mut st, Action::CloseWindow), None);
+    assert_eq!(
+        st.settings.as_ref().unwrap().dialog,
+        Some(settings::Dialog::DiscardOnClose)
+    );
+    assert_eq!(window_action(&mut st, Action::CloseWindow), None);
+    let w = st.settings.as_ref().unwrap();
+    assert_eq!((w.dialog, w.edit.vat_rate.as_str()), (None, "3"));
+    // 最小化不影响子窗口
+    assert_eq!(window_action(&mut st, Action::Minimize), minimize);
+    assert!(st.settings.is_some());
+}
+
+#[test]
+fn ui_ctrl_w_closes_sub_window() {
+    let w = eframe::egui::Key::W;
+    let cmd = eframe::egui::Modifiers::COMMAND;
+    let mut h = harness(AppState::with_default_config());
+    h.state_mut().show_about = true;
+    h.run();
+    h.key_press_modifiers(cmd, w);
+    h.run();
+    assert!(!h.state().show_about);
+    let mut st = settings_at(settings::Section::Vat);
+    st.settings.as_mut().unwrap().edit.vat_rate = "3".into();
+    let mut h = harness(st);
+    h.run();
+    h.key_press_modifiers(cmd, w);
+    h.run();
+    h.get_by_label("有 1 项修改尚未生效");
+    h.get_by_label("放弃未生效的修改").click();
+    h.run();
+    assert!(h.state().settings.is_none());
+    // 文件菜单显示“关闭窗口”及快捷键
+    h.get_by_label("文件").click();
+    h.run();
+    h.get_by_label_contains("关闭窗口");
 }
 
 #[test]
@@ -838,25 +1160,40 @@ fn sample_xlsx() {
     assert_eq!(pv[7][col("测算状态")], "数据错误");
 }
 
-/// 当前分组中显示“已修改”标签的数量（减去左侧状态说明中的一个图例）。
+/// 当前页中显示“已修改”标签的数量。
 fn modified_tags(h: &Harness<'_, AppState>) -> usize {
-    h.query_all_by_label("已修改").count() - 1
+    h.query_all_by_label("已修改").count()
+}
+
+fn window_with(d: SettingsDraft) -> AppState {
+    let mut st = AppState::with_default_config();
+    st.settings = Some(settings::SettingsWindow::from_draft(d));
+    st
 }
 
 #[test]
 fn modified_badge_count_matches_row_tags() {
     // 三项附加税费全部勾选：城市维护建设税、地方教育附加两行标“已修改”，底部计数为 2
-    let mut st = AppState::with_default_config();
-    st.open_settings();
-    if let Some(d) = &mut st.settings {
-        d.section = settings::Section::Surcharge;
-        d.items[0].enabled = true;
-        d.items[2].enabled = true;
+    let mut st = settings_at(settings::Section::Surcharge);
+    {
+        let w = st.settings.as_mut().unwrap();
+        w.edit.items[0].enabled = true;
+        w.edit.items[2].enabled = true;
     }
+    assert!(st.confirm_setting("surcharge.items.0"));
+    assert!(st.confirm_setting("surcharge.items.2"));
     let mut h = harness(st);
     h.run();
     assert_eq!(modified_tags(&h), 2);
-    assert_eq!(h.state().settings.as_ref().unwrap().modified_count(), 2);
+    assert_eq!(
+        h.state()
+            .settings
+            .as_ref()
+            .unwrap()
+            .applied
+            .modified_count(),
+        2
+    );
     h.get_by_label("与内置默认不同 2 项");
 
     // 各分组都有修改时，所有分组“已修改”标签之和等于底部计数
@@ -879,12 +1216,9 @@ fn modified_badge_count_matches_row_tags() {
     assert_eq!(expect, 10, "{:?}", d.modified_rows());
     let mut total = 0;
     for sec in settings::Section::ALL {
-        let mut st = AppState::with_default_config();
-        st.open_settings();
         let mut dd = d.clone();
         dd.section = sec;
-        st.settings = Some(dd);
-        let mut h = harness(st);
+        let mut h = harness(window_with(dd));
         h.run();
         total += modified_tags(&h);
         h.get_by_label(&format!("与内置默认不同 {expect} 项"));
@@ -898,11 +1232,13 @@ fn modified_badge_count_matches_row_tags() {
         d.modified_rows(),
         vec![settings::key::ITEMS_REMOVED.to_string()]
     );
-    let mut st = AppState::with_default_config();
-    st.open_settings();
     d.section = settings::Section::Surcharge;
-    st.settings = Some(d);
-    let mut h = harness(st);
+    let mut h = harness(window_with(d));
     h.run();
     assert_eq!(modified_tags(&h), 1);
+    // 恢复默认项目：直接生效
+    h.get_by_label("🔃 默认").click();
+    h.run();
+    assert_eq!(modified_tags(&h), 0);
+    assert_eq!(h.state().settings.as_ref().unwrap().edit.items.len(), 3);
 }

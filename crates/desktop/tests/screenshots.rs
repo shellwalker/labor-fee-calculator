@@ -31,8 +31,9 @@ fn shoot(
     prep: impl FnOnce(&mut Harness<'_, AppState>),
 ) {
     st.prefs.theme = theme;
-    if let Some(d) = &mut st.settings {
-        d.theme = theme;
+    if let Some(w) = &mut st.settings {
+        w.edit.theme = theme;
+        w.applied.theme = theme;
     }
     let mut h = Harness::builder()
         .with_size(egui::vec2(size.0, size.1))
@@ -107,7 +108,7 @@ fn screenshots() {
 
         st = AppState::with_default_config();
         st.open_settings();
-        if let Some(d) = &mut st.settings {
+        if let Some(d) = st.settings.as_mut().map(|w| &mut w.edit) {
             d.section = Section::Iit;
             d.brackets[1].rate = "abc".into();
             d.fixed_deduction = "1000".into();
@@ -150,7 +151,7 @@ fn screenshots() {
 
         st = AppState::with_default_config();
         st.open_settings();
-        if let Some(d) = &mut st.settings {
+        if let Some(d) = st.settings.as_mut().map(|w| &mut w.edit) {
             d.section = Section::Surcharge;
         }
         shoot("5a-settings-surcharge-default", st, theme, size, |_| {});
@@ -158,7 +159,7 @@ fn screenshots() {
         // 只勾选，不改费率
         st = AppState::with_default_config();
         st.open_settings();
-        if let Some(d) = &mut st.settings {
+        if let Some(d) = st.settings.as_mut().map(|w| &mut w.edit) {
             d.section = Section::Surcharge;
             d.items[0].enabled = true;
             d.items[2].enabled = true;
@@ -170,5 +171,89 @@ fn screenshots() {
         st.batch.path = sample_xlsx();
         st.run_batch_blocking();
         shoot("13-batch-min-size", st, theme, (960.0, 640.0), |_| {});
+    }
+}
+
+/// 设置窗口逐项确认、分组导航、全部恢复默认等（第五轮设计复核）。
+#[test]
+#[ignore = "需要 GPU / 软件渲染，手动运行"]
+fn screenshots_settings() {
+    use labor_fee_desktop::settings::{key, Dialog, ItemDraft};
+    let size = (1280.0, 820.0);
+    let at = |sec: Section| {
+        let mut st = AppState::with_default_config();
+        st.open_settings();
+        st.settings.as_mut().unwrap().edit.section = sec;
+        st
+    };
+    // 已生效：征收率 3%、城市维护建设税计征
+    let modified = |sec: Section| {
+        let mut st = at(sec);
+        {
+            let w = st.settings.as_mut().unwrap();
+            w.edit.vat_rate = "3".into();
+            w.edit.items[0].enabled = true;
+        }
+        st.confirm_setting(key::VAT_RATE);
+        st.confirm_setting("surcharge.items.0");
+        st
+    };
+    for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
+        // 1. 编辑中未确认：√ × 与“未生效”
+        let mut st = at(Section::Vat);
+        st.settings.as_mut().unwrap().edit.vat_rate = "3".into();
+        shoot("s1-vat-editing", st, theme, size, |_| {});
+        if theme == ThemeChoice::Dark {
+            continue;
+        }
+        // 2. 生效后与默认不同：常驻提示、已修改、导航红点
+        let st = modified(Section::Vat);
+        shoot("s2-vat-applied-differs", st, theme, size, |_| {});
+        // 3. 附加税费：已生效修改 + 新增项目待确认
+        let mut st = modified(Section::Surcharge);
+        st.settings.as_mut().unwrap().edit.items.push(ItemDraft {
+            name: "其他附加".into(),
+            rate: "0.5".into(),
+            enabled: true,
+        });
+        shoot("s3-surcharge-new-item", st, theme, size, |_| {});
+        // 4. 非法值：√ 禁用并说明原因
+        let mut st = at(Section::Iit);
+        st.settings.as_mut().unwrap().edit.brackets[1].rate = "abc".into();
+        shoot("s4-iit-invalid", st, theme, size, |_| {});
+        // 5. 计算规则分组：金额舍入、测算求解
+        let mut st = at(Section::Rounding);
+        st.settings.as_mut().unwrap().edit.mode = labor_fee_core::RoundingMode::HalfEven;
+        shoot("s5-rounding", st, theme, size, |_| {});
+        let st = at(Section::Solving);
+        shoot("s6-solving", st, theme, size, |_| {});
+        // 7. 全部恢复默认确认框
+        let mut st = modified(Section::Vat);
+        st.settings.as_mut().unwrap().dialog = Some(Dialog::ResetAll);
+        shoot("s7-reset-all-confirm", st, theme, size, |_| {});
+        // 8. 恢复后
+        let mut st = modified(Section::Vat);
+        st.reset_all_settings();
+        shoot("s8-after-reset", st, theme, size, |_| {});
+        // 9. 关闭时有未生效的修改
+        let mut st = modified(Section::Vat);
+        st.settings.as_mut().unwrap().edit.threshold = "2000".into();
+        st.settings.as_mut().unwrap().dialog = Some(Dialog::DiscardOnClose);
+        shoot("s9-close-pending-confirm", st, theme, size, |_| {});
+        // 10. 外观、设置存储
+        let mut st = at(Section::Appearance);
+        st.settings.as_mut().unwrap().applied.theme = ThemeChoice::System;
+        shoot("s10-appearance", st, theme, size, |_| {});
+        let st = at(Section::Storage);
+        shoot("s11-storage", st, theme, size, |_| {});
+        // 12. 最小尺寸
+        let mut st = modified(Section::Vat);
+        st.settings.as_mut().unwrap().edit.threshold = "2000".into();
+        shoot("s12-min-size", st, theme, (960.0, 640.0), |_| {});
+        // 13. 文件菜单：关闭窗口 Ctrl+W
+        let st = AppState::with_default_config();
+        shoot("s13-file-menu", st, theme, size, |h| {
+            h.get_by_label("文件").click();
+        });
     }
 }
