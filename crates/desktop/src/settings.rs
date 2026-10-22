@@ -298,6 +298,13 @@ pub mod key {
     pub const FIXED_DEDUCTION: &str = "iit.fixed_deduction";
     pub const PCT_DEDUCTION: &str = "iit.percent_deduction_rate";
     pub const ITEMS: &str = "surcharge.items";
+    pub const ITEMS_REMOVED: &str = "surcharge.items.removed";
+    pub const THRESHOLD_ENABLED: &str = "vat.threshold_enabled";
+    pub const LEVY_AT: &str = "vat.levy_at_threshold";
+    pub const BASE: &str = "surcharge.base";
+    pub const MODE: &str = "rounding.mode";
+    pub const SURCHARGE_ROUNDING: &str = "rounding.surcharge";
+    pub const PREFER: &str = "reverse.prefer";
     pub const BRACKETS: &str = "iit.brackets";
     pub const SCALE: &str = "rounding.scale";
     pub const SEARCH_WINDOW: &str = "reverse.search_window";
@@ -491,29 +498,92 @@ impl SettingsDraft {
         Ok(cfg)
     }
 
-    /// 与内置默认不同的参数项数（不含主题）。
-    pub fn modified_count(&self) -> usize {
+    /// 显示“已修改”标签的各行（字段标识），与设置界面逐行一致。
+    ///
+    /// 附加税费项目逐项计：与默认同位置同名的标准项目按“是否计征 + 费率数值”比较，
+    /// 自行添加的项目每项计 1；删除了默认项目时另计 1 行（`surcharge.items.removed`）。
+    pub fn modified_rows(&self) -> Vec<String> {
         let d = self.defaults();
-        let same = |a: &str, b: &str| parse_dec(a).is_some() && parse_dec(a) == parse_dec(b);
-        [
-            same(&self.vat_rate, &d.vat_rate),
-            self.threshold_enabled == d.threshold_enabled && same(&self.threshold, &d.threshold),
-            self.levy_at_threshold == d.levy_at_threshold,
-            self.surcharge_base == d.surcharge_base,
-            items_same(&self.items, &d.items),
-            same(&self.fixed_limit, &d.fixed_limit),
-            same(&self.fixed_deduction, &d.fixed_deduction),
-            same(&self.pct_deduction, &d.pct_deduction),
-            self.brackets == d.brackets,
-            self.scale.trim() == d.scale && self.mode == d.mode,
-            self.surcharge_rounding == d.surcharge_rounding,
-            self.prefer == d.prefer,
-            self.search_window.trim() == d.search_window,
-            same(&self.max_net_income, &d.max_net_income),
-        ]
-        .iter()
-        .filter(|s| !**s)
-        .count()
+        let mut v: Vec<String> = Vec::new();
+        let mut add = |k: &str, changed: bool| {
+            if changed {
+                v.push(k.to_string());
+            }
+        };
+        add(key::VAT_RATE, !same_value(&self.vat_rate, &d.vat_rate));
+        add(
+            key::THRESHOLD_ENABLED,
+            self.threshold_enabled != d.threshold_enabled,
+        );
+        add(key::THRESHOLD, !same_value(&self.threshold, &d.threshold));
+        add(key::LEVY_AT, self.levy_at_threshold != d.levy_at_threshold);
+        add(key::BASE, self.surcharge_base != d.surcharge_base);
+        for i in 0..self.items.len() {
+            add(&format!("{}.{i}", key::ITEMS), self.item_modified(i));
+        }
+        add(key::ITEMS_REMOVED, self.standard_items_removed());
+        add(
+            key::FIXED_LIMIT,
+            !same_value(&self.fixed_limit, &d.fixed_limit),
+        );
+        add(
+            key::FIXED_DEDUCTION,
+            !same_value(&self.fixed_deduction, &d.fixed_deduction),
+        );
+        add(
+            key::PCT_DEDUCTION,
+            !same_value(&self.pct_deduction, &d.pct_deduction),
+        );
+        add(key::BRACKETS, self.brackets != d.brackets);
+        add(key::SCALE, self.scale.trim() != d.scale);
+        add(key::MODE, self.mode != d.mode);
+        add(
+            key::SURCHARGE_ROUNDING,
+            self.surcharge_rounding != d.surcharge_rounding,
+        );
+        add(key::PREFER, self.prefer != d.prefer);
+        add(
+            key::SEARCH_WINDOW,
+            self.search_window.trim() != d.search_window,
+        );
+        add(
+            key::MAX_NET,
+            !same_value(&self.max_net_income, &d.max_net_income),
+        );
+        v
+    }
+
+    /// 某一行是否显示“已修改”。
+    pub fn is_modified(&self, k: &str) -> bool {
+        self.modified_rows().iter().any(|r| r == k)
+    }
+
+    /// 第 `i` 个附加税费项目是否与默认不同（自行添加的项目恒为已修改）。
+    pub fn item_modified(&self, i: usize) -> bool {
+        let d = self.defaults();
+        match (self.items.get(i), self.standard_item(i, &d)) {
+            (Some(it), Some(std_item)) => !item_same(it, std_item),
+            (Some(_), None) => true,
+            (None, _) => false,
+        }
+    }
+
+    /// 第 `i` 个项目若与默认同位置同名，返回对应的默认项目。
+    pub fn standard_item<'a>(&self, i: usize, d: &'a SettingsDraft) -> Option<&'a ItemDraft> {
+        d.items
+            .get(i)
+            .filter(|x| self.items.get(i).is_some_and(|it| it.name == x.name))
+    }
+
+    /// 是否删除（或移动）了默认项目。
+    pub fn standard_items_removed(&self) -> bool {
+        let d = self.defaults();
+        (0..d.items.len()).any(|i| self.standard_item(i, &d).is_none())
+    }
+
+    /// 与内置默认不同的参数项数（不含主题），等于界面上“已修改”标签的数量。
+    pub fn modified_count(&self) -> usize {
+        self.modified_rows().len()
     }
 }
 

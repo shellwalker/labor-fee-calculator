@@ -204,7 +204,7 @@ fn settings_surcharge_items_prefilled() {
     assert_eq!(amts, vec![dec!(7.00), dec!(3.00), dec!(2.00)]);
     assert_eq!(b.surcharge_total, dec!(12.00));
     assert_eq!(b.total_cost, dec!(10112.00));
-    assert_eq!(d.modified_count(), 1);
+    assert_eq!(d.modified_count(), 2);
     assert!(!settings::item_same(&d.items[0], &d.defaults().items[0]));
     // 规则说明动态列出计征的项目
     let text: String = rules::rule_groups(&c)
@@ -836,4 +836,73 @@ fn sample_xlsx() {
         ["500.00", "999.99", "1000.00", "4000.00", "23809.52", "63235.29", ""]
     );
     assert_eq!(pv[7][col("测算状态")], "数据错误");
+}
+
+/// 当前分组中显示“已修改”标签的数量（减去左侧状态说明中的一个图例）。
+fn modified_tags(h: &Harness<'_, AppState>) -> usize {
+    h.query_all_by_label("已修改").count() - 1
+}
+
+#[test]
+fn modified_badge_count_matches_row_tags() {
+    // 三项附加税费全部勾选：城市维护建设税、地方教育附加两行标“已修改”，底部计数为 2
+    let mut st = AppState::with_default_config();
+    st.open_settings();
+    if let Some(d) = &mut st.settings {
+        d.section = settings::Section::Surcharge;
+        d.items[0].enabled = true;
+        d.items[2].enabled = true;
+    }
+    let mut h = harness(st);
+    h.run();
+    assert_eq!(modified_tags(&h), 2);
+    assert_eq!(h.state().settings.as_ref().unwrap().modified_count(), 2);
+    h.get_by_label("与内置默认不同 2 项");
+
+    // 各分组都有修改时，所有分组“已修改”标签之和等于底部计数
+    let mut d = SettingsDraft::from_config(&labor_fee_core::Config::default(), ThemeChoice::System);
+    d.vat_rate = "3".into();
+    d.threshold_enabled = false;
+    d.threshold = "500".into();
+    d.items[0].enabled = true;
+    d.items[1].rate = "2".into();
+    d.items.push(settings::ItemDraft {
+        name: "其他附加".into(),
+        rate: "1".into(),
+        enabled: true,
+    });
+    d.fixed_deduction = "1000".into();
+    d.brackets[0].rate = "25".into();
+    d.mode = labor_fee_core::RoundingMode::HalfEven;
+    d.prefer = labor_fee_core::Prefer::MaxCost;
+    let expect = d.modified_count();
+    assert_eq!(expect, 10, "{:?}", d.modified_rows());
+    let mut total = 0;
+    for sec in settings::Section::ALL {
+        let mut st = AppState::with_default_config();
+        st.open_settings();
+        let mut dd = d.clone();
+        dd.section = sec;
+        st.settings = Some(dd);
+        let mut h = harness(st);
+        h.run();
+        total += modified_tags(&h);
+        h.get_by_label(&format!("与内置默认不同 {expect} 项"));
+    }
+    assert_eq!(total, expect);
+
+    // 删除默认项目：单独一行标记并计数
+    let mut d = SettingsDraft::from_config(&labor_fee_core::Config::default(), ThemeChoice::System);
+    d.items.remove(2);
+    assert_eq!(
+        d.modified_rows(),
+        vec![settings::key::ITEMS_REMOVED.to_string()]
+    );
+    let mut st = AppState::with_default_config();
+    st.open_settings();
+    d.section = settings::Section::Surcharge;
+    st.settings = Some(d);
+    let mut h = harness(st);
+    h.run();
+    assert_eq!(modified_tags(&h), 1);
 }

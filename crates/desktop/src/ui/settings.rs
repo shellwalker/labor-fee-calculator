@@ -3,7 +3,7 @@
 use super::widgets::{badge, primary_button, secondary_button, small};
 use crate::icons;
 use crate::settings::{
-    key, prefer_text, rounding_mode_text, same_value, surcharge_base_text, surcharge_rounding_text,
+    key, prefer_text, rounding_mode_text, surcharge_base_text, surcharge_rounding_text,
     BracketDraft, Errors, ItemDraft, Section, SettingsDraft, Tag, ThemeChoice,
 };
 use crate::state::AppState;
@@ -285,7 +285,7 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "增值税征收率",
         "当前按 1% 优惠征收率（小规模纳税人 3% 征收率减按 1%，财政部 税务总局公告2026年第10号）；可改为 3% 等",
         Tag::Confirmed,
-        !same_value(&d.vat_rate, &def.vat_rate),
+        d.is_modified(key::VAT_RATE),
         errors.get(key::VAT_RATE),
         |ui, l| {
             text_field(
@@ -305,7 +305,7 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "启用增值税起征点",
         "未达到起征点时，不征收增值税及附加税费；个人所得税不受影响",
         Tag::Confirmed,
-        d.threshold_enabled != def.threshold_enabled,
+        d.is_modified(key::THRESHOLD_ENABLED),
         None,
         |ui, _| {
             ui.checkbox(&mut d.threshold_enabled, "启用");
@@ -319,7 +319,7 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "起征点",
         "按不含增值税收入判断。按次纳税的起征点为每次（日）销售额 1000 元（财政部 税务总局公告2026年第10号）",
         Tag::Confirmed,
-        !same_value(&d.threshold, &def.threshold),
+        d.is_modified(key::THRESHOLD),
         errors.get(key::THRESHOLD),
         |ui, l| {
             text_field(
@@ -339,7 +339,7 @@ fn vat_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "恰好等于起征点时",
         "勾选：达到起征点即征收（含本数）；不勾选：超过起征点才征收",
         Tag::Confirmed,
-        d.levy_at_threshold != def.levy_at_threshold,
+        d.is_modified(key::LEVY_AT),
         None,
         |ui, _| {
             ui.add_enabled(en, egui::Checkbox::new(&mut d.levy_at_threshold, "征收"));
@@ -362,7 +362,7 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "计税依据",
         "依法以实际缴纳的增值税税额为计税依据",
         Tag::Confirmed,
-        d.surcharge_base != def.surcharge_base,
+        d.is_modified(key::BASE),
         None,
         |ui, l| {
             ComboBox::from_id_salt("surcharge_base")
@@ -383,11 +383,8 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     let mut remove = None;
     for i in 0..d.items.len() {
         let k = format!("{}.{i}", key::ITEMS);
-        let standard = def
-            .items
-            .get(i)
-            .filter(|x| x.name == d.items[i].name)
-            .cloned();
+        let standard = d.standard_item(i, &def).cloned();
+        let item_modified = d.item_modified(i);
         let has_err = errors.contains_key(&k);
         let it = &mut d.items[i];
         match standard {
@@ -404,14 +401,13 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
                     }
                     _ => "",
                 };
-                let modified = !crate::settings::item_same(it, &std_item);
                 let name = it.name.clone();
                 if row(
                     ui,
                     &name,
                     help,
                     Tag::Confirmed,
-                    modified,
+                    item_modified,
                     errors.get(&k),
                     |ui, l| {
                         ui.checkbox(&mut it.enabled, "计征").labelled_by(l);
@@ -433,22 +429,21 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
             }
             None => {
                 ui.horizontal(|ui| {
-                    let id = ui
-                        .allocate_ui_with_layout(
-                            Vec2::new(LABEL_W, 30.0),
-                            Layout::left_to_right(Align::Center),
-                            |ui| {
-                                ui.set_width(LABEL_W);
-                                ui.add(
-                                    TextEdit::singleline(&mut it.name)
-                                        .desired_width(LABEL_W - 12.0)
-                                        .hint_text("项目名称"),
-                                )
-                                .id
-                            },
-                        )
-                        .inner;
-                    ui.checkbox(&mut it.enabled, "计征").labelled_by(id);
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(LABEL_W, 30.0),
+                        Layout::left_to_right(Align::Center),
+                        |ui| {
+                            ui.set_width(LABEL_W);
+                            ui.add(
+                                TextEdit::singleline(&mut it.name)
+                                    .desired_width(LABEL_W - 12.0)
+                                    .hint_text("项目名称"),
+                            )
+                            .id
+                        },
+                    );
+                    ui.checkbox(&mut it.enabled, "计征");
+                    let rid = ui.label(RichText::new("费率").color(p.text_weak)).id;
                     ui.add_enabled(
                         it.enabled,
                         TextEdit::singleline(&mut it.rate)
@@ -456,9 +451,16 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
                             .desired_width(CTRL_W - 110.0)
                             .background_color(if has_err { p.error_soft } else { p.surface }),
                     )
-                    .labelled_by(id);
+                    .labelled_by(rid);
                     ui.label(RichText::new("%").color(p.text_weak));
-                    tag_badge(ui, Tag::Modified);
+                    tag_badge(
+                        ui,
+                        if item_modified {
+                            Tag::Modified
+                        } else {
+                            Tag::Confirmed
+                        },
+                    );
                     if ui
                         .small_button(icons::ERROR)
                         .on_hover_text("删除该项目")
@@ -478,6 +480,14 @@ fn surcharge_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
     }
     if let Some(i) = remove {
         d.items.remove(i);
+    }
+    if d.is_modified(key::ITEMS_REMOVED) {
+        // 删除或调整了默认项目：单独一行标记，计入“与内置默认不同”的项数
+        ui.horizontal(|ui| {
+            ui.add_space(LABEL_W + 8.0);
+            small(ui, "已删除或调整默认项目顺序");
+            tag_badge(ui, Tag::Modified);
+        });
     }
     ui.horizontal(|ui| {
         ui.add_space(LABEL_W + 8.0);
@@ -507,7 +517,7 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "定额减除适用上限",
         "每次收入不超过该金额时，减除定额费用",
         Tag::Verified,
-        !same_value(&d.fixed_limit, &def.fixed_limit),
+        d.is_modified(key::FIXED_LIMIT),
         errors.get(key::FIXED_LIMIT),
         |ui, l| {
             text_field(
@@ -527,7 +537,7 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "定额减除费用",
         "",
         Tag::Verified,
-        !same_value(&d.fixed_deduction, &def.fixed_deduction),
+        d.is_modified(key::FIXED_DEDUCTION),
         errors.get(key::FIXED_DEDUCTION),
         |ui, l| {
             text_field(
@@ -547,7 +557,7 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "定率减除比例",
         "每次收入超过上限时，减除收入的该比例",
         Tag::Verified,
-        !same_value(&d.pct_deduction, &def.pct_deduction),
+        d.is_modified(key::PCT_DEDUCTION),
         errors.get(key::PCT_DEDUCTION),
         |ui, l| {
             text_field(
@@ -567,7 +577,7 @@ fn iit_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "预扣率表（个人所得税预扣率表二，居民个人劳务报酬所得适用）",
     );
     ui.horizontal(|ui| {
-        let modified = d.brackets != def.brackets;
+        let modified = d.is_modified(key::BRACKETS);
         tag_badge(
             ui,
             if modified {
@@ -692,7 +702,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "金额小数位",
         "2 表示到分；增值税税额、各项附加税费、20% 减除费用、应预扣预缴税额分别舍入",
         Tag::Pending,
-        d.scale.trim() != def.scale,
+        d.is_modified(key::SCALE),
         errors.get(key::SCALE),
         |ui, l| {
             text_field(
@@ -712,7 +722,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "舍入方式",
         "请确认与开票、申报系统一致",
         Tag::Pending,
-        d.mode != def.mode,
+        d.is_modified(key::MODE),
         None,
         |ui, l| {
             ComboBox::from_id_salt("rounding_mode")
@@ -739,7 +749,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "附加税费舍入方式",
         "启用多个项目时生效；默认各项目分别按分舍入",
         Tag::Pending,
-        d.surcharge_rounding != def.surcharge_rounding,
+        d.is_modified(key::SURCHARGE_ROUNDING),
         None,
         |ui, l| {
             ComboBox::from_id_salt("surcharge_rounding")
@@ -766,7 +776,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "多解时取值",
         "多个不含增值税收入得到同一税后实发金额时",
         Tag::Confirmed,
-        d.prefer != def.prefer,
+        d.is_modified(key::PREFER),
         None,
         |ui, l| {
             ComboBox::from_id_salt("prefer")
@@ -788,7 +798,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "逐分校准窗口",
         "二分定位后向前、向后逐分校准的范围",
         Tag::Implementation,
-        d.search_window.trim() != def.search_window,
+        d.is_modified(key::SEARCH_WINDOW),
         errors.get(key::SEARCH_WINDOW),
         |ui, l| {
             text_field(
@@ -808,7 +818,7 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, errors: &Errors) {
         "测算搜索上限",
         "不含增值税收入的最大值",
         Tag::Implementation,
-        !same_value(&d.max_net_income, &def.max_net_income),
+        d.is_modified(key::MAX_NET),
         errors.get(key::MAX_NET),
         |ui, l| {
             text_field(
