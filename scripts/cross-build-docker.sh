@@ -4,7 +4,7 @@
 # 用法：scripts/cross-build-docker.sh <linux|windows|macos|all> [选项]
 #   linux    x86_64-unknown-linux-gnu（容器内 Debian bookworm + GTK3）→ dist/linux-x86_64/
 #   windows  x86_64-pc-windows-gnu（mingw-w64）→ dist/windows-gnu-x86_64/*.exe
-#   macos    x86_64 + aarch64 apple-darwin（osxcross，lipo 合并为 universal 并打成 .app）→ dist/macos-universal/
+#   macos    仅 aarch64-apple-darwin（Apple Silicon / M 系列，osxcross，打成 .app）→ dist/macos-arm64/
 #            需要自备 macOS SDK 打包文件（例如 MacOSX14.5.sdk.tar.xz，按 osxcross 说明从 Xcode 提取），
 #            通过 --macos-sdk 指定；请自行确认 Apple SDK 的许可条款。未提供 SDK 时跳过 macOS。
 #   all      linux + windows（提供 --macos-sdk 时再加 macos）
@@ -18,9 +18,10 @@
 # 本机直接构建 Windows 版（Debian/Ubuntu）：
 #   sudo apt install gcc-mingw-w64-x86-64 && rustup target add x86_64-pc-windows-gnu
 #   scripts/cross-build-docker.sh windows --no-docker
+# shellcheck source=lib/common.sh
 source "$(dirname "$0")/lib/common.sh"
 
-WHAT="${1:-}"; [[ -n "$WHAT" ]] && shift || true
+WHAT="${1:-}"; if [[ -n "$WHAT" ]]; then shift; fi
 ENGINE="" NO_DOCKER=0 MACOS_SDK="" DESKTOP_ONLY=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -74,7 +75,7 @@ build_linux() {
 build_macos_osxcross() {
     [[ -n "$MACOS_SDK" && -f "$MACOS_SDK" ]] || { log "未提供 macOS SDK（--macos-sdk），跳过 macOS"; return 0; }
     local oc="${OSXCROSS_DIR:-$ROOT/target/osxcross}"
-    if [[ ! -x "$oc/target/bin/o64-clang" ]]; then
+    if [[ ! -x "$oc/target/bin/oa64-clang" ]]; then
         log "构建 osxcross（首次较慢）"
         [[ -d "$oc/.git" ]] || git clone --depth 1 https://github.com/tpoechtrager/osxcross.git "$oc"
         cp "$MACOS_SDK" "$oc/tarballs/"
@@ -82,15 +83,12 @@ build_macos_osxcross() {
     fi
     export PATH="$oc/target/bin:$PATH"
     export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}"
-    export CC_x86_64_apple_darwin=o64-clang CXX_x86_64_apple_darwin=o64-clang++
     export CC_aarch64_apple_darwin=oa64-clang CXX_aarch64_apple_darwin=oa64-clang++
-    export CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=o64-clang
     export CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
-    local lipo
-    lipo="$(ls "$oc"/target/bin/*-lipo 2>/dev/null | head -1)" || true
-    [[ -n "$lipo" ]] || die "osxcross 中没有找到 lipo"
-    LIPO="$lipo" "$ROOT/scripts/build-macos.sh" --arch universal --no-sign \
-        $([[ $DESKTOP_ONLY -eq 1 ]] && echo --desktop-only)
+    # 有 rcodesign 时 build-macos.sh 会自动 ad-hoc 签名，否则提示到 Mac 上再签
+    local args=()
+    [[ $DESKTOP_ONLY -eq 1 ]] && args+=(--desktop-only)
+    "$ROOT/scripts/build-macos.sh" ${args[@]+"${args[@]}"}
 }
 
 run_inner() {

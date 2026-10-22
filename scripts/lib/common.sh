@@ -3,6 +3,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck disable=SC2034  # 由引用本文件的构建脚本使用
 DIST="$ROOT/dist"
 APP_NAME="labor-fee-desktop"
 APP_TITLE="劳务报酬计算工具"
@@ -25,6 +26,7 @@ ensure_target() {
 copy_docs() {
     local dest="$1"
     cp "$ROOT/crates/desktop/assets/fonts/OFL.txt" "$dest/字体许可证-OFL.txt"
+    # shellcheck disable=SC1111  # 说明文字中的中文引号是有意的
     cat >"$dest/说明.txt" <<TXT
 $APP_TITLE $VERSION
 
@@ -72,7 +74,14 @@ PLIST
 
 # 生成 sha256 校验文件
 write_checksums() {
-    local dir="$1"
-    (cd "$dir" && find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | sort | xargs -r sha256sum >SHA256SUMS) 2>/dev/null \
-        || (cd "$dir" && shasum -a 256 $(ls | grep -v SHA256SUMS) >SHA256SUMS)
+    local dir="$1" f files=()
+    for f in "$dir"/*; do
+        [[ -f "$f" && "$(basename "$f")" != SHA256SUMS ]] && files+=("$(basename "$f")")
+    done
+    [[ ${#files[@]} -gt 0 ]] || return 0
+    if command -v sha256sum >/dev/null 2>&1; then
+        (cd "$dir" && sha256sum "${files[@]}" >SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS)
+    else
+        (cd "$dir" && shasum -a 256 "${files[@]}" >SHA256SUMS.tmp && mv SHA256SUMS.tmp SHA256SUMS)
+    fi
 }

@@ -10,6 +10,7 @@
 #   Debian/Ubuntu：sudo apt install build-essential pkg-config libgtk-3-dev
 #   Fedora：       sudo dnf install gcc pkgconf-pkg-config gtk3-devel
 # 运行时依赖：libGL（Mesa）、libxkbcommon、X11 或 Wayland；gtk3 后端另需 libgtk-3-0。
+# shellcheck source=lib/common.sh
 source "$(dirname "$0")/lib/common.sh"
 
 TARGET="" FEATURES="" DESKTOP_ONLY=0
@@ -36,7 +37,7 @@ else
     pkg-config --exists gtk+-3.0 || die "缺少 GTK3 开发包（libgtk-3-dev / gtk3-devel），或改用 --features portal。"
 fi
 
-cd "$ROOT"
+cd "$ROOT" || exit 1
 TDIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 log "构建桌面程序（$TARGET）"
 cargo build --release --locked -p labor-fee-desktop --target "$TARGET" "${FEATURE_ARGS[@]}"

@@ -168,9 +168,9 @@ GB2312 以外的罕见字（例如个别人名用字）由 egui 的 `system_font
 | 平台 | 命令 | 构建依赖 | 产物 |
 |---|---|---|---|
 | Linux | `scripts/build-linux.sh` | `build-essential pkg-config libgtk-3-dev`（Debian/Ubuntu），或 `gcc pkgconf-pkg-config gtk3-devel`（Fedora） | `dist/linux-<arch>/labor-fee-desktop` 等，以及 `.tar.gz` |
-| macOS | `scripts/build-macos.sh` | Xcode Command Line Tools（`xcode-select --install`） | `dist/macos-universal/LaborFee.app`（x86_64 + arm64 经 lipo 合并），以及 `.zip` |
+| macOS | `scripts/build-macos.sh` | Xcode Command Line Tools（`xcode-select --install`） | `dist/macos-arm64/LaborFee.app`（仅 Apple Silicon / M 系列），以及 `labor-fee-<版本>-macos-arm64.zip` |
 | Windows | `powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1` | Visual Studio 生成工具（C++ 桌面开发，MSVC） | `dist\windows-x86_64\labor-fee-desktop.exe` 等，以及 `.zip` |
-| 交叉构建（可选） | `scripts/cross-build-docker.sh linux\|windows\|macos\|all` | Docker 或 Podman；加 `--no-docker` 则在本机执行，例如本机装 mingw-w64 后构建 Windows 版 | `dist/linux-x86_64/`、`dist/windows-gnu-x86_64/`、`dist/macos-universal/` |
+| 交叉构建（可选） | `scripts/cross-build-docker.sh linux\|windows\|macos\|all` | Docker 或 Podman；加 `--no-docker` 则在本机执行，例如本机装 mingw-w64 后构建 Windows 版 | `dist/linux-x86_64/`、`dist/windows-gnu-x86_64/`、`dist/macos-arm64/` |
 
 说明：
 
@@ -180,7 +180,9 @@ GB2312 以外的罕见字（例如个别人名用字）由 egui 的 `system_font
   - 运行时需要 `libgl1`（Mesa）、`libxkbcommon0`，X11 下还需要 `libxkbcommon-x11-0`，GTK3 后端另需 `libgtk-3-0`。
   - 其它参数：`--target aarch64-unknown-linux-gnu`、`--desktop-only`。
 - **macOS**：
-  - `--arch universal|x86_64|aarch64`，默认 universal。
+  - 只构建 Apple Silicon（M 系列，`aarch64-apple-darwin`）版本，最低 macOS 11.0；不提供 Intel / universal 版本。
+  - 在 Intel Mac 上也能运行脚本，会交叉编译出 arm64 版本（自动 `rustup target add`），但产物只能在 M 系列 Mac 上运行。
+  - 其它参数：`--desktop-only`。
   - 默认对 .app 做 ad-hoc 签名，`--no-sign` 可跳过。
   - 程序没有经过公证，首次打开需要右键“打开”，或在“隐私与安全性”中允许。
 - **Windows**：
@@ -188,7 +190,7 @@ GB2312 以外的罕见字（例如个别人名用字）由 egui 的 `system_font
   - 可用 `-Target aarch64-pc-windows-msvc` 或 `-DesktopOnly`。
 - **交叉构建**：
   - Windows 目标为 `x86_64-pc-windows-gnu`（mingw-w64），产物只依赖系统 DLL。
-  - macOS 使用 osxcross，需要用 `--macos-sdk <MacOSX*.sdk.tar.xz>` 自备 SDK（请自行确认 Apple SDK 的许可条款）；不提供 SDK 时跳过 macOS。
+  - macOS 只构建 `aarch64-apple-darwin`，使用 osxcross，需要用 `--macos-sdk <MacOSX*.sdk.tar.xz>` 自备 SDK（请自行确认 Apple SDK 的许可条款）；不提供 SDK 时跳过 macOS。装有 [rcodesign](https://github.com/indygreg/apple-platform-rs) 时自动 ad-hoc 签名，否则需在 Mac 上执行 `codesign --force --deep -s - LaborFee.app`。
 
 ## 配置说明
 
