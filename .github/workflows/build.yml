@@ -1,0 +1,181 @@
+name: 构建（可复用）
+
+# 由 ci.yml（PR / develop 预览）与 release.yml（main 正式发布）调用：
+#   1. 计算本次构建的版本号（各平台一致）；
+#   2. 三个平台分别做格式检查、静态检查、测试；
+#   3. package=true 时打包 CLI（labor-fee）+ Web（labor-fee-web）+ 桌面程序（labor-fee-desktop）并上传为 artifact。
+# 平台：Linux x86_64、Windows x86_64、macOS Apple Silicon（aarch64-apple-darwin）。不构建 Intel / universal macOS。
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: "pr | preview | release"
+        required: true
+        type: string
+      version:
+        description: "正式发布的版本号（release 必填；其余留空自动生成预发布版本号）"
+        required: false
+        type: string
+        default: ""
+      ref:
+        description: "要构建的提交（留空为触发事件的提交）"
+        required: false
+        type: string
+        default: ""
+      package:
+        description: "是否打包并上传产物"
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      version:
+        description: "本次构建的版本号"
+        value: ${{ jobs.version.outputs.version }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  version:
+    name: 计算版本号
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+
+      - name: 计算版本号
+        id: ver
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          INPUT_VERSION: ${{ inputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          SHA_FOR_PR="${PR_HEAD_SHA:-$HEAD_SHA}"
+          # 短提交号前加 g（同 git describe），避免全数字且以 0 开头时违反 SemVer
+          case "$CHANNEL" in
+            release)
+              if [ -z "$INPUT_VERSION" ]; then echo "::error::正式发布必须指定版本号"; exit 1; fi
+              python3 scripts/ci-version.py --version "$INPUT_VERSION" --output "$GITHUB_OUTPUT" ;;
+            preview)
+              # develop 预览版：<版本>-preview.<流水号>.<UTC时间>.g<短提交号>
+              python3 scripts/ci-version.py --tag preview --run "$RUN_NUMBER" \
+                --sha "g${HEAD_SHA:0:8}" --output "$GITHUB_OUTPUT" ;;
+            pr)
+              python3 scripts/ci-version.py --tag pr --run "${PR_NUMBER:-$RUN_NUMBER}" \
+                --sha "g${SHA_FOR_PR:0:8}" --output "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::未知 channel：$CHANNEL"; exit 1 ;;
+          esac
+          echo "版本号：$(tail -1 "$GITHUB_OUTPUT")"
+
+  build:
+    name: ${{ inputs.package && '检查并构建' || '检查' }} ${{ matrix.label }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            python: python3
+          - label: windows-x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            python: python
+          - label: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            python: python3
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: 安装 Linux 构建依赖（GTK3 文件对话框、pkg-config）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libgtk-3-dev libxkbcommon-dev
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo 依赖源
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-registry-${{ runner.os }}-
+
+      - name: 缓存构建产物
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: cargo-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-target-${{ matrix.target }}-
+
+      - name: 写入版本号 ${{ env.VERSION }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ matrix.python }}" scripts/ci-version.py --version "$VERSION" --stamp
+          # 只同步工作区自身的版本号，第三方依赖仍按 Cargo.lock
+          cargo update --workspace
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+          echo "LFD_GIT_HASH=$(git rev-parse --short=8 HEAD)" >> "$GITHUB_ENV"
+
+      - name: 格式检查
+        if: runner.os == 'Linux'
+        run: cargo fmt --all -- --check
+
+      - name: 静态检查
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: 运行测试
+        run: cargo test --workspace --all-targets --locked
+
+      - name: 打包 (Linux)
+        if: inputs.package && runner.os == 'Linux'
+        run: bash scripts/build-linux.sh --target ${{ matrix.target }}
+
+      - name: 打包 (macOS)
+        if: inputs.package && runner.os == 'macOS'
+        run: bash scripts/build-macos.sh
+
+      - name: 打包 (Windows)
+        if: inputs.package && runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/build-windows.ps1 -Target ${{ matrix.target }}
+
+      - name: 上传产物
+        if: inputs.package
+        uses: actions/upload-artifact@v7
+        with:
+          name: labor-fee-${{ env.VERSION }}-${{ matrix.label }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: ${{ inputs.channel == 'release' && 90 || 14 }}

@@ -1,133 +1,91 @@
 name: CI
 
-# develop、PR、main 都触发：验证（格式/静态检查/测试）+ 构建临时验证产物。
-# 正式发布见 release.yml（只有 main 可以发布）。
+# - PR（目标任意分支）：三平台格式检查 / 静态检查 / 测试，不打包、不发布。
+# - push develop：三平台检查 + 打包，并发布“预览版（测试用）”预发布 Release（标签 develop-preview，每次覆盖）。
+# - 手动触发：同 develop，但只上传 artifact，不更新预览 Release（除非在 develop 上触发）。
+# 正式版本只由 release.yml 在 main 上发布。
 on:
-  push:
-    branches: [main, develop]
   pull_request:
+  push:
+    branches: [develop]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-env:
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: 构建 ${{ matrix.label }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - label: windows-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            arch: x64
-            python: python
-          - label: macos-arm64
-            os: macos-15
-            target: aarch64-apple-darwin
-            arch: arm64
-            python: python3
+    name: 构建
+    uses: ./.github/workflows/build.yml
+    with:
+      channel: ${{ github.event_name == 'pull_request' && 'pr' || 'preview' }}
+      package: ${{ github.event_name != 'pull_request' }}
 
+  preview:
+    name: 发布 develop 预览版
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: develop-preview-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      TAG: develop-preview
+      VERSION: ${{ needs.build.outputs.version }}
+      SHA: ${{ github.sha }}
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v7
-
-      - name: 安装 Rust 工具链
-        uses: dtolnay/rust-toolchain@stable
+      - name: 下载产物
+        uses: actions/download-artifact@v8
         with:
-          targets: ${{ matrix.target }}
-          components: rustfmt, clippy
+          path: artifacts
+          pattern: labor-fee-*
+          merge-multiple: true
 
-      - name: 缓存 Cargo 依赖源
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-registry-
-
-      - name: 缓存构建产物
-        uses: actions/cache@v6
-        with:
-          path: target
-          key: cargo-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-target-${{ matrix.target }}-
-
-      - name: 计算版本号
-        id: ver
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          REF_NAME: ${{ github.ref_name }}
-          RUN_NUMBER: ${{ github.run_number }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          HEAD_SHA: ${{ github.sha }}
+      - name: 生成校验和
+        working-directory: artifacts
         run: |
           set -euo pipefail
-          # PR：候选版本 rc；develop：开发中版本 beta；main：发布候选 rc
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            TAG="rc"; NUM="$PR_NUMBER"; SHA="$PR_HEAD_SHA"
-          elif [ "$REF_NAME" = "develop" ]; then
-            TAG="beta"; NUM="$RUN_NUMBER"; SHA="$HEAD_SHA"
-          else
-            TAG="rc"; NUM="$RUN_NUMBER"; SHA="$HEAD_SHA"
-          fi
-          SHORT_SHA="$(printf '%s' "$SHA" | cut -c1-8)"
-          "${{ matrix.python }}" scripts/ci-version.py \
-            --tag "$TAG" --run "$NUM" --sha "$SHORT_SHA" \
-            --stamp --output "$GITHUB_OUTPUT"
-          echo "版本号：$(tail -1 "$GITHUB_OUTPUT")"
+          ls -l
+          sha256sum -- *.zip *.tar.gz > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
-      - name: 同步 Cargo.lock
-        run: cargo update --workspace
-
-      - name: 固定构建时间（取提交时间，各平台一致）
-        shell: bash
-        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
-
-      - name: 格式检查
-        run: cargo fmt --all -- --check
-
-      - name: 静态检查
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: 运行测试
-        run: cargo test --workspace --all-targets
-
-      - name: 构建发布产物 (macOS)
-        if: matrix.target == 'aarch64-apple-darwin'
-        shell: bash
+      - name: 更新预览版 Release（develop-preview）
         run: |
           set -euo pipefail
-          LFD_GIT_HASH="$(git rev-parse --short=8 HEAD)"
-          export LFD_GIT_HASH
-          bash scripts/build-macos.sh
+          SHORT="$(printf '%s' "$SHA" | cut -c1-8)"
+          NOTES="$(mktemp)"
+          cat > "$NOTES" <<NOTES_EOF
+          > [!WARNING]
+          > **预览版 / 测试版，请勿用于正式核算。** 由 develop 分支自动构建，每次推送 develop 都会覆盖本 Release。
+          > 正式版本请到 [Releases](https://github.com/${GH_REPO}/releases/latest) 下载（只由 main 分支发布）。
 
-      - name: 构建发布产物 (Windows)
-        if: matrix.target == 'x86_64-pc-windows-msvc'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $env:LFD_GIT_HASH = (git rev-parse --short=8 HEAD)
-          ./scripts/build-windows.ps1
+          - 版本号：\`${VERSION}\`
+          - 提交：[\`${SHORT}\`](https://github.com/${GH_REPO}/commit/${SHA})
+          - 构建：[Actions 运行记录](https://github.com/${GH_REPO}/actions/runs/${{ github.run_id }})
 
-      - name: 上传临时验证产物
-        uses: actions/upload-artifact@v7
-        with:
-          name: labor-fee-${{ steps.ver.outputs.version }}-${{ matrix.arch }}
-          path: dist/*.zip
-          if-no-files-found: error
-          retention-days: 30
+          | 平台 | 文件 |
+          | --- | --- |
+          | Windows x86_64 | \`labor-fee-${VERSION}-windows-x86_64.zip\` |
+          | macOS Apple Silicon（M 系列） | \`labor-fee-${VERSION}-macos-arm64.zip\`（未签名、未公证，首次打开需右键「打开」） |
+          | Linux x86_64 | \`labor-fee-${VERSION}-linux-x86_64.tar.gz\` |
+
+          每个压缩包都含桌面程序 labor-fee-desktop、命令行 labor-fee 与 Web 服务 labor-fee-web。
+          NOTES_EOF
+          # 预览标签只用于挂载预览产物，每次指向最新的 develop 提交（不涉及分支历史）
+          gh release delete "$TAG" --cleanup-tag --yes 2>/dev/null || true
+          gh release create "$TAG" artifacts/* \
+            --target "$SHA" \
+            --prerelease \
+            --latest=false \
+            --title "预览版（测试用）${VERSION}" \
+            --notes-file "$NOTES"
+          echo "预览版：https://github.com/${GH_REPO}/releases/tag/${TAG}" >> "$GITHUB_STEP_SUMMARY"
