@@ -41,7 +41,7 @@ jobs:
 
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -50,7 +50,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: 缓存 Cargo 依赖源
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry
@@ -59,7 +59,7 @@ jobs:
           restore-keys: cargo-registry-
 
       - name: 缓存构建产物
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: target
           key: cargo-target-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
@@ -125,7 +125,7 @@ jobs:
           ./scripts/build-windows.ps1
 
       - name: 上传临时验证产物
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: labor-fee-${{ steps.ver.outputs.version }}-${{ matrix.arch }}
           path: dist/*.zip
