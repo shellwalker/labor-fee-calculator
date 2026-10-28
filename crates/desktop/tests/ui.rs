@@ -576,10 +576,10 @@ fn batch_blocking_preview_and_save() {
     st.batch.path = sample_csv(&dir).display().to_string();
     st.run_batch_blocking();
     let res = st.batch.result.as_ref().expect("有结果");
-    assert_eq!(res.output.summary.rows, 4);
-    assert_eq!(res.output.summary.errors, 1);
+    assert_eq!(res.computed.summary.rows, 4);
+    assert_eq!(res.computed.summary.errors, 1);
     assert!(res.summary_text().starts_with("共 4 行：成功 3"));
-    let pv = &res.output.preview;
+    let pv = &res.preview(&st.batch_selected_columns());
     assert_eq!(pv.len(), 5);
     assert_eq!(&pv[0][..3], &["姓名", "到手金额", "不含增值税收入"]);
     assert_eq!(pv[4][2], "10000.00");
@@ -595,11 +595,15 @@ fn batch_blocking_preview_and_save() {
     let p = dir.join("cost.csv");
     std::fs::write(&p, "企业总支出\n1005\n10103.00\n").unwrap();
     st.batch.path = p.display().to_string();
-    st.batch.kind = InputKind::TotalCost;
+    st.set_batch_kind(InputKind::TotalCost);
+    st.batch.path = p.display().to_string();
     st.run_batch_blocking();
     let res = st.batch.result.as_ref().unwrap();
-    assert_eq!(res.output.summary.unreachable_cost, 1);
-    assert!(res.output.preview[1].last().unwrap().contains("不可达区间"));
+    assert_eq!(res.computed.summary.unreachable_cost, 1);
+    assert!(res.preview(&st.batch_selected_columns())[1]
+        .last()
+        .unwrap()
+        .contains("不可达区间"));
     assert_eq!(res.default_file_name(), "cost_计算结果.csv");
 
     st.batch.path = dir.join("x.txt").display().to_string();
@@ -618,7 +622,7 @@ fn batch_background_thread() {
     rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
     st.poll_batch();
     assert!(!st.batch_running());
-    assert_eq!(st.batch.result.as_ref().unwrap().output.summary.exact, 3);
+    assert_eq!(st.batch.result.as_ref().unwrap().computed.summary.exact, 3);
 }
 
 // ---------- 字体 ----------
@@ -822,7 +826,8 @@ fn ui_batch_tab_preview() {
     h.run();
     for s in [
         "选择文件",
-        "选择输入列",
+        "选择测算方式",
+        "导出列",
         "执行测算",
         "导出结果",
         "总行数",
@@ -836,13 +841,13 @@ fn ui_batch_tab_preview() {
     h.get_by_label("▶ 执行");
     h.get_by_label_contains("另存为…");
     h.get_by_label_contains("保存到输入文件旁");
-    h.get_by_label("样例_测算结果.csv");
+    h.get_by_label_contains("样例_测算结果.csv");
     h.get_by_label_contains("共 4 行");
     h.get_by_label("甲");
     assert!(has(&h, "10,103.00"));
     h.get_by_label_contains("无法解析金额");
     // 切换输入列类型
-    h.get_by_label("输入列").click();
+    h.get_by_label("测算方式（输入列）").click();
     h.run();
     h.get_by_label("企业总支出（测算收入）").click();
     h.run();
@@ -1286,10 +1291,10 @@ fn sample_xlsx() {
     st.batch.path = p.display().to_string();
     st.run_batch_blocking();
     let res = st.batch.result.as_ref().expect("有结果");
-    let s = &res.output.summary;
+    let s = &res.computed.summary;
     assert_eq!((s.rows, s.exact, s.errors), (7, 6, 1));
     assert_eq!(res.default_file_name(), "到手样例_测算结果.xlsx");
-    let pv = &res.output.preview;
+    let pv = &res.preview(&st.batch_selected_columns());
     let col = |n: &str| pv[0].iter().position(|x| x == n).unwrap();
     let nets: Vec<&str> = pv[1..]
         .iter()
@@ -1610,4 +1615,292 @@ fn ui_settings_no_status_badges() {
             assert!(h.query_by_label(t).is_none(), "{sec:?} 页仍显示“{t}”");
         }
     }
+}
+
+// ---------- 批量导出列 ----------
+
+/// 当前方式导出列的标题（按顺序）。
+fn export_titles(st: &AppState) -> Vec<String> {
+    st.batch_selected_columns()
+        .iter()
+        .map(|c| c.title().to_string())
+        .collect()
+}
+
+#[test]
+fn batch_columns_default_all_and_per_kind() {
+    let mut st = AppState::with_default_config();
+    let th = st.batch_available_columns();
+    assert!(st.batch_columns_default());
+    assert_eq!(st.batch_selected_columns(), th, "默认全选、默认顺序");
+    assert_eq!(th.first().unwrap().key(), "source");
+    assert_eq!(th.last().unwrap().key(), "notes");
+    assert!(th.iter().any(|c| c.key() == "diff"), "实发测算有“差额”列");
+    st.set_batch_kind(InputKind::NetIncome);
+    let ni = st.batch_available_columns();
+    assert!(!ni.iter().any(|c| c.key() == "diff"), "收入计算无“差额”列");
+    assert_eq!(ni.len() + 1, th.len());
+    st.set_batch_kind(InputKind::TotalCost);
+    assert!(st.batch_columns_default());
+}
+
+#[test]
+fn batch_columns_toggle_move_reset_and_export() {
+    let dir = tmp_dir("cols");
+    let mut st = AppState::with_default_config();
+    st.batch.path = sample_csv(&dir).display().to_string();
+    st.run_batch_blocking();
+    let all = export_titles(&st);
+    // 只导出 税后实发金额、不含增值税收入、原表各列（按此顺序）
+    st.set_all_batch_columns(false);
+    assert!(st.batch_selected_columns().is_empty());
+    let out = dir.join("none.csv");
+    st.save_batch(&out);
+    assert_eq!(
+        st.batch.message.as_ref().unwrap().text,
+        "请至少选择一个导出列"
+    );
+    assert!(!out.exists());
+    let idx = |st: &AppState, key: &str| {
+        st.batch_column_entries()
+            .iter()
+            .position(|(c, _)| c.key() == key)
+            .unwrap()
+    };
+    let i = idx(&st, "take_home");
+    st.set_batch_column_enabled(i, true);
+    st.move_batch_column(i, 0);
+    let i = idx(&st, "net_income");
+    st.set_batch_column_enabled(i, true);
+    st.move_batch_column(i, 1);
+    let i = idx(&st, "source");
+    st.set_batch_column_enabled(i, true);
+    assert_eq!(
+        export_titles(&st),
+        ["税后实发金额", "不含增值税收入", "原表各列"]
+    );
+    assert!(!st.batch_columns_default());
+    // 预览随导出列变化，无需重新计算
+    let pv = st
+        .batch
+        .result
+        .as_ref()
+        .unwrap()
+        .preview(&st.batch_selected_columns());
+    assert_eq!(
+        pv[0],
+        ["税后实发金额", "不含增值税收入", "姓名", "到手金额"]
+    );
+    // CSV 按设置导出
+    let csv = dir.join("cols.csv");
+    st.save_batch(&csv);
+    assert!(st.batch.message.as_ref().unwrap().text.contains("（4 列）"));
+    let text = std::fs::read_to_string(&csv).unwrap();
+    let first = text.trim_start_matches('\u{feff}').lines().next().unwrap();
+    assert_eq!(first, "税后实发金额,不含增值税收入,姓名,到手金额");
+    // xlsx 按设置导出
+    let xlsx = dir.join("cols.xlsx");
+    st.save_batch(&xlsx);
+    assert_eq!(st.batch.message.as_ref().unwrap().level, Level::Ok);
+    let bytes = std::fs::read(&xlsx).unwrap();
+    assert_eq!(&bytes[..2], b"PK", "xlsx 文件");
+    // 恢复默认列
+    st.reset_batch_columns();
+    assert!(st.batch_columns_default());
+    assert_eq!(export_titles(&st), all);
+    // 越界移动无效果
+    st.move_batch_column(0, 999);
+    assert!(st.batch_columns_default());
+}
+
+#[test]
+fn batch_columns_and_result_persist_across_restart() {
+    let dir = tmp_dir("batch-persist");
+    let store = SettingsStore::at(dir.join("labor-fee-desktop"));
+    let input = sample_csv(&dir);
+    {
+        let mut st = AppState::with_store(store.clone());
+        st.batch.path = input.display().to_string();
+        st.run_batch_blocking();
+        assert!(st.batch.result.is_some());
+        st.set_all_batch_columns(false);
+        st.set_batch_column_enabled(1, true); // 不含增值税收入
+        st.move_batch_column(1, 0);
+        // 另一种方式有自己的设置
+        st.set_batch_kind(InputKind::NetIncome);
+        st.set_batch_column_enabled(0, false);
+        st.set_batch_kind(InputKind::TakeHome);
+    }
+    assert!(store.batch_path().exists(), "批量设置写入配置目录");
+    // 原文件删除后仍可从缓存副本恢复
+    std::fs::remove_file(&input).unwrap();
+    let mut st = AppState::with_store(store.clone());
+    assert_eq!(st.batch.kind, InputKind::TakeHome);
+    assert_eq!(st.batch.path, input.display().to_string());
+    assert_eq!(st.batch_selected_columns()[0].key(), "net_income");
+    assert!(st.batch_needs_refresh(), "启动后待恢复上次结果");
+    st.refresh_batch_blocking();
+    let res = st.batch.result.as_ref().expect("恢复了上次结果");
+    assert_eq!(res.computed.summary.rows, 4);
+    assert!(st
+        .batch
+        .message
+        .as_ref()
+        .unwrap()
+        .text
+        .starts_with("已恢复上次的结果"));
+    st.set_batch_kind(InputKind::NetIncome);
+    assert!(!st.batch_columns_default());
+    assert!(!st.batch_column_entries()[0].1);
+}
+
+#[test]
+fn batch_kind_switch_keeps_each_result() {
+    let dir = tmp_dir("kind-stash");
+    let mut st = AppState::with_default_config();
+    st.batch.path = sample_csv(&dir).display().to_string();
+    st.run_batch_blocking();
+    assert_eq!(st.batch.result.as_ref().unwrap().kind, InputKind::TakeHome);
+    st.set_batch_kind(InputKind::TotalCost);
+    assert!(st.batch.result.is_none());
+    assert_eq!(
+        st.batch.path,
+        sample_csv(&dir).display().to_string(),
+        "目标方式未选文件时沿用当前文件"
+    );
+    let p = dir.join("cost.csv");
+    std::fs::write(&p, "企业总支出\n10103.00\n").unwrap();
+    st.batch.path = p.display().to_string();
+    st.run_batch_blocking();
+    st.set_batch_kind(InputKind::TakeHome);
+    let res = st.batch.result.as_ref().expect("切回后结果仍在");
+    assert_eq!(res.kind, InputKind::TakeHome);
+    assert_eq!(res.computed.summary.rows, 4);
+    st.set_batch_kind(InputKind::TotalCost);
+    assert_eq!(st.batch.path, p.display().to_string());
+    assert_eq!(st.batch.result.as_ref().unwrap().computed.summary.rows, 1);
+}
+
+#[test]
+fn batch_recomputes_after_config_change() {
+    let dir = tmp_dir("recompute");
+    let mut st = AppState::with_default_config();
+    st.batch.path = sample_csv(&dir).display().to_string();
+    st.run_batch_blocking();
+    let mut cfg = st.config().clone();
+    for it in &mut cfg.surcharge.items {
+        it.enabled = false;
+    }
+    st.set_config(cfg, "测试").unwrap();
+    assert!(st.batch.result.is_none());
+    assert!(st.batch_needs_refresh());
+    assert!(!st
+        .batch_available_columns()
+        .iter()
+        .any(|c| matches!(c, labor_fee_batch::ExportColumn::Surcharge(_))));
+    st.refresh_batch_blocking();
+    assert_eq!(st.batch.result.as_ref().unwrap().computed.summary.rows, 4);
+}
+
+/// 批量页 + 已有结果的界面。
+fn batch_ui(name: &str) -> Harness<'static, AppState> {
+    let dir = tmp_dir(name);
+    let mut st = AppState::with_default_config();
+    st.tab = Tab::Batch;
+    st.batch.path = sample_csv(&dir).display().to_string();
+    st.run_batch_blocking();
+    let mut h = harness(st);
+    h.run();
+    h
+}
+
+#[test]
+fn ui_batch_columns_card() {
+    let mut h = batch_ui("ui-cols");
+    h.get_by_label_contains("已选 ");
+    h.get_by_role_and_label(Role::CheckBox, "不含增值税收入");
+    assert!(has(&h, "全选"));
+    assert!(has(&h, "全不选"));
+    assert!(
+        h.get_by_label("🔃 恢复默认列")
+            .accesskit_node()
+            .is_disabled(),
+        "默认时不可点"
+    );
+    // 取消一列：预览与统计随之变化
+    let before = export_titles(h.state()).len();
+    h.get_by_role_and_label(Role::CheckBox, "增值税税额")
+        .click();
+    h.run();
+    assert_eq!(export_titles(h.state()).len(), before - 1);
+    assert!(!export_titles(h.state()).contains(&"增值税税额".to_string()));
+    assert!(!h
+        .get_by_label("🔃 恢复默认列")
+        .accesskit_node()
+        .is_disabled());
+    // 上移/下移
+    h.get_by_label("下移 原表各列").click();
+    h.run();
+    assert_eq!(export_titles(h.state())[0], "不含增值税收入");
+    assert_eq!(export_titles(h.state())[1], "原表各列");
+    h.get_by_label("上移 原表各列").click();
+    h.run();
+    assert_eq!(export_titles(h.state())[0], "原表各列");
+    assert!(
+        h.get_by_label("上移 原表各列")
+            .accesskit_node()
+            .is_disabled(),
+        "首行不能上移"
+    );
+    // 全不选：提示并禁用保存
+    h.get_by_label("全不选").click();
+    h.run();
+    assert!(has(&h, "⚠ 请至少选择一个导出列"));
+    assert!(h
+        .get_by_label_contains("保存到输入文件旁")
+        .accesskit_node()
+        .is_disabled());
+    // 恢复默认列
+    h.get_by_label("🔃 恢复默认列").click();
+    h.run();
+    assert!(h.state().batch_columns_default());
+}
+
+#[test]
+fn ui_batch_columns_drag_reorder() {
+    use eframe::egui::{Event, PointerButton, Pos2};
+    let mut h = batch_ui("ui-drag");
+    let handles: Vec<_> = h
+        .query_all_by_label("≡")
+        .map(|n| n.rect().center())
+        .collect();
+    assert!(handles.len() > 3);
+    let (from, to) = (handles[0], handles[2]);
+    let pos = |p: eframe::egui::Pos2| Pos2::new(p.x, p.y);
+    let press = |h: &mut Harness<'static, AppState>, p: Pos2, pressed: bool| {
+        h.input_mut().events.push(Event::PointerButton {
+            pos: p,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Default::default(),
+        });
+    };
+    h.input_mut().events.push(Event::PointerMoved(pos(from)));
+    h.step();
+    press(&mut h, pos(from), true);
+    h.step();
+    for k in 1..=10 {
+        let t = k as f32 / 10.0;
+        let p = from + (to - from) * t + eframe::egui::vec2(0.0, 4.0);
+        h.input_mut().events.push(Event::PointerMoved(p));
+        h.step();
+    }
+    let drop = to + eframe::egui::vec2(0.0, 4.0);
+    press(&mut h, drop, false);
+    h.step();
+    h.run();
+    // 原表各列（第 1 行）拖到第 3 行下方
+    let t = export_titles(h.state());
+    assert_eq!(t[2], "原表各列", "{t:?}");
+    assert_eq!(t[0], "不含增值税收入");
 }

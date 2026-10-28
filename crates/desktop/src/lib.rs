@@ -2,6 +2,7 @@
 //!
 //! 计算全部复用 `labor-fee-core` 与 `labor-fee-batch`，本 crate 只负责状态管理与界面。
 
+pub mod batch_store;
 pub mod fonts;
 pub mod icons;
 #[cfg(target_os = "macos")]

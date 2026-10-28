@@ -39,9 +39,11 @@
       <option value="total-cost">企业总支出</option>
     </select>
     列标题 <input type="text" name="column" placeholder="缺省按输入列识别" style="width:110px">
+    <br>导出列 <input type="text" name="columns" id="columns" placeholder="缺省导出全部列，按默认顺序" style="width:420px">
     <button type="submit">上传并测算</button>
   </form>
   <p class="muted">读取首行标题为“税后实发金额”（兼容旧列名“实发金额”“到手金额”）或所选输入列的列，在右侧追加不含增值税收入、增值税税额、附加税费、企业总支出、个人所得税、测算状态、备注等列，结果文件自动下载。企业总支出无对应收入的行，备注列写明原因和两侧最近的有效总支出。</p>
+  <p class="muted">导出列：逗号分隔的列标识或列标题，按填写顺序导出；留空导出全部列。可用的列（随输入列变化）：<span id="colList">加载中…</span></p>
   <div id="batch"></div>
 </section>
 
@@ -114,6 +116,13 @@ document.getElementById('batchForm').addEventListener('submit', async e => {
   const s = Object.fromEntries((resp.headers.get('x-batch-summary') || '').split(';').filter(Boolean).map(kv => kv.split('=')));
   el.innerHTML = `<p class="ok">已下载 ${name}：共 ${s.rows} 行，成功 ${s.exact}，无法精确匹配 ${s.inexact}，总支出不可达 ${s.unreachable_cost}，数据错误 ${s.errors}，空白 ${s.empty}</p>`;
 });
+async function loadColumns() {
+  const kind = document.querySelector('#batchForm select[name=input_kind]').value;
+  const d = await fetch('/api/columns?input_kind=' + encodeURIComponent(kind)).then(r => r.json());
+  document.getElementById('colList').textContent = d.columns.map(c => `${c.key}（${c.title}）`).join('、');
+}
+document.querySelector('#batchForm select[name=input_kind]').addEventListener('change', loadColumns);
+loadColumns();
 fetch('/api/config').then(r => r.text()).then(t => document.getElementById('cfg').textContent = t);
 </script>
 </body>

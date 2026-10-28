@@ -5,7 +5,8 @@
 //! - 可选“不含增值税收入”（批量计算；兼容“不含税收入”）或“企业总支出”（按企业总支出批量测算；
 //!   兼容“企业总成本”，无对应收入的行在备注列写明原因）。
 //!
-//! 对每一行计算，并在原表右侧追加各项结果列，输出新文件（表格输入输出 xlsx，csv 输入输出 csv）。
+//! 对每一行计算全部结果列（[`compute`]），再按导出列的选择与顺序生成新文件（[`Computed::render`]，
+//! CSV 或 xlsx）；导出列见 [`columns`]，默认导出原表各列与全部结果列。
 //!
 //! 计算全部使用十进制；仅在读取 Excel 数值单元格、写出 Excel 数值单元格这两个 I/O 边界上与 f64 互转
 //! （Excel 文件格式本身以浮点存储数值），读入时会校验小数位不超过两位。
@@ -15,6 +16,9 @@ use rust_decimal::prelude::ToPrimitive;
 use std::io::Cursor;
 use std::str::FromStr;
 use thiserror::Error;
+
+pub mod columns;
+pub use columns::{available_columns, parse_columns, ColumnLayout, ExportColumn};
 
 /// 默认读取的列标题（按税后实发金额测算）。
 pub const DEFAULT_COLUMN: &str = "税后实发金额";
@@ -98,6 +102,8 @@ pub enum BatchError {
     ColumnNotFound(String),
     #[error("读取文件失败：{0}")]
     Read(String),
+    #[error("未选择任何导出列")]
+    NoColumns,
     #[error("写出文件失败：{0}")]
     Write(String),
     #[error(transparent)]
@@ -174,6 +180,8 @@ pub struct Options {
     pub column: Option<String>,
     /// 在 [`Output::preview`] 中返回的数据行数（不含标题行），0 表示不生成预览。
     pub preview_rows: usize,
+    /// 导出的列及顺序；为空时导出全部列（[`available_columns`] 的默认顺序）。
+    pub columns: Option<Vec<ExportColumn>>,
 }
 
 impl Options {
@@ -275,34 +283,6 @@ fn parse_amount(cell: &Cell, scale: u32) -> Result<Option<Decimal>, String> {
     Ok(Some(r))
 }
 
-fn result_headers(cfg: &Config) -> Vec<String> {
-    let mut h: Vec<String> = ["不含增值税收入", "增值税税额"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-    h.extend(cfg.surcharge.enabled_items().map(|i| i.name.clone()));
-    h.extend(
-        [
-            "附加税费减征额",
-            "增值税附加税费合计",
-            "企业总支出",
-            "每次收入",
-            "减除费用",
-            "预扣预缴应纳税所得额",
-            "预扣率",
-            "速算扣除数",
-            "应预扣预缴税额",
-            "税后实发金额",
-            "测算状态",
-            "差额",
-            "备注",
-        ]
-        .iter()
-        .map(|s| s.to_string()),
-    );
-    h
-}
-
 /// 一行的计算结果。
 struct RowResult {
     breakdown: Breakdown,
@@ -311,31 +291,53 @@ struct RowResult {
     notes: Vec<String>,
 }
 
-fn result_values(r: &RowResult) -> Vec<Out> {
+/// 按可导出列计算一行的结果值（与 `cols` 一一对应，原表各列位置为空）。
+fn result_values(cols: &[ExportColumn], r: &RowResult) -> Vec<Out> {
+    use ExportColumn as C;
     let b = &r.breakdown;
-    let mut v = vec![Out::Money(b.net_income), Out::Money(b.vat)];
-    v.extend(b.surcharges.iter().map(|l| Out::Money(l.amount)));
-    v.extend([
-        Out::Money(b.surcharge_relief),
-        Out::Money(b.surcharge_total),
-        Out::Money(b.total_cost),
-        Out::Money(b.iit.income),
-        Out::Money(b.iit.deduction),
-        Out::Money(b.iit.taxable_income),
-        Out::Rate(b.iit.rate),
-        Out::Money(b.iit.quick_deduction),
-        Out::Money(b.iit.tax),
-        Out::Money(b.take_home),
-        Out::Text(r.status.clone()),
-        r.diff.map(Out::Money).unwrap_or(Out::Empty),
-    ]);
-    let mut notes = Vec::new();
-    if b.vat_exempt {
-        notes.push(VAT_EXEMPT_NOTE.to_string());
-    }
-    notes.extend(r.notes.iter().cloned());
-    v.push(Out::Text(notes.join("；")));
-    v
+    cols.iter()
+        .map(|c| match c {
+            C::Source => Out::Empty,
+            C::NetIncome => Out::Money(b.net_income),
+            C::Vat => Out::Money(b.vat),
+            C::Surcharge(name) => b
+                .surcharges
+                .iter()
+                .find(|l| &l.name == name)
+                .map_or(Out::Empty, |l| Out::Money(l.amount)),
+            C::SurchargeRelief => Out::Money(b.surcharge_relief),
+            C::SurchargeTotal => Out::Money(b.surcharge_total),
+            C::TotalCost => Out::Money(b.total_cost),
+            C::Income => Out::Money(b.iit.income),
+            C::Deduction => Out::Money(b.iit.deduction),
+            C::TaxableIncome => Out::Money(b.iit.taxable_income),
+            C::Rate => Out::Rate(b.iit.rate),
+            C::QuickDeduction => Out::Money(b.iit.quick_deduction),
+            C::IitTax => Out::Money(b.iit.tax),
+            C::TakeHome => Out::Money(b.take_home),
+            C::Status => Out::Text(r.status.clone()),
+            C::Diff => r.diff.map_or(Out::Empty, Out::Money),
+            C::Notes => {
+                let mut notes = Vec::new();
+                if b.vat_exempt {
+                    notes.push(VAT_EXEMPT_NOTE.to_string());
+                }
+                notes.extend(r.notes.iter().cloned());
+                Out::Text(notes.join("；"))
+            }
+        })
+        .collect()
+}
+
+/// 出错行：测算状态写简短状态，备注写完整原因，其余为空。
+fn error_values(cols: &[ExportColumn], status: &str, msg: &str) -> Vec<Out> {
+    cols.iter()
+        .map(|c| match c {
+            ExportColumn::Status => Out::Text(status.to_string()),
+            ExportColumn::Notes => Out::Text(msg.to_string()),
+            _ => Out::Empty,
+        })
+        .collect()
 }
 
 /// 读取 CSV：自动识别 UTF-8（含 BOM）与 GBK/GB18030 编码。
@@ -410,107 +412,192 @@ impl Out {
     }
 }
 
-fn row_text(orig: &[Cell], out: &[Out]) -> Vec<String> {
-    orig.iter()
-        .map(Cell::text)
-        .chain(out.iter().map(Out::text))
-        .collect()
+/// 输出表的一列：原表第 i 列，或第 i 个结果列。
+#[derive(Debug, Clone, Copy)]
+enum Slot {
+    Source(usize),
+    Result(usize),
 }
 
-fn write_csv(
-    header: &[Cell],
-    rows: &[(Vec<Cell>, Vec<Out>)],
-    extra: &[String],
-) -> Result<Vec<u8>, BatchError> {
-    let mut buf = "\u{feff}".as_bytes().to_vec(); // BOM，便于 Excel 直接打开
-    {
-        let mut w = csv::WriterBuilder::new()
-            .flexible(true)
-            .from_writer(&mut buf);
-        let h: Vec<String> = header
-            .iter()
-            .map(Cell::text)
-            .chain(extra.iter().cloned())
-            .collect();
-        w.write_record(&h)
-            .map_err(|e| BatchError::Write(e.to_string()))?;
-        for (orig, out) in rows {
-            let rec = row_text(orig, out);
-            w.write_record(&rec)
+/// 已完成计算的批量结果：保存原表与全部结果列，可按任意导出列选择与顺序生成文件和预览，无需重新计算。
+#[derive(Debug, Clone)]
+pub struct Computed {
+    /// 输入列的含义。
+    pub kind: InputKind,
+    /// 输入文件格式（默认导出格式）。
+    pub format: Format,
+    pub summary: Summary,
+    header: Vec<Cell>,
+    columns: Vec<ExportColumn>,
+    rows: Vec<(Vec<Cell>, Vec<Out>)>,
+}
+
+impl Computed {
+    /// 可导出的全部列（默认顺序）。
+    pub fn available_columns(&self) -> &[ExportColumn] {
+        &self.columns
+    }
+
+    /// 数据行数。
+    pub fn row_count(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// 原表的列标题（原表各列展开后的标题）。
+    pub fn source_headers(&self) -> Vec<String> {
+        self.header.iter().map(Cell::text).collect()
+    }
+
+    fn plan(&self, columns: &[ExportColumn]) -> Vec<Slot> {
+        let mut plan = Vec::new();
+        for c in columns {
+            match c {
+                ExportColumn::Source => plan.extend((0..self.header.len()).map(Slot::Source)),
+                c => {
+                    if let Some(i) = self.columns.iter().position(|x| x == c) {
+                        plan.push(Slot::Result(i));
+                    }
+                }
+            }
+        }
+        plan
+    }
+
+    fn header_text(&self, s: Slot) -> String {
+        match s {
+            Slot::Source(i) => self.header[i].text(),
+            Slot::Result(i) => self.columns[i].title().to_string(),
+        }
+    }
+
+    fn row_texts(&self, plan: &[Slot], orig: &[Cell], out: &[Out]) -> Vec<String> {
+        plan.iter()
+            .map(|s| match *s {
+                Slot::Source(i) => orig[i].text(),
+                Slot::Result(i) => out[i].text(),
+            })
+            .collect()
+    }
+
+    /// 导出文件的标题行（按导出列展开）。
+    pub fn headers(&self, columns: &[ExportColumn]) -> Vec<String> {
+        self.plan(columns)
+            .into_iter()
+            .map(|s| self.header_text(s))
+            .collect()
+    }
+
+    /// 文本预览（与 CSV 输出一致）：标题行 + 前 `rows` 个数据行。
+    pub fn preview(&self, columns: &[ExportColumn], rows: usize) -> Vec<Vec<String>> {
+        let plan = self.plan(columns);
+        std::iter::once(plan.iter().map(|s| self.header_text(*s)).collect())
+            .chain(
+                self.rows
+                    .iter()
+                    .take(rows)
+                    .map(|(orig, out)| self.row_texts(&plan, orig, out)),
+            )
+            .collect()
+    }
+
+    /// 按导出列（选择与顺序）生成文件；`format` 为输出格式（CSV 或 xlsx）。
+    pub fn render(&self, columns: &[ExportColumn], format: Format) -> Result<Vec<u8>, BatchError> {
+        let plan = self.plan(columns);
+        if plan.is_empty() {
+            return Err(BatchError::NoColumns);
+        }
+        match format {
+            Format::Csv => self.write_csv(&plan),
+            Format::Spreadsheet => self.write_xlsx(&plan),
+        }
+    }
+
+    fn write_csv(&self, plan: &[Slot]) -> Result<Vec<u8>, BatchError> {
+        let mut buf = "\u{feff}".as_bytes().to_vec(); // BOM，便于 Excel 直接打开
+        {
+            let mut w = csv::WriterBuilder::new()
+                .flexible(true)
+                .from_writer(&mut buf);
+            let h: Vec<String> = plan.iter().map(|s| self.header_text(*s)).collect();
+            w.write_record(&h)
                 .map_err(|e| BatchError::Write(e.to_string()))?;
-        }
-        w.flush().map_err(|e| BatchError::Write(e.to_string()))?;
-    }
-    Ok(buf)
-}
-
-fn write_xlsx(
-    header: &[Cell],
-    rows: &[(Vec<Cell>, Vec<Out>)],
-    extra: &[String],
-) -> Result<Vec<u8>, BatchError> {
-    use rust_xlsxwriter::{Format as XFormat, Workbook};
-    let werr = |e: rust_xlsxwriter::XlsxError| BatchError::Write(e.to_string());
-    let mut wb = Workbook::new();
-    let ws = wb.add_worksheet();
-    ws.set_name("计算结果").map_err(werr)?;
-    let bold = XFormat::new().set_bold();
-    let money = XFormat::new().set_num_format("0.00");
-    let pct = XFormat::new().set_num_format("0%");
-    let ncols = header.len();
-    let write_cell = |ws: &mut rust_xlsxwriter::Worksheet, r: u32, c: u16, cell: &Cell| match cell {
-        Cell::Empty => Ok(()),
-        Cell::Text(s) => ws.write_string(r, c, s).map(|_| ()),
-        Cell::Number(n) => ws.write_number(r, c, *n).map(|_| ()),
-    };
-    for (c, cell) in header.iter().enumerate() {
-        let c = c as u16;
-        match cell {
-            Cell::Empty => {}
-            _ => {
-                ws.write_string_with_format(0, c, cell.text(), &bold)
-                    .map_err(werr)?;
+            for (orig, out) in &self.rows {
+                w.write_record(self.row_texts(plan, orig, out))
+                    .map_err(|e| BatchError::Write(e.to_string()))?;
             }
+            w.flush().map_err(|e| BatchError::Write(e.to_string()))?;
         }
+        Ok(buf)
     }
-    for (i, h) in extra.iter().enumerate() {
-        let c = (ncols + i) as u16;
-        ws.write_string_with_format(0, c, h, &bold).map_err(werr)?;
-        ws.set_column_width(c, 14).map_err(werr)?;
-    }
-    for (ri, (orig, out)) in rows.iter().enumerate() {
-        let r = (ri + 1) as u32;
-        for (c, cell) in orig.iter().enumerate().take(ncols) {
-            write_cell(ws, r, c as u16, cell).map_err(werr)?;
-        }
-        for (i, o) in out.iter().enumerate() {
-            let c = (ncols + i) as u16;
-            match o {
-                Out::Empty => {}
-                Out::Money(d) => {
-                    ws.write_number_with_format(r, c, d.to_f64().unwrap_or(0.0), &money)
-                        .map_err(werr)?;
+
+    fn write_xlsx(&self, plan: &[Slot]) -> Result<Vec<u8>, BatchError> {
+        use rust_xlsxwriter::{Format as XFormat, Workbook};
+        let werr = |e: rust_xlsxwriter::XlsxError| BatchError::Write(e.to_string());
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        ws.set_name("计算结果").map_err(werr)?;
+        let bold = XFormat::new().set_bold();
+        let money = XFormat::new().set_num_format("0.00");
+        let pct = XFormat::new().set_num_format("0%");
+        for (c, s) in plan.iter().enumerate() {
+            let c = c as u16;
+            match *s {
+                Slot::Source(i) => {
+                    if !matches!(self.header[i], Cell::Empty) {
+                        ws.write_string_with_format(0, c, self.header[i].text(), &bold)
+                            .map_err(werr)?;
+                    }
                 }
-                Out::Rate(d) => {
-                    ws.write_number_with_format(r, c, d.to_f64().unwrap_or(0.0), &pct)
+                Slot::Result(i) => {
+                    ws.write_string_with_format(0, c, self.columns[i].title(), &bold)
                         .map_err(werr)?;
-                }
-                Out::Text(s) => {
-                    ws.write_string(r, c, s).map_err(werr)?;
+                    ws.set_column_width(c, 14).map_err(werr)?;
                 }
             }
         }
+        for (ri, (orig, out)) in self.rows.iter().enumerate() {
+            let r = (ri + 1) as u32;
+            for (c, s) in plan.iter().enumerate() {
+                let c = c as u16;
+                match *s {
+                    Slot::Source(i) => match &orig[i] {
+                        Cell::Empty => {}
+                        Cell::Text(t) => {
+                            ws.write_string(r, c, t).map_err(werr)?;
+                        }
+                        Cell::Number(n) => {
+                            ws.write_number(r, c, *n).map_err(werr)?;
+                        }
+                    },
+                    Slot::Result(i) => match &out[i] {
+                        Out::Empty => {}
+                        Out::Money(d) => {
+                            ws.write_number_with_format(r, c, d.to_f64().unwrap_or(0.0), &money)
+                                .map_err(werr)?;
+                        }
+                        Out::Rate(d) => {
+                            ws.write_number_with_format(r, c, d.to_f64().unwrap_or(0.0), &pct)
+                                .map_err(werr)?;
+                        }
+                        Out::Text(t) => {
+                            ws.write_string(r, c, t).map_err(werr)?;
+                        }
+                    },
+                }
+            }
+        }
+        wb.save_to_buffer().map_err(werr)
     }
-    wb.save_to_buffer().map_err(werr)
 }
 
-/// 批量计算：读取输入文件字节，返回追加结果列后的新文件。
-pub fn process(
+/// 批量计算：读取输入文件字节，逐行计算全部结果列（不生成文件）。
+/// 之后可用 [`Computed::render`] 按任意导出列生成文件。
+pub fn compute(
     cfg: &Config,
     input: &[u8],
     format: Format,
     opts: &Options,
-) -> Result<Output, BatchError> {
+) -> Result<Computed, BatchError> {
     let mut table = match format {
         Format::Csv => read_csv(input)?,
         Format::Spreadsheet => read_spreadsheet(input)?,
@@ -539,7 +626,7 @@ pub fn process(
             })?
         }
     };
-    // 原表列数：取标题与各数据行的最大宽度，结果列统一追加在其右侧
+    // 原表列数：取标题与各数据行的最大宽度
     let width = table
         .iter()
         .map(Vec::len)
@@ -556,20 +643,13 @@ pub fn process(
             None
         }
     };
-    let extra = result_headers(cfg);
-    let n = extra.len();
+    let columns = available_columns(cfg, opts.kind);
+    let n = columns.len();
     let mut summary = Summary::default();
     let mut rows = Vec::with_capacity(table.len());
     for mut orig in table {
         orig.resize(width, Cell::Empty);
         summary.rows += 1;
-        // 出错行：测算状态写简短状态，备注写完整原因
-        let err_row = |status: &str, msg: String| {
-            let mut v = vec![Out::Empty; n];
-            v[n - 3] = Out::Text(status.to_string());
-            v[n - 1] = Out::Text(msg);
-            v
-        };
         let amount = match parse_amount(&orig[col], cfg.rounding.scale) {
             Ok(None) => {
                 summary.empty += 1;
@@ -578,7 +658,7 @@ pub fn process(
             }
             Err(e) => {
                 summary.errors += 1;
-                rows.push((orig, err_row(STATUS_ERROR, e)));
+                rows.push((orig, error_values(&columns, STATUS_ERROR, &e)));
                 continue;
             }
             Ok(Some(a)) => a,
@@ -617,44 +697,51 @@ pub fn process(
                 } else {
                     summary.exact += 1;
                 }
-                result_values(&r)
+                result_values(&columns, &r)
             }
             Err(e @ CalcError::CostUnreachable(_)) => {
                 summary.unreachable_cost += 1;
-                err_row(STATUS_UNREACHABLE, e.to_string())
+                error_values(&columns, STATUS_UNREACHABLE, &e.to_string())
             }
             Err(e) => {
                 summary.errors += 1;
-                err_row(STATUS_ERROR, e.to_string())
+                error_values(&columns, STATUS_ERROR, &e.to_string())
             }
         };
         rows.push((orig, out));
     }
-    let bytes = match format {
-        Format::Csv => write_csv(&header, &rows, &extra)?,
-        Format::Spreadsheet => write_xlsx(&header, &rows, &extra)?,
-    };
+    Ok(Computed {
+        kind: opts.kind,
+        format,
+        summary,
+        header,
+        columns,
+        rows,
+    })
+}
+
+/// 批量计算：读取输入文件字节，按导出列（默认全部列）返回新文件（输出格式与输入相同）。
+pub fn process(
+    cfg: &Config,
+    input: &[u8],
+    format: Format,
+    opts: &Options,
+) -> Result<Output, BatchError> {
+    let computed = compute(cfg, input, format, opts)?;
+    let columns = opts
+        .columns
+        .clone()
+        .unwrap_or_else(|| computed.available_columns().to_vec());
+    let bytes = computed.render(&columns, format)?;
     let preview = if opts.preview_rows == 0 {
         Vec::new()
     } else {
-        std::iter::once(
-            header
-                .iter()
-                .map(Cell::text)
-                .chain(extra.iter().cloned())
-                .collect(),
-        )
-        .chain(
-            rows.iter()
-                .take(opts.preview_rows)
-                .map(|(orig, out)| row_text(orig, out)),
-        )
-        .collect()
+        computed.preview(&columns, opts.preview_rows)
     };
     Ok(Output {
         bytes,
         format,
-        summary,
+        summary: computed.summary,
         preview,
     })
 }

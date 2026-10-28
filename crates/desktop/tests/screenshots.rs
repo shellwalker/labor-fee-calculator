@@ -400,3 +400,96 @@ fn screenshots_v7() {
         shoot("v7-8-from-cost-default", st, theme, size, |_| {});
     }
 }
+
+/// 第七轮：批量测算页“导出列”（选择、排序、各测算方式分别配置）（v8 截图）。
+#[test]
+#[ignore = "需要 GPU / 软件渲染，手动运行"]
+fn screenshots_v8() {
+    use labor_fee_batch::InputKind;
+    let size = (1280.0, 1000.0);
+    let dir = std::env::temp_dir().join(format!("lfd-shots-v8-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ni = dir.join("收入样例.csv");
+    std::fs::write(
+        &ni,
+        "姓名,不含增值税收入\n甲,800\n乙,4000\n丙,10000\n丁,23809.52\n",
+    )
+    .unwrap();
+    let tc = dir.join("支出样例.csv");
+    std::fs::write(
+        &tc,
+        "姓名,企业总支出\n甲,1005\n乙,4000\n丙,10103.00\n丁,30000\n",
+    )
+    .unwrap();
+    let batch = || {
+        let mut st = AppState::with_default_config();
+        st.tab = Tab::Batch;
+        st.batch.path = sample_xlsx();
+        st.run_batch_blocking();
+        st
+    };
+    let pos = |st: &AppState, key: &str| {
+        st.batch_column_entries()
+            .iter()
+            .position(|(c, _)| c.key() == key)
+            .unwrap()
+    };
+    for theme in [ThemeChoice::Light, ThemeChoice::Dark] {
+        // 1. 默认：全部导出、默认顺序
+        shoot("v8-1-batch-columns-default", batch(), theme, size, |_| {});
+        // 2. 自定义：只导出部分列并调整顺序（税后实发金额、不含增值税收入在前）
+        let mut st = batch();
+        for k in [
+            "vat",
+            "surcharge_relief",
+            "deduction",
+            "taxable_income",
+            "rate",
+            "quick_deduction",
+            "diff",
+        ] {
+            let i = pos(&st, k);
+            st.set_batch_column_enabled(i, false);
+        }
+        let i = pos(&st, "take_home");
+        st.move_batch_column(i, 1);
+        shoot("v8-2-batch-columns-custom", st, theme, size, |_| {});
+        // 3. 全不选：提示并禁用保存
+        let mut st = batch();
+        st.set_all_batch_columns(false);
+        shoot("v8-3-batch-columns-none", st, theme, size, |_| {});
+        // 4. 按不含增值税收入计算（无“差额”列）
+        let mut st = AppState::with_default_config();
+        st.tab = Tab::Batch;
+        st.set_batch_kind(InputKind::NetIncome);
+        st.batch.path = ni.display().to_string();
+        st.batch.column = "不含增值税收入".into();
+        st.run_batch_blocking();
+        shoot("v8-4-batch-net-income", st, theme, size, |_| {});
+        // 5. 按企业总支出测算
+        let mut st = AppState::with_default_config();
+        st.tab = Tab::Batch;
+        st.set_batch_kind(InputKind::TotalCost);
+        st.batch.path = tc.display().to_string();
+        st.batch.column = "企业总支出".into();
+        st.run_batch_blocking();
+        shoot("v8-5-batch-total-cost", st, theme, size, |_| {});
+        // 6. 空白状态
+        let mut st = AppState::with_default_config();
+        st.tab = Tab::Batch;
+        shoot("v8-6-batch-empty", st, theme, size, |_| {});
+        // 7. 最小窗口：导出列在预览上方
+        shoot(
+            "v8-7-batch-min-size",
+            batch(),
+            theme,
+            (960.0, 640.0),
+            |_| {},
+        );
+        // 8. 悬停说明
+        shoot("v8-8-batch-column-hint", batch(), theme, size, |h| {
+            h.get_by_role_and_label(egui::accesskit::Role::CheckBox, "增值税附加税费合计")
+                .hover();
+        });
+    }
+}

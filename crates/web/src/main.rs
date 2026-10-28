@@ -4,7 +4,9 @@
 //! - `GET /api/forward?net_income=`：按不含增值税收入计算全部金额；
 //! - `GET /api/from-cost?total_cost=`：按企业总支出测算；不可达时返回 422 及原因、两侧最近的有效总支出；
 //! - `GET /api/reverse?take_home=`：按税后实发金额测算；
-//! - `POST /api/batch`：multipart，字段 file、input_kind（take-home/net-income/total-cost）、column。
+//! - `POST /api/batch`：multipart，字段 file、input_kind（take-home/net-income/total-cost）、column、
+//!   columns（导出列及顺序，逗号分隔的列标识或列标题，缺省全部）；
+//! - `GET /api/columns?input_kind=`：该输入列含义下可导出的列（标识、标题、说明，按默认顺序）。
 
 use anyhow::Context;
 use axum::{
@@ -71,9 +73,35 @@ struct CostQuery {
 }
 
 #[derive(Deserialize)]
+struct ColumnsQuery {
+    #[serde(default)]
+    input_kind: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct ReverseQuery {
     #[serde(alias = "amount")]
     take_home: String,
+}
+
+async fn api_columns(State(st): State<Shared>, Query(q): Query<ColumnsQuery>) -> Response {
+    let kind = match q
+        .input_kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        None => labor_fee_batch::InputKind::default(),
+        Some(t) => match labor_fee_batch::InputKind::parse(t) {
+            Some(k) => k,
+            None => return err(StatusCode::BAD_REQUEST, format!("未知输入列含义：{t}")),
+        },
+    };
+    let cols: Vec<_> = labor_fee_batch::available_columns(&st.cfg, kind)
+        .iter()
+        .map(|c| serde_json::json!({"key": c.key(), "title": c.title(), "description": c.description()}))
+        .collect();
+    Json(serde_json::json!({"input_kind": kind.title(), "columns": cols})).into_response()
 }
 
 async fn index() -> Html<&'static str> {
@@ -131,11 +159,13 @@ async fn api_reverse(State(st): State<Shared>, Query(q): Query<ReverseQuery>) ->
 }
 
 /// 上传字段：file（必填）；input_kind（可选，take-home 默认 / net-income / total-cost）；
-/// column（可选，缺省按 input_kind 识别“税后实发金额”/“不含增值税收入”/“企业总支出”，兼容旧列名）。
+/// column（可选，缺省按 input_kind 识别“税后实发金额”/“不含增值税收入”/“企业总支出”，兼容旧列名）；
+/// columns（可选，导出列及顺序，逗号分隔的列标识或列标题，缺省导出全部列）。
 async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
     let mut file: Option<(String, Vec<u8>)> = None;
     let mut column: Option<String> = None;
     let mut kind = labor_fee_batch::InputKind::default();
+    let mut columns_spec: Option<String> = None;
     loop {
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
@@ -156,6 +186,13 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
                 if let Ok(t) = field.text().await {
                     if !t.trim().is_empty() {
                         column = Some(t.trim().to_string());
+                    }
+                }
+            }
+            Some("columns") => {
+                if let Ok(t) = field.text().await {
+                    if !t.trim().is_empty() {
+                        columns_spec = Some(t.trim().to_string());
                     }
                 }
             }
@@ -184,9 +221,17 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
         (Err(e), _) | (_, Err(e)) => return err(StatusCode::BAD_REQUEST, e),
     };
     let cfg = st.cfg.clone();
+    let columns = match columns_spec
+        .map(|spec| labor_fee_batch::parse_columns(&spec, &cfg, kind))
+        .transpose()
+    {
+        Ok(c) => c,
+        Err(e) => return err(StatusCode::BAD_REQUEST, e),
+    };
     let opts = labor_fee_batch::Options {
         kind,
         column,
+        columns,
         ..Default::default()
     };
     let result =
@@ -239,6 +284,7 @@ fn app(cfg: Config, max_upload_mb: usize) -> anyhow::Result<Router> {
         .route("/api/from-cost", get(api_from_cost))
         .route("/api/reverse", get(api_reverse))
         .route("/api/batch", post(api_batch))
+        .route("/api/columns", get(api_columns))
         .layer(DefaultBodyLimit::max(max_upload_mb * 1024 * 1024))
         .with_state(state))
 }
@@ -401,6 +447,73 @@ mod tests {
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         let s = String::from_utf8(b.to_vec()).unwrap();
         assert!(s.contains("10103.00"));
+    }
+
+    async fn batch_with_columns(columns: &str) -> Response {
+        let boundary = "XCOLS";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"columns\"\r\n\r\n{columns}\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"名单.csv\"\r\nContent-Type: text/csv\r\n\r\n姓名,税后实发金额\n张三,8400\n\r\n--{boundary}--\r\n"
+        );
+        let req = Request::post("/api/batch")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        router().oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn batch_upload_selected_columns() {
+        let resp = batch_with_columns("take_home,net_income,source").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        let s = String::from_utf8(b.to_vec()).unwrap();
+        let s = s.trim_start_matches('\u{feff}');
+        let mut lines = s.lines();
+        assert_eq!(
+            lines.next().unwrap(),
+            "税后实发金额,不含增值税收入,姓名,税后实发金额"
+        );
+        assert_eq!(lines.next().unwrap(), "8400.00,10000.00,张三,8400");
+
+        let resp = batch_with_columns("不存在的列").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn columns_api_differs_by_kind() {
+        let get = |q: &'static str| async move {
+            let resp = router()
+                .oneshot(Request::get(q).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            body_json(resp).await
+        };
+        let keys = |v: &serde_json::Value| -> Vec<String> {
+            v["columns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["key"].as_str().unwrap().to_string())
+                .collect()
+        };
+        let take_home = keys(&get("/api/columns").await);
+        let net = keys(&get("/api/columns?input_kind=net-income").await);
+        assert_eq!(take_home.first().map(String::as_str), Some("source"));
+        assert!(take_home.contains(&"diff".to_string()));
+        assert!(!net.contains(&"diff".to_string()));
+        let resp = router()
+            .oneshot(
+                Request::get("/api/columns?input_kind=x")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

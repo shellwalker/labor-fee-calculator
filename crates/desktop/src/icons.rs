@@ -28,3 +28,6 @@ pub const FILE: &str = "📄";
 pub const LINK: &str = "📎";
 pub const TIP: &str = "💡";
 pub const CHART: &str = "📈";
+pub const UP: &str = "▲";
+pub const DOWN: &str = "▼";
+pub const DRAG: &str = "≡";

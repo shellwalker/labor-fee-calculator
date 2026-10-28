@@ -1,9 +1,10 @@
 //! 桌面程序的状态与操作逻辑（与界面绘制分离，便于测试）。所有计算都调用 labor-fee-core / labor-fee-batch。
 
+use crate::batch_store::{kind_index, kind_key, KINDS};
 use crate::settings::{
     item_index, Dialog, Prefs, SettingsDraft, SettingsStore, SettingsWindow, ThemeChoice,
 };
-use labor_fee_batch::{InputKind, Output};
+use labor_fee_batch::{ColumnLayout, Computed, ExportColumn, Format, InputKind};
 use labor_fee_core::{
     forward, from_total_cost, Breakdown, CalcError, Config, CostGap, CostGapReason, Decimal,
     ReverseOutcome, Reverser,
@@ -11,6 +12,7 @@ use labor_fee_core::{
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::Arc;
 
 /// 批量结果预览的行数。
 pub const PREVIEW_ROWS: usize = 50;
@@ -203,7 +205,9 @@ impl SingleTab {
     }
 }
 
-/// 批量页签。
+/// 批量页签。`path`/`column`/`result`/`message` 为当前测算方式的输入与结果；
+/// 切换方式（[`AppState::set_batch_kind`]）时与其他方式暂存的内容互换，每种方式各自保留上次的输入与结果，
+/// 离开批量页再回来、切换方式再切回都不会丢失。
 #[derive(Default)]
 pub struct BatchTab {
     /// 输入文件路径（可手工输入，也可用“选择文件…”）。
@@ -213,20 +217,56 @@ pub struct BatchTab {
     pub column: String,
     pub result: Option<BatchResult>,
     pub message: Option<Status>,
-    running: Option<Receiver<Result<BatchResult, String>>>,
+    /// 各测算方式的导出列设置（选择与顺序），下标见 [`kind_index`]。
+    pub layouts: [ColumnLayout; 3],
+    /// 其他测算方式暂存的输入与结果。
+    others: [ModeStash; 3],
+    /// 待按当前参数重新计算的输入（参数更改后、启动时恢复上次结果）。
+    pending: Option<BatchInput>,
+    running: Option<RunningBatch>,
 }
 
-/// 一次批量计算的结果。
+/// 某种测算方式暂存的输入与结果。
+#[derive(Default)]
+struct ModeStash {
+    path: String,
+    column: String,
+    result: Option<BatchResult>,
+    message: Option<Status>,
+    pending: Option<BatchInput>,
+}
+
+struct RunningBatch {
+    kind: InputKind,
+    /// 开始时的参数版本；完成时参数已更改则按新参数重算。
+    generation: u64,
+    rx: Receiver<Result<BatchResult, String>>,
+}
+
+/// 批量计算的输入快照（原文件路径与内容）。
+#[derive(Clone)]
+pub struct BatchInput {
+    pub path: PathBuf,
+    pub bytes: Arc<Vec<u8>>,
+    /// 是否为启动时恢复上次的结果。
+    pub restored: bool,
+}
+
+/// 一次批量计算的结果：保存全部结果列，导出时按导出列设置生成文件，修改导出列无需重新计算。
 pub struct BatchResult {
     pub input: PathBuf,
     pub kind: InputKind,
-    pub output: Output,
+    pub computed: Computed,
+    /// 输入文件内容快照（参数更改后据此重新计算，并缓存供下次启动恢复）。
+    pub bytes: Arc<Vec<u8>>,
+    /// 是否为启动时恢复的结果（按当前参数重新计算）。
+    pub restored: bool,
 }
 
 impl BatchResult {
     /// 统计说明。
     pub fn summary_text(&self) -> String {
-        let s = &self.output.summary;
+        let s = &self.computed.summary;
         let mut t = format!("共 {} 行：成功 {}", s.rows, s.exact);
         if self.kind == InputKind::TakeHome {
             t += &format!("，无法精确匹配 {}", s.inexact);
@@ -238,16 +278,32 @@ impl BatchResult {
         t
     }
 
-    /// 默认输出文件名（与 CLI 一致：原名_反算结果 / 原名_计算结果）。
+    /// 默认输出文件名（与 CLI 一致：原名_测算结果 / 原名_计算结果）。
     pub fn default_file_name(&self) -> String {
         let name = self.input.to_string_lossy();
         labor_fee_batch::output_file_name_for(&name, self.kind)
-            .unwrap_or_else(|_| format!("结果.{}", self.output.format.output_extension()))
+            .unwrap_or_else(|_| format!("结果.{}", self.computed.format.output_extension()))
     }
 
     /// 默认保存位置：输入文件同目录。
     pub fn default_save_path(&self) -> PathBuf {
         self.input.with_file_name(self.default_file_name())
+    }
+
+    /// 按导出列生成的预览（标题行 + 前 [`PREVIEW_ROWS`] 行）。
+    pub fn preview(&self, columns: &[ExportColumn]) -> Vec<Vec<String>> {
+        self.computed.preview(columns, PREVIEW_ROWS)
+    }
+}
+
+/// 按文件扩展名确定导出格式：`.csv` 为 CSV，其余为 xlsx。
+pub fn export_format(path: &Path) -> Format {
+    match path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+    {
+        Some(e) if e == "csv" => Format::Csv,
+        _ => Format::Spreadsheet,
     }
 }
 
@@ -265,6 +321,8 @@ pub struct AppState {
     pub reverse: SingleTab,
     pub from_cost: SingleTab,
     pub batch: BatchTab,
+    /// 参数版本（每次更换参数加一），用于判断后台批量计算是否按旧参数完成。
+    cfg_generation: u64,
     /// 当前口径来源说明。
     pub source: String,
     /// 顶部提示（如启动时加载设置失败）。
@@ -373,6 +431,7 @@ impl AppState {
             reverse: SingleTab::default(),
             from_cost: SingleTab::default(),
             batch: BatchTab::default(),
+            cfg_generation: 0,
             source: source.into(),
             notice: None,
             prefs: Prefs::default(),
@@ -407,6 +466,7 @@ impl AppState {
             Err(e) => st.notice = Some(Status::error(e)),
         }
         st.store = Some(store);
+        st.restore_batch();
         st
     }
 
@@ -671,6 +731,8 @@ impl AppState {
         self.batch.path = path.display().to_string();
         self.batch.result = None;
         self.batch.message = None;
+        self.batch.pending = None;
+        self.persist_batch();
     }
 
     pub fn config(&self) -> &Config {
@@ -763,8 +825,24 @@ impl AppState {
         if self.from_cost.outcome != Outcome::None {
             self.calc_from_cost();
         }
-        self.batch.result = None;
-        self.batch.message = None;
+        // 批量结果按新参数重新计算（当前方式在批量页显示时后台重算，其他方式切换过去时重算）
+        self.cfg_generation += 1;
+        let b = &mut self.batch;
+        let slots = std::iter::once((&mut b.result, &mut b.message, &mut b.pending)).chain(
+            b.others
+                .iter_mut()
+                .map(|s| (&mut s.result, &mut s.message, &mut s.pending)),
+        );
+        for (result, message, pending) in slots {
+            if let Some(r) = result.take() {
+                *pending = Some(BatchInput {
+                    path: r.input,
+                    bytes: r.bytes,
+                    restored: false,
+                });
+                *message = Some(Status::ok("参数已更改，正在按新参数重新计算…"));
+            }
+        }
         Ok(())
     }
 
@@ -795,106 +873,386 @@ impl AppState {
         self.notice = Some(Status::ok("已恢复内置默认参数"));
     }
 
+    // ---------------- 批量测算 ----------------
+
+    /// 当前测算方式在当前参数下可导出的全部列（默认顺序）。
+    pub fn batch_available_columns(&self) -> Vec<ExportColumn> {
+        labor_fee_batch::available_columns(&self.cfg, self.batch.kind)
+    }
+
+    /// 当前测算方式的导出列列表（实际顺序与是否导出）。
+    pub fn batch_column_entries(&self) -> Vec<(ExportColumn, bool)> {
+        self.batch.layouts[kind_index(self.batch.kind)].entries(&self.batch_available_columns())
+    }
+
+    /// 当前测算方式导出的列（按顺序）。
+    pub fn batch_selected_columns(&self) -> Vec<ExportColumn> {
+        self.batch.layouts[kind_index(self.batch.kind)].selected(&self.batch_available_columns())
+    }
+
+    /// 当前测算方式的导出列是否为默认（全部导出、默认顺序）。
+    pub fn batch_columns_default(&self) -> bool {
+        ColumnLayout::from_entries(
+            &self.batch_column_entries(),
+            &self.batch_available_columns(),
+        )
+        .is_default()
+    }
+
+    /// 以界面上的列表更新当前测算方式的导出列设置并保存。
+    pub fn set_batch_column_entries(&mut self, entries: &[(ExportColumn, bool)]) {
+        let avail = self.batch_available_columns();
+        let layout = ColumnLayout::from_entries(entries, &avail);
+        let i = kind_index(self.batch.kind);
+        if self.batch.layouts[i] != layout {
+            self.batch.layouts[i] = layout;
+            self.persist_batch();
+        }
+    }
+
+    /// 勾选或取消第 `index` 列。
+    pub fn set_batch_column_enabled(&mut self, index: usize, on: bool) {
+        let mut e = self.batch_column_entries();
+        if let Some(x) = e.get_mut(index) {
+            x.1 = on;
+            self.set_batch_column_entries(&e);
+        }
+    }
+
+    /// 把第 `from` 列移到第 `to` 个位置（拖动排序、上移/下移）。
+    pub fn move_batch_column(&mut self, from: usize, to: usize) {
+        let mut e = self.batch_column_entries();
+        if from >= e.len() || to >= e.len() || from == to {
+            return;
+        }
+        let x = e.remove(from);
+        e.insert(to, x);
+        self.set_batch_column_entries(&e);
+    }
+
+    /// 全部勾选或全部取消（保持顺序）。
+    pub fn set_all_batch_columns(&mut self, on: bool) {
+        let e: Vec<_> = self
+            .batch_column_entries()
+            .into_iter()
+            .map(|(c, _)| (c, on))
+            .collect();
+        self.set_batch_column_entries(&e);
+    }
+
+    /// 恢复默认列：全部导出、默认顺序。
+    pub fn reset_batch_columns(&mut self) {
+        self.batch.layouts[kind_index(self.batch.kind)] = ColumnLayout::default();
+        self.persist_batch();
+    }
+
+    /// 切换测算方式：当前方式的输入与结果暂存，换出目标方式上次的输入与结果。
+    /// 目标方式尚未选择文件时沿用当前文件路径。
+    pub fn set_batch_kind(&mut self, kind: InputKind) {
+        let b = &mut self.batch;
+        if b.kind == kind {
+            return;
+        }
+        let old = kind_index(b.kind);
+        let new = kind_index(kind);
+        b.others[old] = ModeStash {
+            path: b.path.clone(),
+            column: std::mem::take(&mut b.column),
+            result: b.result.take(),
+            message: b.message.take(),
+            pending: b.pending.take(),
+        };
+        let s = std::mem::take(&mut b.others[new]);
+        if !s.path.trim().is_empty() || s.result.is_some() || s.pending.is_some() {
+            b.path = s.path;
+        }
+        b.column = s.column;
+        b.result = s.result;
+        b.message = s.message;
+        b.pending = s.pending;
+        b.kind = kind;
+        self.persist_batch();
+    }
+
     fn batch_job(
         &self,
+        input: Option<BatchInput>,
     ) -> Result<impl FnOnce() -> Result<BatchResult, String> + Send + 'static, String> {
-        let path = PathBuf::from(self.batch.path.trim());
-        if self.batch.path.trim().is_empty() {
-            return Err("请先选择文件".into());
-        }
+        let (path, snapshot, restored) = match input {
+            Some(i) => (i.path, Some(i.bytes), i.restored),
+            None => {
+                if self.batch.path.trim().is_empty() {
+                    return Err("请先选择文件".into());
+                }
+                (PathBuf::from(self.batch.path.trim()), None, false)
+            }
+        };
         let name = path.to_string_lossy().to_string();
-        let format = labor_fee_batch::Format::from_file_name(&name).map_err(|e| e.to_string())?;
+        let format = Format::from_file_name(&name).map_err(|e| e.to_string())?;
         let cfg = self.cfg.clone();
         let kind = self.batch.kind;
         let column = Some(self.batch.column.trim().to_string()).filter(|c| !c.is_empty());
         Ok(move || {
-            let bytes = std::fs::read(&path).map_err(|e| format!("读取文件失败：{e}"))?;
+            let bytes = match snapshot {
+                Some(b) => b,
+                None => Arc::new(std::fs::read(&path).map_err(|e| format!("读取文件失败：{e}"))?),
+            };
             let opts = labor_fee_batch::Options {
                 kind,
                 column,
-                preview_rows: PREVIEW_ROWS,
+                ..Default::default()
             };
-            let output =
-                labor_fee_batch::process(&cfg, &bytes, format, &opts).map_err(|e| e.to_string())?;
+            let computed =
+                labor_fee_batch::compute(&cfg, &bytes, format, &opts).map_err(|e| e.to_string())?;
             Ok(BatchResult {
                 input: path,
                 kind,
-                output,
+                computed,
+                bytes,
+                restored,
             })
         })
     }
 
-    fn finish_batch(&mut self, r: Result<BatchResult, String>) {
-        match r {
+    fn finish_batch(&mut self, kind: InputKind, generation: u64, r: Result<BatchResult, String>) {
+        // 计算期间参数已更改：按新参数重算
+        let (result, message, pending) = match r {
+            Ok(res) if generation != self.cfg_generation => (
+                None,
+                Some(Status::ok("参数已更改，正在按新参数重新计算…")),
+                Some(BatchInput {
+                    path: res.input,
+                    bytes: res.bytes,
+                    restored: res.restored,
+                }),
+            ),
             Ok(res) => {
-                self.batch.message = Some(Status::ok(res.summary_text()));
-                self.batch.result = Some(res);
+                let text = if res.restored {
+                    format!(
+                        "已恢复上次的结果（按当前参数重新计算）：{}",
+                        res.summary_text()
+                    )
+                } else {
+                    res.summary_text()
+                };
+                (Some(res), Some(Status::ok(text)), None)
             }
-            Err(e) => {
-                self.batch.result = None;
-                self.batch.message = Some(Status::error(e));
+            Err(e) => (None, Some(Status::error(e)), None),
+        };
+        let fresh = result.as_ref().is_some_and(|r| !r.restored);
+        if kind == self.batch.kind {
+            self.batch.result = result;
+            self.batch.message = message;
+            self.batch.pending = pending;
+        } else {
+            let s = &mut self.batch.others[kind_index(kind)];
+            s.result = result;
+            s.message = message;
+            s.pending = pending;
+        }
+        if fresh {
+            self.cache_batch_input(kind);
+        }
+        self.persist_batch();
+    }
+
+    fn mode_result(&self, kind: InputKind) -> Option<&BatchResult> {
+        if kind == self.batch.kind {
+            self.batch.result.as_ref()
+        } else {
+            self.batch.others[kind_index(kind)].result.as_ref()
+        }
+    }
+
+    /// 缓存输入文件副本（下次启动恢复结果用）。
+    fn cache_batch_input(&mut self, kind: InputKind) {
+        let Some(store) = &self.store else { return };
+        let Some(res) = self.mode_result(kind) else {
+            return;
+        };
+        let mut bp = store.load_batch();
+        let m = bp.mode_mut(kind);
+        match store.save_batch_input(kind, &res.input, &res.bytes) {
+            Ok(Some(name)) => {
+                m.cached = name;
+                m.cached_from = res.input.display().to_string();
             }
+            _ => {
+                m.cached.clear();
+                m.cached_from.clear();
+            }
+        }
+        let _ = store.save_batch(&bp);
+    }
+
+    /// 保存批量测算设置（当前方式、各方式的路径、列标题与导出列）。
+    fn persist_batch(&self) {
+        let Some(store) = &self.store else { return };
+        let mut bp = store.load_batch();
+        bp.kind = kind_key(self.batch.kind).to_string();
+        for k in KINDS {
+            let i = kind_index(k);
+            let (path, column) = if k == self.batch.kind {
+                (&self.batch.path, &self.batch.column)
+            } else {
+                (&self.batch.others[i].path, &self.batch.others[i].column)
+            };
+            let m = bp.mode_mut(k);
+            m.path = path.trim().to_string();
+            m.column = column.trim().to_string();
+            m.set_layout(&self.batch.layouts[i]);
+        }
+        if let Err(e) = store.save_batch(&bp) {
+            eprintln!("保存批量测算状态失败：{e}");
+        }
+    }
+
+    /// 启动时读取批量测算设置，并准备恢复各方式上次的结果（按当前参数重新计算）。
+    fn restore_batch(&mut self) {
+        let Some(store) = &self.store else { return };
+        let bp = store.load_batch();
+        let kind = bp.kind();
+        for k in KINDS {
+            let i = kind_index(k);
+            let m = bp.mode(k);
+            self.batch.layouts[i] = m.layout();
+            let pending = store.load_batch_input(&m.cached).and_then(|bytes| {
+                let from = PathBuf::from(&m.cached_from);
+                // 副本的格式按原文件名判断
+                Format::from_file_name(&m.cached_from).ok()?;
+                Some(BatchInput {
+                    path: from,
+                    bytes: Arc::new(bytes),
+                    restored: true,
+                })
+            });
+            let message = pending
+                .as_ref()
+                .map(|_| Status::ok("正在恢复上次的批量结果…"));
+            let s = ModeStash {
+                path: m.path.clone(),
+                column: m.column.clone(),
+                result: None,
+                message,
+                pending,
+            };
+            if k == kind {
+                self.batch.path = s.path;
+                self.batch.column = s.column;
+                self.batch.message = s.message;
+                self.batch.pending = s.pending;
+            } else {
+                self.batch.others[i] = s;
+            }
+        }
+        self.batch.kind = kind;
+    }
+
+    /// 当前方式是否有待重新计算的结果（参数更改后、启动恢复）。
+    pub fn batch_needs_refresh(&self) -> bool {
+        self.batch.pending.is_some() && self.batch.running.is_none()
+    }
+
+    /// 在后台按当前参数重新计算待更新的结果（批量页显示时调用）。
+    pub fn refresh_batch(&mut self, on_done: impl FnOnce() + Send + 'static) {
+        if let Some(input) = self.batch.pending.clone() {
+            self.spawn_batch(Some(input), on_done);
+        }
+    }
+
+    /// 同步重新计算待更新的结果（测试用）。
+    pub fn refresh_batch_blocking(&mut self) {
+        if let Some(input) = self.batch.pending.clone() {
+            let r = self.batch_job(Some(input)).and_then(|job| job());
+            self.finish_batch(self.batch.kind, self.cfg_generation, r);
         }
     }
 
     /// 同步执行批量计算（测试与小文件用）。
     pub fn run_batch_blocking(&mut self) {
-        let r = self.batch_job().and_then(|job| job());
-        self.finish_batch(r);
+        self.batch.pending = None;
+        let r = self.batch_job(None).and_then(|job| job());
+        self.finish_batch(self.batch.kind, self.cfg_generation, r);
     }
 
-    /// 在后台线程执行批量计算；`on_done` 在完成时调用（用于请求界面重绘）。
+    /// 在后台线程执行批量计算（读取输入文件）；`on_done` 在完成时调用（用于请求界面重绘）。
     pub fn start_batch(&mut self, on_done: impl FnOnce() + Send + 'static) {
+        self.spawn_batch(None, on_done);
+    }
+
+    fn spawn_batch(&mut self, input: Option<BatchInput>, on_done: impl FnOnce() + Send + 'static) {
         if self.batch.running.is_some() {
             return;
         }
-        match self.batch_job() {
-            Err(e) => self.finish_batch(Err(e)),
+        let refresh = input.is_some();
+        match self.batch_job(input) {
+            Err(e) => {
+                self.batch.pending = None;
+                self.finish_batch(self.batch.kind, self.cfg_generation, Err(e))
+            }
             Ok(job) => {
                 let (tx, rx) = std::sync::mpsc::channel();
                 std::thread::spawn(move || {
                     let _ = tx.send(job());
                     on_done();
                 });
-                self.batch.result = None;
-                self.batch.message = None;
-                self.batch.running = Some(rx);
+                if !refresh {
+                    self.batch.result = None;
+                    self.batch.message = None;
+                }
+                self.batch.pending = None;
+                self.batch.running = Some(RunningBatch {
+                    kind: self.batch.kind,
+                    generation: self.cfg_generation,
+                    rx,
+                });
             }
         }
     }
 
-    /// 是否有批量计算在进行。
+    /// 是否有批量计算在进行（当前方式）。
     pub fn batch_running(&self) -> bool {
-        self.batch.running.is_some()
+        self.batch
+            .running
+            .as_ref()
+            .is_some_and(|r| r.kind == self.batch.kind)
     }
 
     /// 检查后台批量计算是否完成。
     pub fn poll_batch(&mut self) {
-        let Some(rx) = &self.batch.running else {
+        let Some(run) = &self.batch.running else {
             return;
         };
-        match rx.try_recv() {
-            Ok(r) => {
-                self.batch.running = None;
-                self.finish_batch(r);
-            }
-            Err(TryRecvError::Empty) => {}
-            Err(TryRecvError::Disconnected) => {
-                self.batch.running = None;
-                self.finish_batch(Err("批量测算意外中止".into()));
-            }
-        }
+        let (kind, generation) = (run.kind, run.generation);
+        let r = match run.rx.try_recv() {
+            Ok(r) => r,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => Err("批量测算意外中止".into()),
+        };
+        self.batch.running = None;
+        self.finish_batch(kind, generation, r);
     }
 
-    /// 保存批量结果到指定路径。
+    /// 按当前导出列设置生成文件并保存；格式按扩展名（`.csv` 为 CSV，其余为 xlsx）。
     pub fn save_batch(&mut self, path: &Path) {
         let Some(res) = &self.batch.result else {
             self.batch.message = Some(Status::error("没有可保存的结果"));
             return;
         };
-        self.batch.message = Some(match std::fs::write(path, &res.output.bytes) {
-            Ok(()) => Status::ok(format!("已保存：{}", path.display())),
-            Err(e) => Status::error(format!("保存失败：{e}")),
+        let cols = self.batch_selected_columns();
+        if cols.is_empty() {
+            self.batch.message = Some(Status::error("请至少选择一个导出列"));
+            return;
+        }
+        let n = res.computed.headers(&cols).len();
+        let r = res
+            .computed
+            .render(&cols, export_format(path))
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| std::fs::write(path, bytes).map_err(|e| format!("保存失败：{e}")));
+        self.batch.message = Some(match r {
+            Ok(()) => Status::ok(format!("已保存：{}（{n} 列）", path.display())),
+            Err(e) => Status::error(e),
         });
     }
 }

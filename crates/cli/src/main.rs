@@ -46,8 +46,9 @@ enum Cmd {
     },
     /// 批量测算：读取 xlsx/xls/ods/csv 中的金额列，追加结果列并输出新文件（默认读取“税后实发金额”列）
     Batch {
-        /// 输入文件
-        input: PathBuf,
+        /// 输入文件（使用 --list-columns 时可省略）
+        #[arg(required_unless_present = "list_columns")]
+        input: Option<PathBuf>,
         /// 输出文件（缺省为 输入名_测算结果/计算结果.xlsx/csv，与输入同目录）
         #[arg(short, long)]
         output: Option<PathBuf>,
@@ -57,6 +58,13 @@ enum Cmd {
         /// 读取的列标题（缺省按输入列含义识别：税后实发金额 / 不含增值税收入 / 企业总支出，兼容旧列名）
         #[arg(long)]
         column: Option<String>,
+        /// 导出列及顺序：逗号分隔的列标识或列标题，如 `source,net_income,iit_tax,take_home`
+        /// 或 `原表各列,不含增值税收入,应预扣预缴税额`（缺省导出全部列；可用的列见 --list-columns）
+        #[arg(long)]
+        columns: Option<String>,
+        /// 列出该输入列含义下可导出的列（标识与标题，按默认顺序）后退出
+        #[arg(long)]
+        list_columns: bool,
     },
     /// 输出当前生效的计算参数（TOML）
     Config,
@@ -215,13 +223,37 @@ fn run() -> Result<()> {
             output,
             input_kind,
             column,
+            columns,
+            list_columns,
         } => {
+            if list_columns {
+                let avail = labor_fee_batch::available_columns(&cfg, input_kind);
+                if cli.json {
+                    let v: Vec<_> = avail
+                        .iter()
+                        .map(|c| serde_json::json!({"key": c.key(), "title": c.title()}))
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&v)?);
+                } else {
+                    println!("{}可导出的列（默认全部、按此顺序）：", input_kind.title());
+                    for c in &avail {
+                        println!("  {:<18} {}", c.key(), c.title());
+                    }
+                }
+                return Ok(());
+            }
+            let input = input.context("请指定输入文件")?;
+            let columns = columns
+                .map(|spec| labor_fee_batch::parse_columns(&spec, &cfg, input_kind))
+                .transpose()
+                .map_err(anyhow::Error::msg)?;
             let name = input.to_string_lossy().to_string();
             let format = labor_fee_batch::Format::from_file_name(&name)?;
             let bytes = std::fs::read(&input).with_context(|| format!("读取文件失败：{name}"))?;
             let opts = labor_fee_batch::Options {
                 kind: input_kind,
                 column,
+                columns,
                 ..Default::default()
             };
             let out = labor_fee_batch::process(&cfg, &bytes, format, &opts)?;

@@ -1,5 +1,8 @@
 use calamine::{Data, Reader};
-use labor_fee_batch::{process, BatchError, Format, InputKind, Options};
+use labor_fee_batch::{
+    available_columns, compute, parse_columns, process, BatchError, ColumnLayout, ExportColumn,
+    Format, InputKind, Options,
+};
 use labor_fee_core::{forward, Config};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -138,6 +141,7 @@ fn total_cost_gap_notes() {
         kind: InputKind::TotalCost,
         column: None,
         preview_rows: 3,
+        columns: None,
     };
     let out = process(&cfg, text.as_bytes(), Format::Csv, &opts).unwrap();
     assert_eq!(out.summary.rows, 6);
@@ -270,4 +274,92 @@ fn three_items_columns() {
         s.contains("100.00,0.50,1.50,1.00,3.00,3.00,10103.00"),
         "{s}"
     );
+}
+
+fn csv_text(bytes: Vec<u8>) -> String {
+    String::from_utf8(bytes)
+        .unwrap()
+        .trim_start_matches('\u{feff}')
+        .to_string()
+}
+
+#[test]
+fn export_columns_selection_and_order() {
+    // 导出列可选择、可排序；CSV 与 xlsx 均按所选列与顺序输出
+    let cfg = Config::default();
+    let text = "姓名,税后实发金额\n张三,8400\n李四,\n王五,abc\n";
+    let cols = parse_columns(
+        "税后实发金额,source,net_income,应预扣预缴税额,status,notes",
+        &cfg,
+        InputKind::TakeHome,
+    )
+    .unwrap();
+    let opts = Options {
+        columns: Some(cols.clone()),
+        preview_rows: 5,
+        ..Options::default()
+    };
+    let out = process(&cfg, text.as_bytes(), Format::Csv, &opts).unwrap();
+    let s = csv_text(out.bytes);
+    let mut lines = s.lines();
+    assert_eq!(
+        lines.next().unwrap(),
+        "税后实发金额,姓名,税后实发金额,不含增值税收入,应预扣预缴税额,测算状态,备注"
+    );
+    assert_eq!(
+        lines.next().unwrap(),
+        "8400.00,张三,8400,10000.00,1600.00,精确匹配,"
+    );
+    assert_eq!(lines.next().unwrap(), ",李四,,,,,");
+    let err = lines.next().unwrap();
+    assert!(err.starts_with(",王五,abc,,,数据错误,"), "{err}");
+    // 预览与导出一致
+    assert_eq!(out.preview[0][0], "税后实发金额");
+    assert_eq!(out.preview[0].len(), 7);
+
+    // 同一计算结果可直接按不同导出列生成 xlsx，无需重新计算
+    let computed = compute(&cfg, text.as_bytes(), Format::Csv, &opts).unwrap();
+    let x = computed
+        .render(
+            &[ExportColumn::Status, ExportColumn::NetIncome],
+            Format::Spreadsheet,
+        )
+        .unwrap();
+    let rows = read_back(&x);
+    assert_eq!(rows[0][0].to_string(), "测算状态");
+    assert_eq!(rows[0][1].to_string(), "不含增值税收入");
+    assert_eq!(rows[0].len(), 2);
+    assert_eq!(money(&rows[1][1]), dec!(10000));
+    assert!(matches!(
+        computed.render(&[], Format::Csv),
+        Err(BatchError::NoColumns)
+    ));
+    // 不适用于本方式的列被忽略
+    let only = computed
+        .render(&[ExportColumn::Diff, ExportColumn::Vat], Format::Csv)
+        .unwrap();
+    assert!(csv_text(only).starts_with("差额,增值税税额\n"));
+}
+
+#[test]
+fn export_columns_per_kind_and_defaults() {
+    let cfg = Config::default();
+    // 默认导出全部列：与可导出列一致；仅按税后实发金额测算有“差额”
+    for (kind, text) in [
+        (InputKind::TakeHome, "税后实发金额\n8400\n"),
+        (InputKind::NetIncome, "不含增值税收入\n10000\n"),
+        (InputKind::TotalCost, "企业总支出\n10103.00\n"),
+    ] {
+        let opts = Options {
+            kind,
+            ..Options::default()
+        };
+        let c = compute(&cfg, text.as_bytes(), Format::Csv, &opts).unwrap();
+        let avail = available_columns(&cfg, kind);
+        assert_eq!(c.available_columns(), avail.as_slice());
+        let h = c.headers(&ColumnLayout::default().selected(&avail));
+        assert_eq!(h.len(), avail.len(), "{kind:?}");
+        assert_eq!(h.contains(&"差额".to_string()), kind == InputKind::TakeHome);
+        assert_eq!(h.last().unwrap(), "备注");
+    }
 }
