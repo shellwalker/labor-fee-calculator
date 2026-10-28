@@ -13,6 +13,25 @@
 
 金额全部使用 `rust_decimal` 十进制运算，不使用浮点数。全部计算参数与舍入规则均可配置；默认参数、政策出处及待确认事项见 [docs/ASSUMPTIONS.md](docs/ASSUMPTIONS.md)，界面用语与官方依据见 [docs/TERMINOLOGY.md](docs/TERMINOLOGY.md)。
 
+## 下载安装
+
+预编译程序在 GitHub Releases 下载（**不需要安装 Rust**）：
+
+| 渠道 | 地址 | 来源分支 | 用途 |
+|---|---|---|---|
+| **正式版** | [Releases（Latest）](https://github.com/shellwalker/labor-fee-calculator/releases/latest) | 仅 `main` | 日常使用 |
+| **预览版（测试用）** | [develop-preview](https://github.com/shellwalker/labor-fee-calculator/releases/tag/develop-preview) | `develop` 每次推送自动更新 | 试用新功能，**不要用于正式报表** |
+
+每个版本都有三个平台的压缩包，各包含命令行 `labor-fee`、Web 服务 `labor-fee-web` 和桌面程序 `labor-fee-desktop`，另附 `SHA256SUMS.txt` 校验文件：
+
+| 平台 | 文件 | 使用方法 |
+|---|---|---|
+| Windows x86_64（Windows 10/11） | `labor-fee-<版本>-windows-x86_64.zip` | 解压后双击 `labor-fee-desktop.exe`；未做代码签名，SmartScreen 提示时选“更多信息 → 仍要运行” |
+| macOS Apple Silicon（M 系列，macOS 11+） | `labor-fee-<版本>-macos-arm64.zip` | 解压后把 `LaborFee.app` 拖到“应用程序”；**未签名、未公证**（仅 ad-hoc 签名），首次打开请右键「打开」，或在“系统设置 → 隐私与安全性”中允许；不支持 Intel Mac |
+| Linux x86_64（glibc，Ubuntu 22.04+ 等） | `labor-fee-<版本>-linux-x86_64.tar.gz` | `tar xzf` 解压后运行 `./labor-fee-desktop`；需要 `libgtk-3-0`、`libxkbcommon0`、`libgl1` |
+
+校验：`sha256sum -c SHA256SUMS.txt --ignore-missing`（macOS 用 `shasum -a 256 -c`）。
+
 ## 默认计算参数（用户已确认）
 
 - 以**不含增值税收入 I** 为核心变量，其余金额都由它唯一确定；
@@ -33,7 +52,8 @@ crates/cli    命令行工具 labor-fee
 crates/web    axum Web 服务 labor-fee-web
 crates/desktop eframe/egui 桌面程序 labor-fee-desktop（内嵌中文字体）
 scripts/      各平台构建脚本（产物输出到 dist/）、ci-version.py（CI 版本号计算）
-.github/workflows/  CI（ci.yml）与发布（release.yml）工作流
+.github/workflows/  CI 与预览版（ci.yml）、正式发布（release.yml）、三平台构建（build.yml，被前两者调用）
+AGENTS.md     给开发者 / AI 代理的协作约定
 samples/      测试用表格（到手样例.xlsx，列名为旧名“到手金额”，用于兼容性测试）
 examples/sample.csv   批量测算示例
 config/default.toml   默认计算参数（同时内置于程序）
@@ -77,6 +97,11 @@ labor-fee batch 名单.xlsx -o 结果.xlsx --column 到手金额   # 旧列名�
 # 按不含增值税收入 / 企业总支出批量（输出 原名_计算结果）
 labor-fee batch 名单.xlsx --input-kind net-income      # 读“不含增值税收入”（或“不含税收入”）列
 labor-fee batch 名单.xlsx --input-kind total-cost      # 读“企业总支出”（或“企业总成本”）列
+
+# 选择导出列及顺序（缺省导出全部列）
+labor-fee batch --list-columns --input-kind net-income   # 查看可导出的列（标识与标题）
+labor-fee batch 名单.xlsx --columns source,net_income,iit_tax,take_home
+labor-fee batch 名单.xlsx --columns 原表各列,税后实发金额,应预扣预缴税额   # 也可写列标题
 ```
 
 单笔计算示例输出（默认参数）：
@@ -125,6 +150,20 @@ labor-fee batch 名单.xlsx --input-kind total-cost      # 读“企业总支出
 - 只读第一个工作表；首行为标题行，按标题精确匹配（忽略首尾空格）。默认读“税后实发金额”列（依次尝试“税后实发金额”“实发金额”“到手金额”）；`--input-kind net-income`/`total-cost` 改读“不含增值税收入”（或“不含税收入”）/“企业总支出”（或“企业总成本”）列，`--column` 可指定其他标题。
 - 金额单元格可为数值或文本，文本允许 `¥`、`元`、千分位逗号；超过两位小数、无法解析的行“测算状态”写“数据错误”，“备注”写原因；企业总支出不可达的行“测算状态”写“总支出不可达”，“备注”写原因和两侧最近的有效企业总支出。出错行不中断其他行。空白行保留原样、结果列为空。
 - 追加列：不含增值税收入、增值税税额、各征收的附加税费项目（减征后实际金额，默认城市维护建设税、教育费附加、地方教育附加三列）、附加税费减征额、增值税附加税费合计、企业总支出、每次收入、减除费用、预扣预缴应纳税所得额、预扣率、速算扣除数、应预扣预缴税额、税后实发金额、测算状态（精确匹配 / 无法精确匹配，差额 x / 已计算 / 数据错误 / 总支出不可达）、差额、备注。
+- **导出列选择与排序**：默认导出全部列（原表各列 + 上述结果列）。不同测算方式的可选列略有不同——只有按税后实发金额测算有“差额”列。可选择只导出部分列并调整顺序，CSV 与 xlsx 都按所选列和顺序输出：
+  - 桌面程序：批量页“导出列”卡片（见下文“桌面程序”）；
+  - 命令行：`--columns`（逗号分隔的列标识或列标题），`--list-columns` 列出可用列；
+  - Web：表单“导出列”字段 / 接口 `columns` 参数，`GET /api/columns?input_kind=…` 返回可用列。
+
+  | 列标识 | 列标题 | 适用测算方式 |
+  |---|---|---|
+  | `source` | 原表各列（输入文件的全部原有列，作为一个整体） | 全部 |
+  | `net_income` / `vat` | 不含增值税收入 / 增值税税额 | 全部 |
+  | `surcharge:<项目名>` | 各征收的附加税费项目，如 `surcharge:城市维护建设税` | 全部（随配置） |
+  | `surcharge_relief` / `surcharge_total` / `total_cost` | 附加税费减征额 / 增值税附加税费合计 / 企业总支出 | 全部 |
+  | `income` / `deduction` / `taxable_income` / `rate` / `quick_deduction` / `iit_tax` | 每次收入 / 减除费用 / 预扣预缴应纳税所得额 / 预扣率 / 速算扣除数 / 应预扣预缴税额 | 全部 |
+  | `take_home` / `status` / `notes` | 税后实发金额 / 测算状态 / 备注 | 全部 |
+  | `diff` | 差额 | 仅按税后实发金额测算 |
 - CSV 输入自动识别 UTF-8（含 BOM）/GBK，输出 UTF-8 带 BOM（Excel 可直接打开）。表格输出为新的 xlsx，只保留原单元格的值，不保留原格式、公式与其他工作表。
 
 ## Web 页面
@@ -140,7 +179,8 @@ labor-fee-web --listen 127.0.0.1:8080 [-c my.toml] [--max-upload-mb 20]
 | GET | `/api/forward?net_income=10000` | 按不含增值税收入计算（主入口），返回 JSON |
 | GET | `/api/reverse?take_home=8400` | 按税后实发金额测算，返回 JSON（含 `exact`、`diff`、`exact_net_income_range`、`other_solutions`） |
 | GET | `/api/from-cost?total_cost=10103.00` | 按企业总支出测算；不可达时返回 422，`error` 为原因说明，`gap` 含 `reason`（`threshold`/`rounding`）和两侧最近的有效企业总支出 `lower`/`upper` |
-| POST | `/api/batch` | multipart 字段 `file`（必填）、`input_kind`（`take-home` 默认/`net-income`/`total-cost`）、`column`（可选），返回结果文件；响应头 `x-batch-summary` 为统计 |
+| POST | `/api/batch` | multipart 字段 `file`（必填）、`input_kind`（`take-home` 默认/`net-income`/`total-cost`）、`column`（可选）、`columns`（可选，导出列及顺序，同 CLI `--columns`；未知列返回 400），返回结果文件；响应头 `x-batch-summary` 为统计 |
+| GET | `/api/columns?input_kind=net-income` | 该测算方式可导出的列 `[{key, title, description}]`（默认顺序）；未知 `input_kind` 返回 400 |
 | GET | `/api/config` | 当前配置（TOML） |
 
 服务没有登录鉴权，默认只监听本机；如需对外提供请放在带鉴权的反向代理之后。
@@ -163,7 +203,13 @@ labor-fee-desktop --version         # 版本、git 短哈希、构建日期
 |---|---|
 | 收入计算 / 实发测算 / 支出测算 | 左：输入卡片（大号输入框、单位“元”、回车或“计算”、快捷示例金额）与最近记录；中：按页区分的 KPI 指标卡（用户输入项不做卡片；收入计算为增值税税额 / 附加税费合计 / 企业总支出 / 应预扣预缴税额 / 税后实发金额；实发测算、支出测算相应替换输入项为测算所得；宽屏一行或 3+2，窄屏自适应）、校验状态徽章、“增值税及附加税费”（逐项列出征收的附加税费，享受减征时注明法定费率、减征比例及减征前金额、减征额，另列附加税费减征额与合计）和“个人所得税”两组明细（千分位、等宽右对齐）、算式核对；右：**计算规则**面板（按当前参数动态生成：征收率与起征点、各项附加税费（含减征算式）及合计、附加税费合计比例（减征前后）、不征收项目、企业承担、减除费用规则、预扣率表、逐步舍入、测算取最小解、不可达区间，并附政策依据链接），可收起 |
 | 支出测算（不可达时） | 红色警示卡：原因、数轴示意（两侧有效值与不可达区间）、两侧最近的有效企业总支出按钮（点击即填入并重新测算） |
-| 批量测算 | 四步：① 拖放或选择文件 ② 选择输入列（税后实发金额 / 不含增值税收入 / 企业总支出）和列标题 ③ 执行 ④ 导出（保存到输入文件旁 / 另存为）；彩色统计卡片（总行数、成功、无法精确匹配/不可达、错误、空白）；预览表（表头固定、斑马纹、数字右对齐、错误行红底、可横向滚动、可调列宽） |
+| 批量测算 | 四步：① 拖放或选择文件 ② 选择输入列（税后实发金额 / 不含增值税收入 / 企业总支出）和列标题 ③ 执行 ④ 导出（保存到输入文件旁 / 另存为，显示将导出的列数）；彩色统计卡片（总行数、成功、无法精确匹配/不可达、错误、空白）；左侧“导出列”卡片；右侧预览表（按所选列和顺序显示；表头固定、斑马纹、数字右对齐、错误行红底、可横向滚动、可调列宽） |
+
+### 批量页“导出列”与结果缓存
+
+- **导出列**卡片在批量页（不在设置中）：每列一个复选框，默认全选；“全选 / 全不选 / 恢复默认列”；拖动左侧 ≡ 或点 ▲▼ 调整顺序；标题旁显示“已选 N / M 列”，鼠标悬停列名显示说明。一列都不选时导出按钮不可用并提示“请至少选择一个导出列”。
+- **按测算方式分别保存**：税后实发金额 / 不含增值税收入 / 企业总支出三种方式各有一套列选择与顺序（例如只有按税后实发金额测算有“差额”列），切换方式时互不影响。附加税费项目随计算参数增减时，新项目自动加入（默认勾选），已删除的项目自动移除。
+- **结果缓存**：三种方式的测算结果分别保留在内存中，切换页面或测算方式不会丢失；修改计算参数后自动按新参数重新测算。输入文件会复制一份到配置目录的 `labor-fee-desktop/batch-cache/`（单个文件不超过 32 MB），`batch.toml` 记录各方式的输入文件、列标题、导出列选择与顺序；重启程序后自动恢复并重新测算，不必重新选择文件。导出 CSV / xlsx 都按当前所选列和顺序。
 
 窗口宽度 ≥ 1120 时三栏，820～1120 时两栏（计算规则移到输入下方），更窄时单列滚动；最小窗口 960×640。
 
@@ -215,7 +261,7 @@ labor-fee-desktop --version         # 版本、git 短哈希、构建日期
 
 - 应用图标由 `scripts/gen-assets.py` 生成（`crates/desktop/assets/icon/`）：窗口图标、Windows 可执行文件图标（`build.rs` 通过 embed-resource 嵌入 `icon.ico`，MSVC 需要 rc.exe，mingw 需要 `x86_64-w64-mingw32-windres`）、macOS `AppIcon.icns`（`build-macos.sh` 打包进 .app），Linux 包内附 `labor-fee-desktop.png` 与 `.desktop` 文件。
 - 窗口标题含版本号；“关于”窗口显示版本、git 短哈希与构建日期（`build.rs` 写入，可用 `LFD_GIT_HASH`、`SOURCE_DATE_EPOCH` 覆盖）、许可、字体 OFL 声明、政策依据链接和免责声明。
-- 界面截图自检：`LFD_SHOTS_DIR=/tmp/shots cargo test -p labor-fee-desktop --test screenshots -- --ignored`（wgpu 离屏渲染；Linux 无 GPU 时安装 `mesa-vulkan-drivers` 用 lavapipe）。
+- 界面截图自检：`LFD_SHOTS_DIR=/tmp/shots cargo test -p labor-fee-desktop --test screenshots -- --ignored`（wgpu 离屏渲染；Linux 无 GPU 时安装 `mesa-vulkan-drivers` 用 lavapipe，或设置 `WGPU_BACKEND=gl` 用 Mesa EGL）。
 
 ### 中文字体与许可证
 
@@ -225,7 +271,7 @@ GB2312 以外的罕见字（例如个别人名用字）由 egui 的 `system_font
 
 ### 构建
 
-各平台在本机独立编译，产物都输出到 `dist/`。不需要 GitLab 流水线。桌面程序需要 Rust 1.95 及以上（eframe 0.37 的要求）。
+各平台在本机独立编译，产物都输出到 `dist/`；GitHub Actions 使用同一组脚本（见“持续集成与发布”）。桌面程序需要 Rust 1.95 及以上（eframe 0.37 的要求）。
 
 | 平台 | 命令 | 构建依赖 | 产物 |
 |---|---|---|---|
@@ -316,10 +362,12 @@ assert!(r.exact && r.breakdown.take_home == dec!(8400));
 ## 测试
 
 ```bash
-cargo fmt --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
+
+Linux 本机没有 GTK3 开发包时，可加 `--no-default-features --features labor-fee-desktop/portal` 改用 portal 文件对话框后再执行 clippy / test。
 
 测试包括：
 - 各分段边界（收入 800/1000/4000、预扣预缴应纳税所得额 20000/50000）单元测试；附加税费三项逐项舍入、减征前后金额与减征额、预填费率选“是”即生效、旧配置兼容（含 `halve` 映射）；
@@ -329,8 +377,21 @@ cargo test
 - 自定义参数下的无法精确匹配与不相连多解；
 - 按企业总支出测算：默认参数 0～70,000 元、三项全开 0～30,000 元逐分（可达则与计算一致，不可达则报原因和两侧最近有效值；起征点不可达区间默认正好 1015 个分，且随减征配置变化）；
 - proptest：收入→实发→测算、目标→测算→计算、单调性、按企业总支出测算；任意减征比例 × 征收项目组合 × 舍入方式下减征前后关系、合计一致、按企业总支出与按实发金额测算可逆；
-- 批量 xlsx/csv（UTF-8/GBK/BOM）读写、新旧列名、三项附加税费列、按企业总支出批量时备注原因；Web 接口（含 422 不可达说明）；
+- 批量 xlsx/csv（UTF-8/GBK/BOM）读写、新旧列名、三项附加税费列、按企业总支出批量时备注原因；导出列解析（标识/标题、未知列报错、各测算方式列集）、按所选列与顺序输出 CSV/xlsx；Web 接口（含 422 不可达说明、`columns` 字段与 `/api/columns`）；
+- 桌面批量页导出列：默认全选、全不选禁用导出、▲▼ 排序、恢复默认列、按测算方式分别保存、`batch.toml` 持久化与重启恢复结果（kittest + 状态测试）；附加税费项目增减时已保存列设置的合并（单元测试）；
 - 桌面程序：状态逻辑与 egui_kittest 界面测试（导航、输入、回车、快捷示例、规则面板、不可达按钮、批量步骤与统计、设置对话框分组导航/逐项 ✔ ✖ 确认与持久化/Enter 与 Esc/非法值禁用 ✔/默认值提示/单项“默认”填入后待确认/全部恢复默认二次确认/附加税费“是否征收”单选（否隐藏、是展开）、城建所在地单选与档位税率修改、设置各页不显示口径状态徽章、减征开关与比例、合计比例卡片与未生效预览/关闭时未生效修改的确认/附加税费项目与预填费率/“已修改”计数、关闭窗口快捷键分发、旧版参数文件、菜单、关于、快捷键、最小窗口）；内嵌中文与图标字体覆盖界面与核心模块中出现的全部字符。
+
+## 分支与发布规则
+
+| 分支 | 用途 | 推送后 GitHub Actions 做什么 |
+|---|---|---|
+| `develop` | 日常开发，所有提交先进入这里（私人项目，可直接推送） | 三平台检查 + 构建，更新 **预览版** Release `develop-preview`（预发布，标注“预览版（测试用）”） |
+| `main` | 只放要发布的版本，由 `develop` 合并而来 | 三平台检查 + 构建，以 `Cargo.toml` 版本号创建 **正式版** Release `v<版本>` |
+| PR | 合并前检查 | 仅 fmt / clippy / test（三平台），不打包、不发布 |
+
+- **只有 `main` 发布正式版本**。在其它分支打 `v*` 标签、或手动在其它分支触发 Release 工作流都会被拒绝。
+- 发版：在 `develop` 上修改 `Cargo.toml` 的 `[workspace.package] version`（例如 `0.1.0` → `0.1.1`）→ 合并到 `main` 并推送 → 自动创建 `v0.1.1` Release。`main` 上版本号未变（Release 已存在）时只构建、不重复发布。
+- 预览版标签 `develop-preview` 每次 `develop` 推送都会删除重建，指向最新 `develop` 提交；它只是 Release 标签，不影响分支历史。
 
 ## 持续集成与发布
 
@@ -338,33 +399,38 @@ GitHub Actions 工作流：
 
 | 工作流 | 触发条件 | 产物 |
 |---|---|---|
-| [ci.yml](.github/workflows/ci.yml) | 推送到 `main` / `develop`、任意 PR、手动触发 | 临时验证产物（工作流产物，不是 Release） |
-| [release.yml](.github/workflows/release.yml) | 推送 `v*` 标签、或在 `main` 上手动触发 | GitHub Release（正式产物） |
+| [ci.yml](.github/workflows/ci.yml) | 任意 PR；推送 `develop`；手动触发 | PR：只检查；`develop`：工作流产物 + 预览版 Release `develop-preview` |
+| [release.yml](.github/workflows/release.yml) | 推送 `main`；推送 `v*` 标签（须指向 `main` 上的提交）；在 `main` 上手动触发 | 正式版 Release `v<版本>` |
+| [build.yml](.github/workflows/build.yml) | 被上面两个工作流调用（`workflow_call`） | 三平台检查、构建、打包 |
 
-构建平台：**Windows x64**（`windows-latest`，MSVC 工具链）与 **macOS Apple Silicon**（`macos-15`，`aarch64-apple-darwin`）。两个平台执行同样的流水线：格式检查（`cargo fmt --check`）→ 静态检查（`cargo clippy -D warnings`）→ 测试（`cargo test --workspace --all-targets`）→ 发布构建 → 打包 zip 并上传。
+构建矩阵（只构建这三个平台，每个平台都产出 CLI + Web + 桌面程序）：
+
+| 平台 | Runner | 目标 | 产物 |
+|---|---|---|---|
+| Linux x86_64 | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | `labor-fee-<版本>-linux-x86_64.tar.gz` |
+| Windows x86_64 | `windows-2025` | `x86_64-pc-windows-msvc` | `labor-fee-<版本>-windows-x86_64.zip` |
+| macOS Apple Silicon | `macos-15` | `aarch64-apple-darwin` | `labor-fee-<版本>-macos-arm64.zip` |
+
+每个平台：写入版本号 → `cargo fmt --all --check`（Linux）→ `cargo clippy --workspace --all-targets --locked -D warnings` → `cargo test --workspace --all-targets --locked` → 平台构建脚本打包 → 上传工作流产物（正式版保留 90 天，其它 14 天）。发布作业汇总三个平台的包并生成 `SHA256SUMS.txt`。
 
 ### 版本号规则
 
-正式发布的版本号取自 `Cargo.toml` 的 `[workspace.package] version`；日常构建在此基础上追加预发布标记、流水号、时间戳与提交号：
+正式版本号取自 `Cargo.toml` 的 `[workspace.package] version`；其它构建在此基础上追加标记、流水号、UTC 时间戳与提交号（版本号只计算一次，三个平台完全一致）：
 
 | 场景 | 版本号示例 | 说明 |
 |---|---|---|
-| `develop` 分支 | `0.1.0-beta.128.20261027T191530Z.d996e93` | 开发中版本 |
-| PR | `0.1.0-rc.42.20261027T191530Z.d996e93` | 合并前的候选版本 |
-| `main` 分支 | `0.1.0-rc.130.20261027T191530Z.d996e93` | 发布候选版本 |
-| 正式发布（标签 `v0.1.0`） | `0.1.0` | 与 `Cargo.toml` 一致 |
+| `develop`（预览版） | `0.1.0-preview.128.20261028T151530Z.gd996e93a` | 流水号为 CI run number |
+| PR | `0.1.0-pr.42.20261028T151530Z.gd996e93a` | 流水号为 PR 号 |
+| `main`（正式版） | `0.1.0` | 与 `Cargo.toml` 一致；带 `-` 后缀（如 `0.2.0-rc.1`）时 Release 自动标为预发布 |
 
-格式为 `<基础版本>-<标记>.<流水号>.<UTC时间戳>.<短提交号>`，由 `scripts/ci-version.py` 计算并写入 `Cargo.toml`；压缩包文件名、程序“关于”窗口与窗口标题共用同一个版本号。基础版本若本身带 `-rc.N` 后缀，日常构建只取其数字部分。
+格式为 `<基础版本>-<标记>.<流水号>.<UTC时间戳>.g<短提交号>`（`g` 前缀避免纯数字提交号以 0 开头违反 SemVer），由 `scripts/ci-version.py` 计算并写入 `Cargo.toml`；压缩包文件名、“关于”窗口与窗口标题共用同一个版本号。
 
-### 发布流程
+### 签名与密钥
 
-**只有 `main` 分支可以发布**，工作流会强制校验：
-
-1. 修改 `Cargo.toml` 的 `version`（例如 `0.1.0` → `0.1.1`），提交并推送到 `main`；
-2. 打标签并推送：`git tag v0.1.1 && git push github v0.1.1`；或在 `main` 上手动触发 Release 工作流；
-3. 工作流校验「标签指向的提交已在 `main` 上」且「标签与 `Cargo.toml` 版本号一致」，然后构建并创建 GitHub Release。
-
-在 `develop` 或其它分支上打标签会被拒绝（标签指向的提交不在 `main` 上），因此其它分支只能产出带 `beta` / `rc` 标记的临时验证产物。若 `Cargo.toml` 的版本带 `-rc.N` 等预发布后缀，创建的 Release 会自动标记为“预发布”。
+- 工作流只使用 GitHub 自动提供的 `GITHUB_TOKEN`（发布作业 `contents: write`），**目前不需要配置任何 secret**。
+- macOS 包**未签名、未公证**（只有 ad-hoc 签名）；Windows 包未做代码签名。如需正式签名，需要提供：
+  - macOS：`APPLE_CERTIFICATE_P12`（Developer ID Application 证书，base64）、`APPLE_CERTIFICATE_PASSWORD`、`APPLE_SIGNING_IDENTITY`、公证用 `APPLE_ID` / `APPLE_TEAM_ID` / `APPLE_APP_PASSWORD`（或 App Store Connect API Key）；
+  - Windows：代码签名证书（PFX 及密码，或云签名服务凭据）。
 
 ## 路线图
 
@@ -374,4 +440,6 @@ GitHub Actions 工作流：
 - [x] 正式用语（docs/TERMINOLOGY.md）；增值税附加税费拆分为三项可配置（城建税、地方教育附加预填法定费率）
 - [x] 附加税费减征优惠（小规模纳税人减半征收，可配置）与附加税费合计比例
 - [x] 原生桌面程序（eframe/egui，Windows / macOS / Linux）与各平台构建脚本
-- [ ] 后续：Web 端在线编辑计算参数；部署（Docker/systemd）；Windows/macOS 代码签名
+- [x] GitHub Actions：Linux / Windows / macOS(arm64) 三平台构建，`main` 正式版、`develop` 预览版
+- [x] 批量导出列选择与排序（按测算方式分别保存）、批量结果缓存；CLI / Web `--columns`
+- [ ] 后续：Web 端在线编辑计算参数；部署（Docker/systemd）；Windows/macOS 代码签名与公证
