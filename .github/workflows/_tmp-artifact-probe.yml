@@ -1,0 +1,30 @@
+name: _tmp artifact layout probe
+
+# 临时探针：确认 download-artifact@v8 对「artifact 内含 zip」的解压行为。
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+
+jobs:
+  probe:
+    runs-on: macos-15
+    steps:
+      - name: 下载上一次 CI 的产物
+        uses: actions/download-artifact@v8
+        with:
+          run-id: 40621722012
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          pattern: labor-fee-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: 列出结果目录结构
+        run: |
+          echo "=== find artifacts ==="
+          find artifacts -maxdepth 3 -print
+          echo "=== *.zip glob ==="
+          ls -la artifacts/*.zip 2>&1 || echo "（没有匹配到 *.zip）"
+          echo "=== 所有普通文件 ==="
+          find artifacts -type f -exec file {} \;
