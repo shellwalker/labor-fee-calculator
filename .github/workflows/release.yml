@@ -1,0 +1,204 @@
+name: Release
+
+# 正式发布：只允许 main。
+#   1) 在 main 上把 Cargo.toml 的 version 改好并提交，打标签 v<版本号> 推送；
+#   2) 或在 main 上手动触发本工作流（自动使用 v<版本号> 作为标签）。
+# develop / PR / 其它分支只能通过 ci.yml 生成带 beta/rc 的临时验证产物，不能发布。
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "发布标签（留空则自动使用 v<版本号>，版本号取自 Cargo.toml）"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  prepare:
+    name: 校验发布来源（仅允许 main）
+    runs-on: macos-15
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 校验分支与标签
+        id: meta
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          HEAD_SHA: ${{ github.sha }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          CARGO_VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -z "$CARGO_VERSION" ]; then
+            echo "::error::无法从 Cargo.toml 读取版本号"; exit 1
+          fi
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            # 手动发布：必须在 main 分支上
+            if [ "$REF" != "refs/heads/main" ]; then
+              echo "::error::发布只能从 main 分支发起，当前为 $REF"
+              exit 1
+            fi
+            TAG="${INPUT_TAG:-v$CARGO_VERSION}"
+          else
+            # 标签发布：标签指向的提交必须已经存在于 main 上
+            git fetch --no-tags origin main
+            # 解引用：附注标签（annotated tag）指向的是标签对象，需取其提交
+            TAG_COMMIT="$(git rev-parse "${HEAD_SHA}^{commit}")"
+            if ! git merge-base --is-ancestor "$TAG_COMMIT" origin/main; then
+              echo "::error::标签 $REF_NAME 指向的提交不在 main 分支上，禁止发布"
+              exit 1
+            fi
+            TAG="$REF_NAME"
+          fi
+
+          # 标签必须与 Cargo.toml 的版本号一致，避免产物与标签对不上
+          if [ "$TAG" != "v$CARGO_VERSION" ]; then
+            echo "::error::标签 $TAG 与 Cargo.toml 版本 $CARGO_VERSION 不一致"
+            exit 1
+          fi
+
+          case "$CARGO_VERSION" in
+            *-*) PRERELEASE="true" ;;
+            *)    PRERELEASE="false" ;;
+          esac
+
+          echo "版本号：$CARGO_VERSION"
+          echo "标签：$TAG"
+          echo "预发布：$PRERELEASE"
+          {
+            echo "version=$CARGO_VERSION"
+            echo "tag=$TAG"
+            echo "prerelease=$PRERELEASE"
+          } >> "$GITHUB_OUTPUT"
+  build:
+    name: 构建 ${{ matrix.label }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            python: python
+          - label: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+            python: python3
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/r-cargo-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 写入发布版本号
+        shell: bash
+        run: |
+          set -euo pipefail
+          "${{ matrix.python }}" scripts/ci-version.py --version "${{ needs.prepare.outputs.version }}" --stamp
+
+      - name: 同步 Cargo.lock
+        run: cargo update --workspace
+
+      - name: 固定构建时间（取提交时间，各平台一致）
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 静态检查
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 运行测试
+        run: cargo test --workspace --all-targets
+
+      - name: 构建发布产物 (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LFD_GIT_HASH="$(git rev-parse --short=8 HEAD)"
+          export LFD_GIT_HASH
+          bash scripts/build-macos.sh
+
+      - name: 构建发布产物 (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:LFD_GIT_HASH = (git rev-parse --short=8 HEAD)
+          ./scripts/build-windows.ps1
+
+      - name: 上传发布产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: labor-fee-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    name: 创建 GitHub Release
+    needs: [prepare, build]
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: 下载发布产物
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: 创建 Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          TARGET_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          ls -l artifacts
+          ARGS=(--title "劳务报酬计算工具 v$VERSION" --generate-notes --target "$TARGET_SHA")
+          if [ "$PRERELEASE" = "true" ]; then
+            ARGS+=(--prerelease)
+          fi
+          gh release create "$TAG" artifacts/*.zip "${ARGS[@]}"
+          echo "已创建：https://github.com/${{ github.repository }}/releases/tag/$TAG"

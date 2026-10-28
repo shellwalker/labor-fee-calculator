@@ -1,0 +1,122 @@
+name: CI
+
+# develop、PR、main 都触发：验证（格式/静态检查/测试）+ 构建临时验证产物。
+# 正式发布见 release.yml（只有 main 可以发布）。
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: 构建 ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: windows-x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x64
+            python: python
+          - label: macos-arm64
+            os: macos-15
+            target: aarch64-apple-darwin
+            arch: arm64
+            python: python3
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt, clippy
+
+      - name: 缓存 Cargo 依赖
+        uses: Swatinem/r-cargo-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 计算版本号
+        id: ver
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # PR：候选版本 rc；develop：开发中版本 beta；main：发布候选 rc
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            TAG="rc"; NUM="$PR_NUMBER"; SHA="$PR_HEAD_SHA"
+          elif [ "$REF_NAME" = "develop" ]; then
+            TAG="beta"; NUM="$RUN_NUMBER"; SHA="$HEAD_SHA"
+          else
+            TAG="rc"; NUM="$RUN_NUMBER"; SHA="$HEAD_SHA"
+          fi
+          SHORT_SHA="$(printf '%s' "$SHA" | cut -c1-8)"
+          "${{ matrix.python }}" scripts/ci-version.py \
+            --tag "$TAG" --run "$NUM" --sha "$SHORT_SHA" \
+            --stamp --output "$GITHUB_OUTPUT"
+          echo "版本号：$(tail -1 "$GITHUB_OUTPUT")"
+
+      - name: 同步 Cargo.lock
+        run: cargo update --workspace
+
+      - name: 固定构建时间（取提交时间，各平台一致）
+        shell: bash
+        run: echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+
+      - name: 格式检查
+        run: cargo fmt --all -- --check
+
+      - name: 静态检查
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 运行测试
+        run: cargo test --workspace --all-targets
+
+      - name: 构建发布产物 (macOS)
+        if: matrix.target == 'aarch64-apple-darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          LFD_GIT_HASH="$(git rev-parse --short=8 HEAD)"
+          export LFD_GIT_HASH
+          bash scripts/build-macos.sh
+
+      - name: 构建发布产物 (Windows)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $env:LFD_GIT_HASH = (git rev-parse --short=8 HEAD)
+          ./scripts/build-windows.ps1
+
+      - name: 上传临时验证产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: labor-fee-${{ steps.ver.outputs.version }}-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 30

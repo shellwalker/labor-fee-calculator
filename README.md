@@ -1,5 +1,8 @@
 # 劳务报酬计算工具（labor-fee-calculator）
 
+[![CI](https://github.com/shellwalker/labor-fee-calculator/actions/workflows/ci.yml/badge.svg)](https://github.com/shellwalker/labor-fee-calculator/actions/workflows/ci.yml)
+[![Release](https://github.com/shellwalker/labor-fee-calculator/actions/workflows/release.yml/badge.svg)](https://github.com/shellwalker/labor-fee-calculator/actions/workflows/release.yml)
+
 计算劳务报酬涉及的 **增值税及附加税费（企业承担）、个人所得税（居民个人劳务报酬所得预扣预缴）**，支持：
 
 - **按不含增值税收入计算（主入口）**：不含增值税收入 → 增值税税额、增值税附加税费（城市维护建设税 / 教育费附加 / 地方教育附加，可分别设置是否征收，可享受减征优惠，列示减征前后金额）、企业总支出、个人所得税（每次收入、减除费用、预扣预缴应纳税所得额、预扣率、速算扣除数、应预扣预缴税额）、税后实发金额；
@@ -29,7 +32,8 @@ crates/batch  批量测算（calamine 读表格、rust_xlsxwriter 写 xlsx、csv
 crates/cli    命令行工具 labor-fee
 crates/web    axum Web 服务 labor-fee-web
 crates/desktop eframe/egui 桌面程序 labor-fee-desktop（内嵌中文字体）
-scripts/      各平台构建脚本（产物输出到 dist/）
+scripts/      各平台构建脚本（产物输出到 dist/）、ci-version.py（CI 版本号计算）
+.github/workflows/  CI（ci.yml）与发布（release.yml）工作流
 samples/      测试用表格（到手样例.xlsx，列名为旧名“到手金额”，用于兼容性测试）
 examples/sample.csv   批量测算示例
 config/default.toml   默认计算参数（同时内置于程序）
@@ -40,7 +44,7 @@ docs/UI_DESIGN.md     桌面程序界面设计说明
 
 ## 构建
 
-需要 Rust 1.85+。
+需要 Rust 1.85+（桌面程序 `labor-fee-desktop` 需要 Rust 1.95+）。
 
 ```bash
 cargo build --release
@@ -327,6 +331,40 @@ cargo test
 - proptest：收入→实发→测算、目标→测算→计算、单调性、按企业总支出测算；任意减征比例 × 征收项目组合 × 舍入方式下减征前后关系、合计一致、按企业总支出与按实发金额测算可逆；
 - 批量 xlsx/csv（UTF-8/GBK/BOM）读写、新旧列名、三项附加税费列、按企业总支出批量时备注原因；Web 接口（含 422 不可达说明）；
 - 桌面程序：状态逻辑与 egui_kittest 界面测试（导航、输入、回车、快捷示例、规则面板、不可达按钮、批量步骤与统计、设置对话框分组导航/逐项 ✔ ✖ 确认与持久化/Enter 与 Esc/非法值禁用 ✔/默认值提示/单项“默认”填入后待确认/全部恢复默认二次确认/附加税费“是否征收”单选（否隐藏、是展开）、城建所在地单选与档位税率修改、设置各页不显示口径状态徽章、减征开关与比例、合计比例卡片与未生效预览/关闭时未生效修改的确认/附加税费项目与预填费率/“已修改”计数、关闭窗口快捷键分发、旧版参数文件、菜单、关于、快捷键、最小窗口）；内嵌中文与图标字体覆盖界面与核心模块中出现的全部字符。
+
+## 持续集成与发布
+
+GitHub Actions 工作流：
+
+| 工作流 | 触发条件 | 产物 |
+|---|---|---|
+| [ci.yml](.github/workflows/ci.yml) | 推送到 `main` / `develop`、任意 PR、手动触发 | 临时验证产物（工作流产物，不是 Release） |
+| [release.yml](.github/workflows/release.yml) | 推送 `v*` 标签、或在 `main` 上手动触发 | GitHub Release（正式产物） |
+
+构建平台：**Windows x64**（`windows-latest`，MSVC 工具链）与 **macOS Apple Silicon**（`macos-15`，`aarch64-apple-darwin`）。两个平台执行同样的流水线：格式检查（`cargo fmt --check`）→ 静态检查（`cargo clippy -D warnings`）→ 测试（`cargo test --workspace --all-targets`）→ 发布构建 → 打包 zip 并上传。
+
+### 版本号规则
+
+正式发布的版本号取自 `Cargo.toml` 的 `[workspace.package] version`；日常构建在此基础上追加预发布标记、流水号、时间戳与提交号：
+
+| 场景 | 版本号示例 | 说明 |
+|---|---|---|
+| `develop` 分支 | `0.1.0-beta.128.20261027T191530Z.d996e93` | 开发中版本 |
+| PR | `0.1.0-rc.42.20261027T191530Z.d996e93` | 合并前的候选版本 |
+| `main` 分支 | `0.1.0-rc.130.20261027T191530Z.d996e93` | 发布候选版本 |
+| 正式发布（标签 `v0.1.0`） | `0.1.0` | 与 `Cargo.toml` 一致 |
+
+格式为 `<基础版本>-<标记>.<流水号>.<UTC时间戳>.<短提交号>`，由 `scripts/ci-version.py` 计算并写入 `Cargo.toml`；压缩包文件名、程序“关于”窗口与窗口标题共用同一个版本号。基础版本若本身带 `-rc.N` 后缀，日常构建只取其数字部分。
+
+### 发布流程
+
+**只有 `main` 分支可以发布**，工作流会强制校验：
+
+1. 修改 `Cargo.toml` 的 `version`（例如 `0.1.0` → `0.1.1`），提交并推送到 `main`；
+2. 打标签并推送：`git tag v0.1.1 && git push github v0.1.1`；或在 `main` 上手动触发 Release 工作流；
+3. 工作流校验「标签指向的提交已在 `main` 上」且「标签与 `Cargo.toml` 版本号一致」，然后构建并创建 GitHub Release。
+
+在 `develop` 或其它分支上打标签会被拒绝（标签指向的提交不在 `main` 上），因此其它分支只能产出带 `beta` / `rc` 标记的临时验证产物。若 `Cargo.toml` 的版本带 `-rc.N` 等预发布后缀，创建的 Release 会自动标记为“预发布”。
 
 ## 路线图
 
