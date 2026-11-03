@@ -96,6 +96,8 @@ impl InputKind {
 pub enum BatchError {
     #[error("不支持的文件类型：{0}（支持 .xlsx/.xlsm/.xls/.ods/.csv）")]
     UnsupportedFormat(String),
+    #[error("不支持的输出文件类型：{0}（请使用 .csv 或 .xlsx）")]
+    UnsupportedOutputFormat(String),
     #[error("表格内容为空")]
     Empty,
     #[error("首行未找到标题为{0}的列")]
@@ -129,6 +131,21 @@ impl Format {
             "csv" => Ok(Format::Csv),
             "xlsx" | "xlsm" | "xls" | "xlsb" | "ods" => Ok(Format::Spreadsheet),
             _ => Err(BatchError::UnsupportedFormat(name.to_string())),
+        }
+    }
+
+    /// 按输出文件扩展名决定写出格式。只接受 `.csv` 与 `.xlsx`（大小写不敏感）。
+    ///
+    /// 输入可以是 `.xls` / `.ods` 等，写出不行：扩展名不支持时返回错误，不按输入格式猜测。
+    pub fn from_output_file_name(name: &str) -> Result<Self, BatchError> {
+        let ext = name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "csv" => Ok(Format::Csv),
+            "xlsx" => Ok(Format::Spreadsheet),
+            _ => Err(BatchError::UnsupportedOutputFormat(name.to_string())),
         }
     }
 
@@ -785,5 +802,17 @@ mod tests {
             "工资_测算结果.xlsx"
         );
         assert_eq!(output_file_name("b.csv").unwrap(), "b_测算结果.csv");
+        assert_eq!(
+            Format::from_output_file_name("out.CSV").unwrap(),
+            Format::Csv
+        );
+        assert_eq!(
+            Format::from_output_file_name(r"dir\结果.XLSX").unwrap(),
+            Format::Spreadsheet
+        );
+        assert!(Format::from_output_file_name("结果.xls").is_err());
+        assert!(Format::from_output_file_name("结果.ods").is_err());
+        assert!(Format::from_output_file_name("结果.txt").is_err());
+        assert!(Format::from_output_file_name("无扩展名").is_err());
     }
 }
