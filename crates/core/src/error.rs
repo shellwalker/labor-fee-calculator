@@ -62,6 +62,8 @@ impl std::fmt::Display for CostGap {
 pub enum CalcError {
     #[error("金额不得为负数：{0}")]
     NegativeAmount(Decimal),
+    #[error("金额 {amount} 超过单笔安全上限 {max}")]
+    AmountTooLarge { amount: Decimal, max: Decimal },
     #[error("金额 {amount} 的小数位数超过设定精度（{scale} 位）")]
     PrecisionExceeded { amount: Decimal, scale: u32 },
     #[error("目标税后实发金额 {target} 超出可测算范围（不含增值税收入上限 {max_net_income} 对应的税后实发金额为 {max_take_home}）")]

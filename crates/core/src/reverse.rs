@@ -54,15 +54,15 @@ impl Ctx<'_> {
     fn dec(&self, ticks: i64) -> Decimal {
         from_ticks(self.cfg, ticks)
     }
-    fn eval(&self, ticks: i64) -> Breakdown {
+    fn eval(&self, ticks: i64) -> Result<Breakdown, CalcError> {
         eval_net(self.cfg, self.dec(ticks))
     }
-    fn th(&self, ticks: i64) -> Decimal {
-        self.eval(ticks).take_home
+    fn th(&self, ticks: i64) -> Result<Decimal, CalcError> {
+        Ok(self.eval(ticks)?.take_home)
     }
     /// 分段键：(是否按比例减除费用, 预扣率档次, 是否征收增值税)。随不含税收入按字典序单调不减。
-    fn key(&self, ticks: i64) -> (bool, usize, bool) {
-        let b = self.eval(ticks);
+    fn key(&self, ticks: i64) -> Result<(bool, usize, bool), CalcError> {
+        let b = self.eval(ticks)?;
         let iit = &self.cfg.iit;
         let pct = b.iit.income > iit.fixed_deduction_limit;
         let idx = iit
@@ -70,7 +70,7 @@ impl Ctx<'_> {
             .iter()
             .position(|br| br.upper.is_none_or(|u| b.iit.taxable_income <= u))
             .unwrap_or(iit.brackets.len());
-        (pct, idx, !b.vat_exempt)
+        Ok((pct, idx, !b.vat_exempt))
     }
 }
 
@@ -80,17 +80,23 @@ struct RegionResult {
     nearest: (i64, Decimal),
 }
 
-fn search_region(ctx: &Ctx, lo: i64, hi: i64, target: Decimal, window: i64) -> RegionResult {
+fn search_region(
+    ctx: &Ctx,
+    lo: i64,
+    hi: i64,
+    target: Decimal,
+    window: i64,
+) -> Result<RegionResult, CalcError> {
     // 二分：区间内到手首次 ≥ 目标的位置
-    let pos = if ctx.th(hi) < target {
+    let pos = if ctx.th(hi)? < target {
         hi
-    } else if ctx.th(lo) >= target {
+    } else if ctx.th(lo)? >= target {
         lo
     } else {
         let (mut l, mut h) = (lo, hi); // 不变式：th(l) < target ≤ th(h)
         while h - l > 1 {
             let m = l + (h - l) / 2;
-            if ctx.th(m) >= target {
+            if ctx.th(m)? >= target {
                 h = m;
             } else {
                 l = m;
@@ -99,13 +105,13 @@ fn search_region(ctx: &Ctx, lo: i64, hi: i64, target: Decimal, window: i64) -> R
         h
     };
     // 按 0.01 上下逐分校准扫描
-    let a = (pos - window).max(lo);
-    let b = (pos + window).min(hi);
+    let a = pos.saturating_sub(window).max(lo);
+    let b = pos.saturating_add(window).min(hi);
     let mut exact_min = None;
     let mut exact_max = None;
     let mut nearest: Option<(i64, Decimal)> = None;
     for t in a..=b {
-        let d = ctx.th(t) - target;
+        let d = ctx.th(t)? - target;
         if d.is_zero() {
             exact_min.get_or_insert(t);
             exact_max = Some(t);
@@ -114,11 +120,13 @@ fn search_region(ctx: &Ctx, lo: i64, hi: i64, target: Decimal, window: i64) -> R
             nearest = Some((t, d));
         }
     }
-    RegionResult {
+    let nearest =
+        nearest.ok_or_else(|| CalcError::InvalidConfig("反算扫描窗口为空".to_string()))?;
+    Ok(RegionResult {
         exact_min,
         exact_max,
-        nearest: nearest.expect("窗口非空"),
-    }
+        nearest,
+    })
 }
 
 /// 可复用的反算器：按配置预先求出分段区间，批量反算时避免重复计算。
@@ -138,8 +146,8 @@ impl Reverser {
         let mut regions = Vec::new();
         let mut lo = 0i64;
         loop {
-            let k = ctx.key(lo);
-            if ctx.key(max_ticks) <= k {
+            let k = ctx.key(lo)?;
+            if ctx.key(max_ticks)? <= k {
                 regions.push((lo, max_ticks));
                 break;
             }
@@ -147,7 +155,7 @@ impl Reverser {
             let (mut l, mut h) = (lo, max_ticks);
             while h - l > 1 {
                 let m = l + (h - l) / 2;
-                if ctx.key(m) > k {
+                if ctx.key(m)? > k {
                     h = m;
                 } else {
                     l = m;
@@ -181,7 +189,7 @@ impl Reverser {
         let target = validate_amount(cfg, take_home)?;
         let ctx = Ctx { cfg };
         let last = self.regions.last().map(|r| r.1).unwrap_or(0);
-        let max_take_home = ctx.th(last);
+        let max_take_home = ctx.th(last)?;
         if target > max_take_home {
             return Err(CalcError::TargetTooLarge {
                 target,
@@ -190,11 +198,10 @@ impl Reverser {
             });
         }
         let window = i64::from(cfg.reverse.search_window.max(1));
-        let results: Vec<RegionResult> = self
-            .regions
-            .iter()
-            .map(|&(lo, hi)| search_region(&ctx, lo, hi, target, window))
-            .collect();
+        let mut results = Vec::with_capacity(self.regions.len());
+        for &(lo, hi) in &self.regions {
+            results.push(search_region(&ctx, lo, hi, target, window)?);
+        }
 
         let exact: Vec<&RegionResult> = results.iter().filter(|r| r.exact_min.is_some()).collect();
         if !exact.is_empty() {
@@ -229,7 +236,7 @@ impl Reverser {
                     others.push(ctx.dec(pick(r)));
                 }
             }
-            let breakdown = ctx.eval(ticks);
+            let breakdown = ctx.eval(ticks)?;
             debug_assert_eq!(breakdown.take_home, target);
             return Ok(ReverseOutcome {
                 target,
@@ -250,7 +257,7 @@ impl Reverser {
         diff.rescale(cfg.rounding.scale);
         Ok(ReverseOutcome {
             target,
-            breakdown: ctx.eval(ticks),
+            breakdown: ctx.eval(ticks)?,
             exact: false,
             diff,
             exact_net_income_range: None,
