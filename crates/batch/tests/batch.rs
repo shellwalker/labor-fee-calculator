@@ -276,6 +276,74 @@ fn three_items_columns() {
     );
 }
 
+#[test]
+fn formula_injection_prefixes_text_but_not_amounts() {
+    let cfg = Config::default();
+    let mut csv_buf = Vec::new();
+    {
+        let mut w = csv::Writer::from_writer(&mut csv_buf);
+        w.write_record(["姓名", "不含增值税收入"]).unwrap();
+        w.write_record(["=1+1", "10000"]).unwrap();
+        w.write_record(["+cmd", "100"]).unwrap();
+        w.write_record(["-2+3", "50"]).unwrap();
+        w.write_record(["@sum", "10"]).unwrap();
+        w.write_record(["\tcmd", "1"]).unwrap();
+        w.write_record(["\rcmd", "2"]).unwrap();
+        w.write_record(["张三", "1000"]).unwrap();
+        w.flush().unwrap();
+    }
+    let opts = Options {
+        kind: InputKind::NetIncome,
+        ..Default::default()
+    };
+    let out = process(&cfg, &csv_buf, Format::Csv, &opts).unwrap();
+    let s = csv_text(out.bytes);
+    let mut rdr = csv::Reader::from_reader(s.as_bytes());
+    let h = rdr.headers().unwrap().clone();
+    let col = |n: &str| h.iter().position(|x| x == n).unwrap();
+    let recs: Vec<_> = rdr.records().map(|r| r.unwrap()).collect();
+    assert_eq!(&recs[0][0], "'=1+1");
+    assert_eq!(&recs[1][0], "'+cmd");
+    assert_eq!(&recs[2][0], "'-2+3");
+    assert_eq!(&recs[3][0], "'@sum");
+    assert_eq!(&recs[4][0], "'\tcmd");
+    assert_eq!(&recs[5][0], "'\rcmd");
+    assert_eq!(&recs[6][0], "张三");
+    assert_eq!(&recs[0][col("企业总支出")], "10103.00");
+    let net = h
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| *x == "不含增值税收入")
+        .map(|(i, _)| i)
+        .last()
+        .unwrap();
+    assert_eq!(&recs[0][net], "10000.00");
+    assert!(!recs[0][net].starts_with('\''));
+    assert_eq!(&recs[6][col("增值税税额")], "10.00");
+    assert!(!recs[0][col("企业总支出")].starts_with('\''));
+
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.write_string(0, 0, "=姓名").unwrap();
+    ws.write_string(0, 1, "不含增值税收入").unwrap();
+    ws.write_string(1, 0, "=1+1").unwrap();
+    ws.write_number(1, 1, 10000.0).unwrap();
+    ws.write_number(2, 0, -12.5).unwrap();
+    ws.write_number(2, 1, 100.0).unwrap();
+    let bytes = wb.save_to_buffer().unwrap();
+    let out = process(&cfg, &bytes, Format::Spreadsheet, &opts).unwrap();
+    let rows = read_back(&out.bytes);
+    assert_eq!(rows[0][0], Data::String("'=姓名".into()));
+    assert_eq!(rows[1][0], Data::String("'=1+1".into()));
+    assert_eq!(money(&rows[1][col("不含增值税收入")]), dec!(10000));
+    match &rows[2][0] {
+        Data::Float(n) => assert!((n - -12.5).abs() < 1e-9, "{n}"),
+        other => panic!("负数原表数值不应被转义成文本：{other:?}"),
+    }
+    // 100 元未达起征点，企业总支出等于不含增值税收入，且仍是数值单元格
+    assert_eq!(money(&rows[2][col("企业总支出")]), dec!(100.00));
+}
+
 fn csv_text(bytes: Vec<u8>) -> String {
     String::from_utf8(bytes)
         .unwrap()
