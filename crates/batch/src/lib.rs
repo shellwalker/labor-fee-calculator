@@ -109,6 +109,14 @@ pub enum BatchError {
     NoColumns,
     #[error("写出文件失败：{0}")]
     Write(String),
+    #[error("文件大小 {size} 字节超过上限 {max} 字节")]
+    FileTooLarge { size: usize, max: usize },
+    #[error("数据行数超过上限 {max} 行（不含标题行）")]
+    TooManyRows { max: usize },
+    #[error("列数 {cols} 超过上限 {max}")]
+    TooManyColumns { cols: usize, max: usize },
+    #[error("单元格长度 {len} 超过上限 {max} 个字符")]
+    CellTooLong { len: usize, max: usize },
     #[error(transparent)]
     Calc(#[from] CalcError),
 }
@@ -189,6 +197,41 @@ pub fn output_file_name_for(input_name: &str, kind: InputKind) -> Result<String,
     Ok(format!("{stem}_{suffix}.{}", fmt.output_extension()))
 }
 
+/// 批量输入的默认文件大小上限（20 MiB）。与 Web `--max-upload-mb` 的默认值一致。
+pub const DEFAULT_MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
+/// 批量输入的默认数据行数上限（不含标题行）。
+pub const DEFAULT_MAX_ROWS: usize = 100_000;
+/// 批量输入的默认列数上限（标题与各数据行的最大宽度）。
+pub const DEFAULT_MAX_COLS: usize = 256;
+/// 批量输入的默认单元格字符数上限，与 Excel 单元格 32,767 个字符的限制一致。
+pub const DEFAULT_MAX_CELL_CHARS: usize = 32_767;
+
+/// 批量输入的规模上限。超过任一上限时整份文件报错，不逐行继续。
+///
+/// 默认值见各 `DEFAULT_MAX_*` 常量，也可在 CLI / Web 启动参数里覆盖。假设见 `docs/ASSUMPTIONS.md`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limits {
+    /// 输入文件字节数上限。
+    pub max_file_bytes: usize,
+    /// 数据行数上限（不含标题行）。
+    pub max_rows: usize,
+    /// 列数上限。
+    pub max_cols: usize,
+    /// 单个文本单元格的字符数上限。
+    pub max_cell_chars: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_rows: DEFAULT_MAX_ROWS,
+            max_cols: DEFAULT_MAX_COLS,
+            max_cell_chars: DEFAULT_MAX_CELL_CHARS,
+        }
+    }
+}
+
 /// 批量处理选项。
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -200,6 +243,8 @@ pub struct Options {
     pub preview_rows: usize,
     /// 导出的列及顺序；为空时导出全部列（[`available_columns`] 的默认顺序）。
     pub columns: Option<Vec<ExportColumn>>,
+    /// 文件大小、行数、列数、单元格长度上限。
+    pub limits: Limits,
 }
 
 impl Options {
@@ -642,12 +687,52 @@ impl Computed {
 
 /// 批量计算：读取输入文件字节，逐行计算全部结果列（不生成文件）。
 /// 之后可用 [`Computed::render`] 按任意导出列生成文件。
+fn enforce_table_limits(table: &[Vec<Cell>], limits: &Limits) -> Result<(), BatchError> {
+    let data_rows = table.len().saturating_sub(1);
+    if data_rows > limits.max_rows {
+        return Err(BatchError::TooManyRows {
+            max: limits.max_rows,
+        });
+    }
+    let cols = table.iter().map(Vec::len).max().unwrap_or(0);
+    if cols > limits.max_cols {
+        return Err(BatchError::TooManyColumns {
+            cols,
+            max: limits.max_cols,
+        });
+    }
+    for row in table {
+        for cell in row {
+            if let Cell::Text(s) = cell {
+                let len = if s.len() <= limits.max_cell_chars {
+                    s.len()
+                } else {
+                    s.chars().count()
+                };
+                if len > limits.max_cell_chars {
+                    return Err(BatchError::CellTooLong {
+                        len,
+                        max: limits.max_cell_chars,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn compute(
     cfg: &Config,
     input: &[u8],
     format: Format,
     opts: &Options,
 ) -> Result<Computed, BatchError> {
+    if input.len() > opts.limits.max_file_bytes {
+        return Err(BatchError::FileTooLarge {
+            size: input.len(),
+            max: opts.limits.max_file_bytes,
+        });
+    }
     let mut table = match format {
         Format::Csv => read_csv(input)?,
         Format::Spreadsheet => read_spreadsheet(input)?,
@@ -662,6 +747,7 @@ pub fn compute(
     if table.is_empty() {
         return Err(BatchError::Empty);
     }
+    enforce_table_limits(&table, &opts.limits)?;
     let header = table.remove(0);
     let find = |name: &str| header.iter().position(|c| c.text().trim() == name.trim());
     let col = match &opts.column {

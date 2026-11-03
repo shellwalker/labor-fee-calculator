@@ -66,6 +66,18 @@ enum Cmd {
         /// 列出该输入列含义下可导出的列（标识与标题，按默认顺序）后退出
         #[arg(long)]
         list_columns: bool,
+        /// 数据行数上限（不含标题行）
+        #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_ROWS)]
+        max_rows: usize,
+        /// 列数上限
+        #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_COLS)]
+        max_cols: usize,
+        /// 单元格字符数上限
+        #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_CELL_CHARS)]
+        max_cell_chars: usize,
+        /// 输入文件大小上限（字节）
+        #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_FILE_BYTES)]
+        max_file_bytes: usize,
     },
     /// 输出当前生效的计算参数（TOML）
     Config,
@@ -226,6 +238,10 @@ fn run() -> Result<()> {
             column,
             columns,
             list_columns,
+            max_rows,
+            max_cols,
+            max_cell_chars,
+            max_file_bytes,
         } => {
             if list_columns {
                 let avail = labor_fee_batch::available_columns(&cfg, input_kind);
@@ -248,7 +264,13 @@ fn run() -> Result<()> {
                 .map(|spec| labor_fee_batch::parse_columns(&spec, &cfg, input_kind))
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
-            let run = run_batch(&cfg, &input, output, input_kind, column, columns)?;
+            let limits = labor_fee_batch::Limits {
+                max_rows,
+                max_cols,
+                max_cell_chars,
+                max_file_bytes,
+            };
+            let run = run_batch(&cfg, &input, output, input_kind, column, columns, limits)?;
             let out_path = run.output;
             let s = &run.summary;
             if cli.json {
@@ -311,6 +333,7 @@ fn run_batch(
     input_kind: labor_fee_batch::InputKind,
     column: Option<String>,
     columns: Option<Vec<labor_fee_batch::ExportColumn>>,
+    limits: labor_fee_batch::Limits,
 ) -> Result<BatchRun> {
     let (input_format, out_path, output_format) = resolve_batch_paths(input, output, input_kind)?;
     let name = input.to_string_lossy();
@@ -319,6 +342,7 @@ fn run_batch(
         kind: input_kind,
         column,
         columns,
+        limits,
         ..Default::default()
     };
     let computed = labor_fee_batch::compute(cfg, &bytes, input_format, &opts)?;
@@ -391,6 +415,7 @@ mod tests {
             InputKind::NetIncome,
             None,
             None,
+            labor_fee_batch::Limits::default(),
         )
         .unwrap();
         assert_eq!(run.output, xlsx_out);
@@ -406,6 +431,7 @@ mod tests {
             InputKind::NetIncome,
             None,
             None,
+            labor_fee_batch::Limits::default(),
         )
         .unwrap();
         let text = String::from_utf8(std::fs::read(&csv_out).unwrap()).unwrap();
@@ -420,6 +446,7 @@ mod tests {
             InputKind::NetIncome,
             None,
             None,
+            labor_fee_batch::Limits::default(),
         )
         .is_err());
         assert!(!bad.exists(), "扩展名不支持时不应写出文件");
