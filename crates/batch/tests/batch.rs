@@ -1,7 +1,7 @@
 use calamine::{Data, Reader};
 use labor_fee_batch::{
     available_columns, compute, parse_columns, process, BatchError, ColumnLayout, ExportColumn,
-    Format, InputKind, Options,
+    Format, InputKind, Limits, Options,
 };
 use labor_fee_core::{forward, Config};
 use rust_decimal::Decimal;
@@ -142,6 +142,7 @@ fn total_cost_gap_notes() {
         column: None,
         preview_rows: 3,
         columns: None,
+        ..Options::default()
     };
     let out = process(&cfg, text.as_bytes(), Format::Csv, &opts).unwrap();
     assert_eq!(out.summary.rows, 6);
@@ -274,6 +275,141 @@ fn three_items_columns() {
         s.contains("100.00,0.50,1.50,1.00,3.00,3.00,10103.00"),
         "{s}"
     );
+}
+
+#[test]
+fn formula_injection_prefixes_text_but_not_amounts() {
+    let cfg = Config::default();
+    let mut csv_buf = Vec::new();
+    {
+        let mut w = csv::Writer::from_writer(&mut csv_buf);
+        w.write_record(["姓名", "不含增值税收入"]).unwrap();
+        w.write_record(["=1+1", "10000"]).unwrap();
+        w.write_record(["+cmd", "100"]).unwrap();
+        w.write_record(["-2+3", "50"]).unwrap();
+        w.write_record(["@sum", "10"]).unwrap();
+        w.write_record(["\tcmd", "1"]).unwrap();
+        w.write_record(["\rcmd", "2"]).unwrap();
+        w.write_record(["张三", "1000"]).unwrap();
+        w.flush().unwrap();
+    }
+    let opts = Options {
+        kind: InputKind::NetIncome,
+        ..Default::default()
+    };
+    let out = process(&cfg, &csv_buf, Format::Csv, &opts).unwrap();
+    let s = csv_text(out.bytes);
+    let mut rdr = csv::Reader::from_reader(s.as_bytes());
+    let h = rdr.headers().unwrap().clone();
+    let col = |n: &str| h.iter().position(|x| x == n).unwrap();
+    let recs: Vec<_> = rdr.records().map(|r| r.unwrap()).collect();
+    assert_eq!(&recs[0][0], "'=1+1");
+    assert_eq!(&recs[1][0], "'+cmd");
+    assert_eq!(&recs[2][0], "'-2+3");
+    assert_eq!(&recs[3][0], "'@sum");
+    assert_eq!(&recs[4][0], "'\tcmd");
+    assert_eq!(&recs[5][0], "'\rcmd");
+    assert_eq!(&recs[6][0], "张三");
+    assert_eq!(&recs[0][col("企业总支出")], "10103.00");
+    let net = h
+        .iter()
+        .enumerate()
+        .filter(|(_, x)| *x == "不含增值税收入")
+        .map(|(i, _)| i)
+        .last()
+        .unwrap();
+    assert_eq!(&recs[0][net], "10000.00");
+    assert!(!recs[0][net].starts_with('\''));
+    assert_eq!(&recs[6][col("增值税税额")], "10.00");
+    assert!(!recs[0][col("企业总支出")].starts_with('\''));
+
+    let mut wb = rust_xlsxwriter::Workbook::new();
+    let ws = wb.add_worksheet();
+    ws.write_string(0, 0, "=姓名").unwrap();
+    ws.write_string(0, 1, "不含增值税收入").unwrap();
+    ws.write_string(1, 0, "=1+1").unwrap();
+    ws.write_number(1, 1, 10000.0).unwrap();
+    ws.write_number(2, 0, -12.5).unwrap();
+    ws.write_number(2, 1, 100.0).unwrap();
+    let bytes = wb.save_to_buffer().unwrap();
+    let out = process(&cfg, &bytes, Format::Spreadsheet, &opts).unwrap();
+    let rows = read_back(&out.bytes);
+    assert_eq!(rows[0][0], Data::String("'=姓名".into()));
+    assert_eq!(rows[1][0], Data::String("'=1+1".into()));
+    assert_eq!(money(&rows[1][col("不含增值税收入")]), dec!(10000));
+    match &rows[2][0] {
+        Data::Float(n) => assert!((n - -12.5).abs() < 1e-9, "{n}"),
+        other => panic!("负数原表数值不应被转义成文本：{other:?}"),
+    }
+    // 100 元未达起征点，企业总支出等于不含增值税收入，且仍是数值单元格
+    assert_eq!(money(&rows[2][col("企业总支出")]), dec!(100.00));
+}
+
+#[test]
+fn input_limits_reject_oversized_batches() {
+    let cfg = Config::default();
+    let csv = "不含增值税收入\n1\n2\n";
+    let base = Limits {
+        max_file_bytes: 1024,
+        max_rows: 10,
+        max_cols: 8,
+        max_cell_chars: 100,
+    };
+    let run = |limits: Limits, text: &str| {
+        process(
+            &cfg,
+            text.as_bytes(),
+            Format::Csv,
+            &Options {
+                kind: InputKind::NetIncome,
+                limits,
+                ..Options::default()
+            },
+        )
+    };
+    assert!(run(base.clone(), csv).is_ok());
+    assert!(matches!(
+        run(
+            Limits {
+                max_rows: 1,
+                ..base.clone()
+            },
+            csv
+        ),
+        Err(BatchError::TooManyRows { max: 1 })
+    ));
+    assert!(matches!(
+        run(
+            Limits {
+                max_cols: 1,
+                ..base.clone()
+            },
+            "甲,不含增值税收入\n张三,1\n"
+        ),
+        Err(BatchError::TooManyColumns { cols: 2, max: 1 })
+    ));
+    // “不含税收入”是 5 个字符，数据单元格 8 个字符，应报单元格而不是列名
+    let long = format!("不含税收入\n{}\n", "甲".repeat(8));
+    assert!(matches!(
+        run(
+            Limits {
+                max_cell_chars: 6,
+                ..base.clone()
+            },
+            &long
+        ),
+        Err(BatchError::CellTooLong { len: 8, max: 6 })
+    ));
+    assert!(matches!(
+        run(
+            Limits {
+                max_file_bytes: 4,
+                ..base
+            },
+            csv
+        ),
+        Err(BatchError::FileTooLarge { .. })
+    ));
 }
 
 fn csv_text(bytes: Vec<u8>) -> String {

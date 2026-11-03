@@ -49,7 +49,8 @@ enum Cmd {
         /// 输入文件（使用 --list-columns 时可省略）
         #[arg(required_unless_present = "list_columns")]
         input: Option<PathBuf>,
-        /// 输出文件（缺省为 输入名_测算结果/计算结果.xlsx/csv，与输入同目录）
+        /// 输出文件。扩展名决定格式：.csv 或 .xlsx，其他扩展名报错。
+        /// 缺省为输入名_测算结果/计算结果.csv/xlsx（与输入同目录，扩展名随输入）
         #[arg(short, long)]
         output: Option<PathBuf>,
         /// 输入列含义：take-home（税后实发金额）| net-income（不含增值税收入）| total-cost（企业总支出）
@@ -65,6 +66,18 @@ enum Cmd {
         /// 列出该输入列含义下可导出的列（标识与标题，按默认顺序）后退出
         #[arg(long)]
         list_columns: bool,
+        /// 数据行数上限（不含标题行）
+        #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_ROWS)]
+        max_rows: usize,
+        /// 列数上限
+        #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_COLS)]
+        max_cols: usize,
+        /// 单元格字符数上限
+        #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_CELL_CHARS)]
+        max_cell_chars: usize,
+        /// 输入文件大小上限（字节）
+        #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_FILE_BYTES)]
+        max_file_bytes: usize,
     },
     /// 输出当前生效的计算参数（TOML）
     Config,
@@ -225,6 +238,10 @@ fn run() -> Result<()> {
             column,
             columns,
             list_columns,
+            max_rows,
+            max_cols,
+            max_cell_chars,
+            max_file_bytes,
         } => {
             if list_columns {
                 let avail = labor_fee_batch::available_columns(&cfg, input_kind);
@@ -247,25 +264,15 @@ fn run() -> Result<()> {
                 .map(|spec| labor_fee_batch::parse_columns(&spec, &cfg, input_kind))
                 .transpose()
                 .map_err(anyhow::Error::msg)?;
-            let name = input.to_string_lossy().to_string();
-            let format = labor_fee_batch::Format::from_file_name(&name)?;
-            let bytes = std::fs::read(&input).with_context(|| format!("读取文件失败：{name}"))?;
-            let opts = labor_fee_batch::Options {
-                kind: input_kind,
-                column,
-                columns,
-                ..Default::default()
+            let limits = labor_fee_batch::Limits {
+                max_rows,
+                max_cols,
+                max_cell_chars,
+                max_file_bytes,
             };
-            let out = labor_fee_batch::process(&cfg, &bytes, format, &opts)?;
-            let out_path = match output {
-                Some(p) => p,
-                None => {
-                    input.with_file_name(labor_fee_batch::output_file_name_for(&name, input_kind)?)
-                }
-            };
-            std::fs::write(&out_path, &out.bytes)
-                .with_context(|| format!("写出文件失败：{}", out_path.display()))?;
-            let s = &out.summary;
+            let run = run_batch(&cfg, &input, output, input_kind, column, columns, limits)?;
+            let out_path = run.output;
+            let s = &run.summary;
             if cli.json {
                 println!(
                     "{}",
@@ -296,9 +303,153 @@ fn run() -> Result<()> {
     Ok(())
 }
 
+struct BatchRun {
+    output: PathBuf,
+    summary: labor_fee_batch::Summary,
+}
+
+/// 按输出路径的扩展名决定写出格式：`.csv` 为 CSV，`.xlsx` 为 Excel；其他扩展名报错。
+/// 未指定输出路径时，仍按输入类型生成 `原名_测算结果/计算结果.csv/xlsx`。
+fn resolve_batch_paths(
+    input: &std::path::Path,
+    output: Option<PathBuf>,
+    kind: labor_fee_batch::InputKind,
+) -> Result<(labor_fee_batch::Format, PathBuf, labor_fee_batch::Format)> {
+    let name = input.to_string_lossy().to_string();
+    let input_format = labor_fee_batch::Format::from_file_name(&name)?;
+    let out_path = match output {
+        Some(p) => p,
+        None => input.with_file_name(labor_fee_batch::output_file_name_for(&name, kind)?),
+    };
+    let output_format =
+        labor_fee_batch::Format::from_output_file_name(&out_path.to_string_lossy())?;
+    Ok((input_format, out_path, output_format))
+}
+
+fn run_batch(
+    cfg: &Config,
+    input: &std::path::Path,
+    output: Option<PathBuf>,
+    input_kind: labor_fee_batch::InputKind,
+    column: Option<String>,
+    columns: Option<Vec<labor_fee_batch::ExportColumn>>,
+    limits: labor_fee_batch::Limits,
+) -> Result<BatchRun> {
+    let (input_format, out_path, output_format) = resolve_batch_paths(input, output, input_kind)?;
+    let name = input.to_string_lossy();
+    let bytes = std::fs::read(input).with_context(|| format!("读取文件失败：{name}"))?;
+    let opts = labor_fee_batch::Options {
+        kind: input_kind,
+        column,
+        columns,
+        limits,
+        ..Default::default()
+    };
+    let computed = labor_fee_batch::compute(cfg, &bytes, input_format, &opts)?;
+    let cols = opts
+        .columns
+        .clone()
+        .unwrap_or_else(|| computed.available_columns().to_vec());
+    let rendered = computed.render(&cols, output_format)?;
+    std::fs::write(&out_path, &rendered)
+        .with_context(|| format!("写出文件失败：{}", out_path.display()))?;
+    Ok(BatchRun {
+        output: out_path,
+        summary: computed.summary,
+    })
+}
+
 fn main() {
     if let Err(e) = run() {
         eprintln!("错误：{e:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use labor_fee_batch::{Format, InputKind};
+
+    fn scratch() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lfc-cli-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn batch_output_format_follows_extension() {
+        let dir = scratch();
+        let csv_in = dir.join("in.csv");
+        std::fs::write(&csv_in, "不含增值税收入\n10000\n").unwrap();
+        let (_, path, fmt) = resolve_batch_paths(&csv_in, None, InputKind::NetIncome).unwrap();
+        assert_eq!(fmt, Format::Csv);
+        assert_eq!(path.file_name().unwrap(), "in_计算结果.csv");
+
+        let xlsx = dir.join("out.XLSX");
+        let (_, path, fmt) =
+            resolve_batch_paths(&csv_in, Some(xlsx.clone()), InputKind::NetIncome).unwrap();
+        assert_eq!(path, xlsx);
+        assert_eq!(fmt, Format::Spreadsheet);
+
+        let err = resolve_batch_paths(&csv_in, Some(dir.join("out.xls")), InputKind::NetIncome)
+            .unwrap_err();
+        assert!(err.to_string().contains(".csv 或 .xlsx"), "{err}");
+        let err = resolve_batch_paths(&csv_in, Some(dir.join("out.txt")), InputKind::NetIncome)
+            .unwrap_err();
+        assert!(err.to_string().contains("不支持的输出文件类型"), "{err}");
+
+        let cfg = Config::default();
+        let xlsx_out = dir.join("结果.xlsx");
+        let run = run_batch(
+            &cfg,
+            &csv_in,
+            Some(xlsx_out.clone()),
+            InputKind::NetIncome,
+            None,
+            None,
+            labor_fee_batch::Limits::default(),
+        )
+        .unwrap();
+        assert_eq!(run.output, xlsx_out);
+        assert_eq!(run.summary.exact, 1);
+        let bytes = std::fs::read(&xlsx_out).unwrap();
+        assert_eq!(&bytes[..2], b"PK", "xlsx 应为 zip 包");
+
+        let csv_out = dir.join("结果.csv");
+        run_batch(
+            &cfg,
+            &csv_in,
+            Some(csv_out.clone()),
+            InputKind::NetIncome,
+            None,
+            None,
+            labor_fee_batch::Limits::default(),
+        )
+        .unwrap();
+        let text = String::from_utf8(std::fs::read(&csv_out).unwrap()).unwrap();
+        assert!(text.contains("10103.00"), "{text}");
+        assert!(text.contains("8400.00"), "{text}");
+
+        let bad = dir.join("结果.xls");
+        assert!(run_batch(
+            &cfg,
+            &csv_in,
+            Some(bad.clone()),
+            InputKind::NetIncome,
+            None,
+            None,
+            labor_fee_batch::Limits::default(),
+        )
+        .is_err());
+        assert!(!bad.exists(), "扩展名不支持时不应写出文件");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -20,6 +20,7 @@ use clap::Parser;
 use labor_fee_core::{forward, from_total_cost, CalcError, Config, Decimal, Reverser};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use tokio::sync::Semaphore;
 
 #[derive(Parser)]
 #[command(name = "labor-fee-web", about = "劳务报酬计算 Web 页面")]
@@ -33,11 +34,29 @@ struct Args {
     /// 上传文件大小上限（MB）
     #[arg(long, default_value_t = 20)]
     max_upload_mb: usize,
+    /// 批量数据行数上限（不含标题行）
+    #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_ROWS)]
+    max_batch_rows: usize,
+    /// 批量列数上限
+    #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_COLS)]
+    max_batch_cols: usize,
+    /// 批量单元格字符数上限
+    #[arg(long, default_value_t = labor_fee_batch::DEFAULT_MAX_CELL_CHARS)]
+    max_batch_cell_chars: usize,
+    /// 同时处理的批量请求上限
+    #[arg(long, default_value_t = DEFAULT_BATCH_CONCURRENCY)]
+    max_batch_concurrency: usize,
 }
+
+/// 同时处理的批量请求默认上限。本地单用户工具，避免大表把进程占满。
+const DEFAULT_BATCH_CONCURRENCY: usize = 2;
 
 struct AppState {
     cfg: Config,
     reverser: Reverser,
+    limits: labor_fee_batch::Limits,
+    batch_concurrency: usize,
+    batch_slots: Arc<Semaphore>,
 }
 
 type Shared = Arc<AppState>;
@@ -228,15 +247,31 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
         Ok(c) => c,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
+    let permit = match Arc::clone(&st.batch_slots).try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return err(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "批量测算并发已达上限（同时最多 {} 个），请稍后再试",
+                    st.batch_concurrency
+                ),
+            );
+        }
+    };
+    let limits = st.limits.clone();
     let opts = labor_fee_batch::Options {
         kind,
         column,
         columns,
+        limits,
         ..Default::default()
     };
-    let result =
-        tokio::task::spawn_blocking(move || labor_fee_batch::process(&cfg, &bytes, format, &opts))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        labor_fee_batch::process(&cfg, &bytes, format, &opts)
+    })
+    .await;
     let out = match result {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return err(StatusCode::UNPROCESSABLE_ENTITY, e),
@@ -274,9 +309,29 @@ fn percent_encode(s: &str) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn app(cfg: Config, max_upload_mb: usize) -> anyhow::Result<Router> {
+    let limits = labor_fee_batch::Limits {
+        max_file_bytes: max_upload_mb.saturating_mul(1024 * 1024),
+        ..labor_fee_batch::Limits::default()
+    };
+    app_with(cfg, limits, DEFAULT_BATCH_CONCURRENCY)
+}
+
+fn app_with(
+    cfg: Config,
+    limits: labor_fee_batch::Limits,
+    concurrency: usize,
+) -> anyhow::Result<Router> {
     let reverser = Reverser::new(&cfg)?;
-    let state = Arc::new(AppState { cfg, reverser });
+    let body_limit = limits.max_file_bytes.saturating_add(1024 * 1024);
+    let state = Arc::new(AppState {
+        cfg,
+        reverser,
+        batch_concurrency: concurrency,
+        batch_slots: Arc::new(Semaphore::new(concurrency)),
+        limits,
+    });
     Ok(Router::new()
         .route("/", get(index))
         .route("/api/config", get(api_config))
@@ -285,7 +340,7 @@ fn app(cfg: Config, max_upload_mb: usize) -> anyhow::Result<Router> {
         .route("/api/reverse", get(api_reverse))
         .route("/api/batch", post(api_batch))
         .route("/api/columns", get(api_columns))
-        .layer(DefaultBodyLimit::max(max_upload_mb * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(body_limit))
         .with_state(state))
 }
 
@@ -300,7 +355,13 @@ async fn main() -> anyhow::Result<()> {
             Config::from_toml_str(&text)?
         }
     };
-    let router = app(cfg, args.max_upload_mb)?;
+    let limits = labor_fee_batch::Limits {
+        max_file_bytes: args.max_upload_mb.saturating_mul(1024 * 1024),
+        max_rows: args.max_batch_rows,
+        max_cols: args.max_batch_cols,
+        max_cell_chars: args.max_batch_cell_chars,
+    };
+    let router = app_with(cfg, limits, args.max_batch_concurrency)?;
     let listener = tokio::net::TcpListener::bind(args.listen)
         .await
         .with_context(|| format!("监听失败：{}", args.listen))?;
@@ -523,5 +584,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(b.to_vec()).unwrap();
+        assert!(
+            !html.contains("innerHTML"),
+            "页面不得再用 innerHTML 拼接内容"
+        );
+        assert!(html.contains("textContent"));
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_too_many_rows() {
+        let limits = labor_fee_batch::Limits {
+            max_rows: 1,
+            ..labor_fee_batch::Limits::default()
+        };
+        let router = app_with(Config::default(), limits, 2).unwrap();
+        let boundary = "LIM";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"input_kind\"\r\n\r\nnet-income\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"c.csv\"\r\nContent-Type: text/csv\r\n\r\n不含增值税收入\n1\n2\n\r\n--{boundary}--\r\n"
+        );
+        let req = Request::post("/api/batch")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let v = body_json(resp).await;
+        let msg = v["error"].as_str().unwrap();
+        assert!(msg.contains("数据行数超过上限 1 行"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn batch_concurrency_limit() {
+        let router = app_with(Config::default(), labor_fee_batch::Limits::default(), 0).unwrap();
+        let boundary = "CONC";
+        let body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"c.csv\"\r\nContent-Type: text/csv\r\n\r\n到手金额\n8400\n\r\n--{boundary}--\r\n"
+        );
+        let req = Request::post("/api/batch")
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let v = body_json(resp).await;
+        let msg = v["error"].as_str().unwrap();
+        assert!(msg.contains("并发已达上限"), "{msg}");
     }
 }

@@ -13,6 +13,7 @@
 
 use labor_fee_core::{forward, from_total_cost, Breakdown, CalcError, Config, Decimal, Reverser};
 use rust_decimal::prelude::ToPrimitive;
+use std::borrow::Cow;
 use std::io::Cursor;
 use std::str::FromStr;
 use thiserror::Error;
@@ -96,6 +97,8 @@ impl InputKind {
 pub enum BatchError {
     #[error("不支持的文件类型：{0}（支持 .xlsx/.xlsm/.xls/.ods/.csv）")]
     UnsupportedFormat(String),
+    #[error("不支持的输出文件类型：{0}（请使用 .csv 或 .xlsx）")]
+    UnsupportedOutputFormat(String),
     #[error("表格内容为空")]
     Empty,
     #[error("首行未找到标题为{0}的列")]
@@ -106,6 +109,14 @@ pub enum BatchError {
     NoColumns,
     #[error("写出文件失败：{0}")]
     Write(String),
+    #[error("文件大小 {size} 字节超过上限 {max} 字节")]
+    FileTooLarge { size: usize, max: usize },
+    #[error("数据行数超过上限 {max} 行（不含标题行）")]
+    TooManyRows { max: usize },
+    #[error("列数 {cols} 超过上限 {max}")]
+    TooManyColumns { cols: usize, max: usize },
+    #[error("单元格长度 {len} 超过上限 {max} 个字符")]
+    CellTooLong { len: usize, max: usize },
     #[error(transparent)]
     Calc(#[from] CalcError),
 }
@@ -129,6 +140,21 @@ impl Format {
             "csv" => Ok(Format::Csv),
             "xlsx" | "xlsm" | "xls" | "xlsb" | "ods" => Ok(Format::Spreadsheet),
             _ => Err(BatchError::UnsupportedFormat(name.to_string())),
+        }
+    }
+
+    /// 按输出文件扩展名决定写出格式。只接受 `.csv` 与 `.xlsx`（大小写不敏感）。
+    ///
+    /// 输入可以是 `.xls` / `.ods` 等，写出不行：扩展名不支持时返回错误，不按输入格式猜测。
+    pub fn from_output_file_name(name: &str) -> Result<Self, BatchError> {
+        let ext = name
+            .rsplit_once('.')
+            .map(|(_, e)| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        match ext.as_str() {
+            "csv" => Ok(Format::Csv),
+            "xlsx" => Ok(Format::Spreadsheet),
+            _ => Err(BatchError::UnsupportedOutputFormat(name.to_string())),
         }
     }
 
@@ -171,6 +197,41 @@ pub fn output_file_name_for(input_name: &str, kind: InputKind) -> Result<String,
     Ok(format!("{stem}_{suffix}.{}", fmt.output_extension()))
 }
 
+/// 批量输入的默认文件大小上限（20 MiB）。与 Web `--max-upload-mb` 的默认值一致。
+pub const DEFAULT_MAX_FILE_BYTES: usize = 20 * 1024 * 1024;
+/// 批量输入的默认数据行数上限（不含标题行）。
+pub const DEFAULT_MAX_ROWS: usize = 100_000;
+/// 批量输入的默认列数上限（标题与各数据行的最大宽度）。
+pub const DEFAULT_MAX_COLS: usize = 256;
+/// 批量输入的默认单元格字符数上限，与 Excel 单元格 32,767 个字符的限制一致。
+pub const DEFAULT_MAX_CELL_CHARS: usize = 32_767;
+
+/// 批量输入的规模上限。超过任一上限时整份文件报错，不逐行继续。
+///
+/// 默认值见各 `DEFAULT_MAX_*` 常量，也可在 CLI / Web 启动参数里覆盖。假设见 `docs/ASSUMPTIONS.md`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Limits {
+    /// 输入文件字节数上限。
+    pub max_file_bytes: usize,
+    /// 数据行数上限（不含标题行）。
+    pub max_rows: usize,
+    /// 列数上限。
+    pub max_cols: usize,
+    /// 单个文本单元格的字符数上限。
+    pub max_cell_chars: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: DEFAULT_MAX_FILE_BYTES,
+            max_rows: DEFAULT_MAX_ROWS,
+            max_cols: DEFAULT_MAX_COLS,
+            max_cell_chars: DEFAULT_MAX_CELL_CHARS,
+        }
+    }
+}
+
 /// 批量处理选项。
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -182,6 +243,8 @@ pub struct Options {
     pub preview_rows: usize,
     /// 导出的列及顺序；为空时导出全部列（[`available_columns`] 的默认顺序）。
     pub columns: Option<Vec<ExportColumn>>,
+    /// 文件大小、行数、列数、单元格长度上限。
+    pub limits: Limits,
 }
 
 impl Options {
@@ -237,6 +300,24 @@ impl Cell {
             Cell::Text(s) => s.clone(),
             Cell::Number(n) => n.to_string(),
         }
+    }
+}
+
+/// 文本若以 `=` `+` `-` `@`、制表符或回车开头，加前缀 `'`，避免被表格软件当成公式。
+/// 数值单元格和金额结果不经过这里，负数金额仍按数值写出。
+fn escape_formula(s: &str) -> Cow<'_, str> {
+    match s.as_bytes().first() {
+        Some(b'=' | b'+' | b'-' | b'@' | b'\t' | b'\r') => Cow::Owned(format!("'{s}")),
+        _ => Cow::Borrowed(s),
+    }
+}
+
+/// 导出时的原表单元格文本：数值（含负数）原样，文本做公式转义。
+fn cell_export_text(cell: &Cell) -> String {
+    match cell {
+        Cell::Empty => String::new(),
+        Cell::Number(n) => n.to_string(),
+        Cell::Text(s) => escape_formula(s).into_owned(),
     }
 }
 
@@ -410,6 +491,14 @@ impl Out {
             Out::Text(s) => s.clone(),
         }
     }
+
+    /// CSV / 预览用文本。金额和预扣率保持数值写法（含负数），其余文本做公式转义。
+    fn export_text(&self) -> String {
+        match self {
+            Out::Text(s) => escape_formula(s).into_owned(),
+            other => other.text(),
+        }
+    }
 }
 
 /// 输出表的一列：原表第 i 列，或第 i 个结果列。
@@ -465,7 +554,7 @@ impl Computed {
 
     fn header_text(&self, s: Slot) -> String {
         match s {
-            Slot::Source(i) => self.header[i].text(),
+            Slot::Source(i) => cell_export_text(&self.header[i]),
             Slot::Result(i) => self.columns[i].title().to_string(),
         }
     }
@@ -473,8 +562,8 @@ impl Computed {
     fn row_texts(&self, plan: &[Slot], orig: &[Cell], out: &[Out]) -> Vec<String> {
         plan.iter()
             .map(|s| match *s {
-                Slot::Source(i) => orig[i].text(),
-                Slot::Result(i) => out[i].text(),
+                Slot::Source(i) => cell_export_text(&orig[i]),
+                Slot::Result(i) => out[i].export_text(),
             })
             .collect()
     }
@@ -542,12 +631,16 @@ impl Computed {
         for (c, s) in plan.iter().enumerate() {
             let c = c as u16;
             match *s {
-                Slot::Source(i) => {
-                    if !matches!(self.header[i], Cell::Empty) {
-                        ws.write_string_with_format(0, c, self.header[i].text(), &bold)
+                Slot::Source(i) => match &self.header[i] {
+                    Cell::Empty => {}
+                    Cell::Number(n) => {
+                        ws.write_number_with_format(0, c, *n, &bold).map_err(werr)?;
+                    }
+                    Cell::Text(t) => {
+                        ws.write_string_with_format(0, c, escape_formula(t).as_ref(), &bold)
                             .map_err(werr)?;
                     }
-                }
+                },
                 Slot::Result(i) => {
                     ws.write_string_with_format(0, c, self.columns[i].title(), &bold)
                         .map_err(werr)?;
@@ -563,7 +656,8 @@ impl Computed {
                     Slot::Source(i) => match &orig[i] {
                         Cell::Empty => {}
                         Cell::Text(t) => {
-                            ws.write_string(r, c, t).map_err(werr)?;
+                            ws.write_string(r, c, escape_formula(t).as_ref())
+                                .map_err(werr)?;
                         }
                         Cell::Number(n) => {
                             ws.write_number(r, c, *n).map_err(werr)?;
@@ -580,7 +674,8 @@ impl Computed {
                                 .map_err(werr)?;
                         }
                         Out::Text(t) => {
-                            ws.write_string(r, c, t).map_err(werr)?;
+                            ws.write_string(r, c, escape_formula(t).as_ref())
+                                .map_err(werr)?;
                         }
                     },
                 }
@@ -592,12 +687,52 @@ impl Computed {
 
 /// 批量计算：读取输入文件字节，逐行计算全部结果列（不生成文件）。
 /// 之后可用 [`Computed::render`] 按任意导出列生成文件。
+fn enforce_table_limits(table: &[Vec<Cell>], limits: &Limits) -> Result<(), BatchError> {
+    let data_rows = table.len().saturating_sub(1);
+    if data_rows > limits.max_rows {
+        return Err(BatchError::TooManyRows {
+            max: limits.max_rows,
+        });
+    }
+    let cols = table.iter().map(Vec::len).max().unwrap_or(0);
+    if cols > limits.max_cols {
+        return Err(BatchError::TooManyColumns {
+            cols,
+            max: limits.max_cols,
+        });
+    }
+    for row in table {
+        for cell in row {
+            if let Cell::Text(s) = cell {
+                let len = if s.len() <= limits.max_cell_chars {
+                    s.len()
+                } else {
+                    s.chars().count()
+                };
+                if len > limits.max_cell_chars {
+                    return Err(BatchError::CellTooLong {
+                        len,
+                        max: limits.max_cell_chars,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn compute(
     cfg: &Config,
     input: &[u8],
     format: Format,
     opts: &Options,
 ) -> Result<Computed, BatchError> {
+    if input.len() > opts.limits.max_file_bytes {
+        return Err(BatchError::FileTooLarge {
+            size: input.len(),
+            max: opts.limits.max_file_bytes,
+        });
+    }
     let mut table = match format {
         Format::Csv => read_csv(input)?,
         Format::Spreadsheet => read_spreadsheet(input)?,
@@ -612,6 +747,7 @@ pub fn compute(
     if table.is_empty() {
         return Err(BatchError::Empty);
     }
+    enforce_table_limits(&table, &opts.limits)?;
     let header = table.remove(0);
     let find = |name: &str| header.iter().position(|c| c.text().trim() == name.trim());
     let col = match &opts.column {
@@ -749,7 +885,9 @@ pub fn process(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use calamine::{Data, Reader};
     use rust_decimal_macros::dec;
+    use std::io::Cursor;
 
     #[test]
     fn amount_parsing() {
@@ -785,5 +923,71 @@ mod tests {
             "工资_测算结果.xlsx"
         );
         assert_eq!(output_file_name("b.csv").unwrap(), "b_测算结果.csv");
+        assert_eq!(
+            Format::from_output_file_name("out.CSV").unwrap(),
+            Format::Csv
+        );
+        assert_eq!(
+            Format::from_output_file_name(r"dir\结果.XLSX").unwrap(),
+            Format::Spreadsheet
+        );
+        assert!(Format::from_output_file_name("结果.xls").is_err());
+        assert!(Format::from_output_file_name("结果.ods").is_err());
+        assert!(Format::from_output_file_name("结果.txt").is_err());
+        assert!(Format::from_output_file_name("无扩展名").is_err());
+    }
+
+    #[test]
+    fn negative_money_is_not_formula_escaped() {
+        let computed = Computed {
+            kind: InputKind::NetIncome,
+            format: Format::Csv,
+            summary: Summary::default(),
+            header: vec![Cell::Text("=抬头".into()), Cell::Number(-12.5)],
+            columns: vec![ExportColumn::NetIncome, ExportColumn::Notes],
+            rows: vec![(
+                vec![Cell::Text("=1+1".into()), Cell::Number(-12.5)],
+                vec![Out::Money(dec!(-1.50)), Out::Text("+备注".into())],
+            )],
+        };
+        let cols = [
+            ExportColumn::Source,
+            ExportColumn::NetIncome,
+            ExportColumn::Notes,
+        ];
+        let csv = String::from_utf8(computed.render(&cols, Format::Csv).unwrap()).unwrap();
+        let csv = csv.trim_start_matches('\u{feff}');
+        let mut rdr = csv::Reader::from_reader(csv.as_bytes());
+        let h = rdr.headers().unwrap().clone();
+        assert_eq!(&h[0], "'=抬头");
+        assert_eq!(&h[1], "-12.5");
+        let rec = rdr.records().next().unwrap().unwrap();
+        assert_eq!(&rec[0], "'=1+1");
+        assert_eq!(&rec[1], "-12.5");
+        assert_eq!(&rec[2], "-1.50");
+        assert_eq!(&rec[3], "'+备注");
+
+        let rows = {
+            let bytes = computed.render(&cols, Format::Spreadsheet).unwrap();
+            let mut wb = calamine::open_workbook_auto_from_rs(Cursor::new(bytes)).unwrap();
+            let range = wb.worksheet_range_at(0).unwrap().unwrap();
+            range.rows().map(|r| r.to_vec()).collect::<Vec<_>>()
+        };
+        assert_eq!(rows[0][0], Data::String("'=抬头".into()));
+        match &rows[0][1] {
+            Data::Float(n) => assert!((n - -12.5).abs() < 1e-9),
+            Data::Int(n) => assert_eq!(n, &-12),
+            other => panic!("负数表头应是数值：{other:?}"),
+        }
+        assert_eq!(rows[1][0], Data::String("'=1+1".into()));
+        match &rows[1][1] {
+            Data::Float(n) => assert!((n - -12.5).abs() < 1e-9),
+            other => panic!("负数原值应是数值：{other:?}"),
+        }
+        match &rows[1][2] {
+            Data::Float(n) => assert!((n - -1.5).abs() < 1e-9, "{n}"),
+            other => panic!("负数金额应是数值：{other:?}"),
+        }
+        assert_eq!(rows[1][3], Data::String("'+备注".into()));
     }
 }

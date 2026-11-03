@@ -73,9 +73,38 @@ fn check_amount(cfg: &Config, amount: Decimal) -> Result<Decimal, CalcError> {
             scale: cfg.rounding.scale,
         });
     }
+    let max = cfg.max_input_amount();
+    if amount > max {
+        return Err(CalcError::AmountTooLarge { amount, max });
+    }
     let mut a = amount;
     a.rescale(cfg.rounding.scale);
     Ok(a)
+}
+
+fn checked_add(a: Decimal, b: Decimal) -> Result<Decimal, CalcError> {
+    a.checked_add(b).ok_or(CalcError::Overflow)
+}
+
+fn checked_sub(a: Decimal, b: Decimal) -> Result<Decimal, CalcError> {
+    a.checked_sub(b).ok_or(CalcError::Overflow)
+}
+
+fn checked_mul(a: Decimal, b: Decimal) -> Result<Decimal, CalcError> {
+    a.checked_mul(b).ok_or(CalcError::Overflow)
+}
+
+fn checked_sum(items: impl IntoIterator<Item = Decimal>) -> Result<Decimal, CalcError> {
+    items.into_iter().try_fold(Decimal::ZERO, checked_add)
+}
+
+/// 二分上中点，等价于 `lo + (hi - lo + 1) / 2`。
+///
+/// `hi == i64::MAX` 时原来的 `hi - lo + 1` 会溢出。这里用无符号差值计算，
+/// 调用方保证 `0 <= lo <= hi`。
+fn upper_midpoint(lo: i64, hi: i64) -> i64 {
+    debug_assert!(lo >= 0 && hi >= lo);
+    lo + (hi as u64 - lo as u64).div_ceil(2) as i64
 }
 
 pub(crate) fn validate_amount(cfg: &Config, amount: Decimal) -> Result<Decimal, CalcError> {
@@ -84,7 +113,10 @@ pub(crate) fn validate_amount(cfg: &Config, amount: Decimal) -> Result<Decimal, 
 
 /// 金额 → 最小单位整数（分）。
 pub(crate) fn to_ticks(cfg: &Config, d: Decimal) -> Result<i64, CalcError> {
-    let m = d * Decimal::from(10i64.pow(cfg.rounding.scale));
+    let pow = 10i64
+        .checked_pow(cfg.rounding.scale)
+        .ok_or(CalcError::Overflow)?;
+    let m = checked_mul(d, Decimal::from(pow))?;
     i64::try_from(m.trunc()).map_err(|_| CalcError::Overflow)
 }
 
@@ -94,103 +126,111 @@ pub(crate) fn from_ticks(cfg: &Config, t: i64) -> Decimal {
 }
 
 /// 按舍入时点舍入各项目金额：返回（各项金额, 合计）。
-fn round_items(cfg: &Config, raw: &[Decimal]) -> (Vec<Decimal>, Decimal) {
+fn round_items(cfg: &Config, raw: &[Decimal]) -> Result<(Vec<Decimal>, Decimal), CalcError> {
     match cfg.rounding.surcharge {
         SurchargeRounding::PerItem => {
             let a: Vec<Decimal> = raw.iter().map(|x| cfg.round(*x)).collect();
-            let t = a.iter().copied().sum();
-            (a, t)
+            let t = checked_sum(a.iter().copied())?;
+            Ok((a, t))
         }
         SurchargeRounding::Total => {
-            let total = cfg.round(raw.iter().copied().sum());
+            let total = cfg.round(checked_sum(raw.iter().copied())?);
             // 明细逐项舍入，末项倒挤，保证明细之和等于合计
             let mut a: Vec<Decimal> = raw.iter().map(|x| cfg.round(*x)).collect();
             if let Some(last) = a.last_mut() {
-                let others: Decimal = raw.iter().take(raw.len() - 1).map(|x| cfg.round(*x)).sum();
-                *last = total - others;
+                let others = checked_sum(raw.iter().take(raw.len() - 1).map(|x| cfg.round(*x)))?;
+                *last = checked_sub(total, others)?;
             }
-            (a, total)
+            Ok((a, total))
         }
     }
 }
 
 /// 增值税附加税费：每项 = 计税依据 × 法定费率 × (1 − 减征比例)，按 `rounding.surcharge` 舍入。
 /// 返回（明细, 实际合计, 减征前合计）。
-fn surcharges(cfg: &Config, vat: Decimal, net: Decimal) -> (Vec<SurchargeLine>, Decimal, Decimal) {
+fn surcharges(
+    cfg: &Config,
+    vat: Decimal,
+    net: Decimal,
+) -> Result<(Vec<SurchargeLine>, Decimal, Decimal), CalcError> {
     let base = match cfg.surcharge.base {
         SurchargeBase::Vat => vat,
         SurchargeBase::NetRevenue => net,
     };
     let relief = cfg.surcharge.applied_relief();
     let items: Vec<_> = cfg.surcharge.enabled_items().collect();
-    let before_raw: Vec<Decimal> = items.iter().map(|it| base * it.rate).collect();
-    let actual_raw: Vec<Decimal> = items
-        .iter()
-        .map(|it| base * cfg.surcharge.actual_rate(it.rate))
-        .collect();
-    let (before, before_total) = round_items(cfg, &before_raw);
-    let (amounts, total) = round_items(cfg, &actual_raw);
-    let lines = items
-        .iter()
-        .zip(before)
-        .zip(amounts)
-        .map(|((it, b), amount)| SurchargeLine {
+    let mut before_raw = Vec::with_capacity(items.len());
+    let mut actual_raw = Vec::with_capacity(items.len());
+    for it in &items {
+        before_raw.push(checked_mul(base, it.rate)?);
+        actual_raw.push(checked_mul(base, cfg.surcharge.actual_rate(it.rate))?);
+    }
+    let (before, before_total) = round_items(cfg, &before_raw)?;
+    let (amounts, total) = round_items(cfg, &actual_raw)?;
+    let mut lines = Vec::with_capacity(items.len());
+    for ((it, b), amount) in items.into_iter().zip(before).zip(amounts) {
+        lines.push(SurchargeLine {
             name: it.name.clone(),
             statutory_rate: it.rate,
             relief_rate: relief,
             rate: cfg.surcharge.actual_rate(it.rate),
             amount_before_relief: b,
-            relief_amount: b - amount,
+            relief_amount: checked_sub(b, amount)?,
             amount,
-        })
-        .collect();
-    (lines, total, before_total)
+        });
+    }
+    Ok((lines, total, before_total))
 }
 
-fn iit(cfg: &Config, income: Decimal) -> IitBreakdown {
+fn iit(cfg: &Config, income: Decimal) -> Result<IitBreakdown, CalcError> {
     let c = &cfg.iit;
     let income = income.max(Decimal::ZERO);
     let deduction = if income <= c.fixed_deduction_limit {
         c.fixed_deduction.min(income)
     } else {
-        cfg.round(income * c.percent_deduction_rate)
+        cfg.round(checked_mul(income, c.percent_deduction_rate)?)
     };
-    let taxable_income = (income - deduction).max(Decimal::ZERO);
+    let taxable_income = checked_sub(income, deduction)?.max(Decimal::ZERO);
     let bracket = c
         .brackets
         .iter()
         .find(|b| b.upper.is_none_or(|u| taxable_income <= u))
-        .expect("最后一档无上限");
+        .ok_or_else(|| {
+            CalcError::InvalidConfig("iit.brackets 不能为空，且最后一档必须没有上限".to_string())
+        })?;
     let tax = cfg
-        .round(taxable_income * bracket.rate - bracket.quick_deduction)
+        .round(checked_sub(
+            checked_mul(taxable_income, bracket.rate)?,
+            bracket.quick_deduction,
+        )?)
         .max(Decimal::ZERO);
-    IitBreakdown {
+    Ok(IitBreakdown {
         income,
         deduction,
         taxable_income,
         rate: bracket.rate,
         quick_deduction: bracket.quick_deduction,
         tax,
-    }
+    })
 }
 
-/// 由不含税收入计算全部金额（`net` 已校验）。
-pub(crate) fn eval_net(cfg: &Config, net: Decimal) -> Breakdown {
+/// 由不含税收入计算全部金额（`net` 已校验，配置已通过 [`Config::validate`]）。
+pub(crate) fn eval_net(cfg: &Config, net: Decimal) -> Result<Breakdown, CalcError> {
     let levied = cfg.levied(net);
     let vat = if levied {
-        cfg.round(net * cfg.vat.rate)
+        cfg.round(checked_mul(net, cfg.vat.rate)?)
     } else {
         Decimal::ZERO
     };
     let (lines, sur_total, sur_before) =
-        surcharges(cfg, vat, if levied { net } else { Decimal::ZERO });
-    let iit = iit(cfg, net);
+        surcharges(cfg, vat, if levied { net } else { Decimal::ZERO })?;
+    let iit = iit(cfg, net)?;
     let fix = |d: Decimal| {
         let mut x = d;
         x.rescale(cfg.rounding.scale);
         x
     };
-    Breakdown {
+    Ok(Breakdown {
         net_income: fix(net),
         vat_exempt: !levied,
         vat: fix(vat),
@@ -205,9 +245,9 @@ pub(crate) fn eval_net(cfg: &Config, net: Decimal) -> Breakdown {
             .collect(),
         surcharge_total: fix(sur_total),
         surcharge_before_relief: fix(sur_before),
-        surcharge_relief: fix(sur_before - sur_total),
-        total_cost: fix(net + vat + sur_total),
-        take_home: fix(net - iit.tax),
+        surcharge_relief: fix(checked_sub(sur_before, sur_total)?),
+        total_cost: fix(checked_add(checked_add(net, vat)?, sur_total)?),
+        take_home: fix(checked_sub(net, iit.tax)?),
         iit: IitBreakdown {
             income: fix(iit.income),
             deduction: fix(iit.deduction),
@@ -216,15 +256,16 @@ pub(crate) fn eval_net(cfg: &Config, net: Decimal) -> Breakdown {
             tax: fix(iit.tax),
             ..iit
         },
-    }
+    })
 }
 
 /// 正算：不含税收入 → 增值税、附加税、企业总成本、个税、实际到手。
 ///
 /// `net_income` 必须非负，且小数位不超过 `rounding.scale`。
 pub fn forward(cfg: &Config, net_income: Decimal) -> Result<Breakdown, CalcError> {
+    cfg.validate()?;
     let net = check_amount(cfg, net_income)?;
-    Ok(eval_net(cfg, net))
+    eval_net(cfg, net)
 }
 
 /// 辅助：按企业总成本正算，内部求出对应的不含税收入。
@@ -233,23 +274,27 @@ pub fn forward(cfg: &Config, net_income: Decimal) -> Result<Breakdown, CalcError
 /// （默认 999.99 → 1010.30），增值税、附加税逐分舍入也会留下单分空位。
 /// 输入落在空位时返回 [`CalcError::CostUnreachable`]，说明原因并给出两侧最近的可达总成本。
 pub fn from_total_cost(cfg: &Config, total_cost: Decimal) -> Result<Breakdown, CalcError> {
+    cfg.validate()?;
     let cost = check_amount(cfg, total_cost)?;
-    let cost_of = |t: i64| eval_net(cfg, from_ticks(cfg, t)).total_cost;
+    let cost_of = |t: i64| -> Result<Decimal, CalcError> {
+        Ok(eval_net(cfg, from_ticks(cfg, t))?.total_cost)
+    };
     // 二分：满足 总成本(收入) ≤ 输入 的最大不含税收入（总成本 ≥ 收入，故收入 ≤ 输入）
     let (mut lo, mut hi) = (0i64, to_ticks(cfg, cost)?);
     while lo < hi {
-        let m = lo + (hi - lo + 1) / 2;
-        if cost_of(m) <= cost {
+        let m = upper_midpoint(lo, hi);
+        if cost_of(m)? <= cost {
             lo = m;
         } else {
             hi = m - 1;
         }
     }
-    let lower = eval_net(cfg, from_ticks(cfg, lo));
+    let lower = eval_net(cfg, from_ticks(cfg, lo))?;
     if lower.total_cost == cost {
         return Ok(lower);
     }
-    let upper = eval_net(cfg, from_ticks(cfg, lo + 1));
+    let upper_ticks = lo.checked_add(1).ok_or(CalcError::Overflow)?;
+    let upper = eval_net(cfg, from_ticks(cfg, upper_ticks))?;
     let reason = if lower.vat_exempt != upper.vat_exempt {
         CostGapReason::Threshold
     } else {
@@ -273,7 +318,9 @@ pub fn from_total_cost(cfg: &Config, total_cost: Decimal) -> Result<Breakdown, C
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use rust_decimal_macros::dec;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn cfg() -> Config {
         Config::default()
@@ -642,5 +689,92 @@ mod tests {
         assert_eq!(b.surcharge_total, dec!(0.25));
         c.surcharge.relief_enabled = false;
         assert_eq!(forward(&c, dec!(1000)).unwrap().surcharge_total, dec!(0.50));
+    }
+
+    #[test]
+    fn huge_amounts_return_error_without_panic() {
+        let cfg = cfg();
+        let max = cfg.max_input_amount();
+        let over = [
+            Decimal::MAX,
+            Decimal::MIN,
+            dec!(92233720368547758.07),
+            max + dec!(0.01),
+        ];
+        for amount in over {
+            let fwd = catch_unwind(AssertUnwindSafe(|| forward(&cfg, amount)));
+            assert!(fwd.is_ok(), "forward 在 {amount} 上 panic");
+            assert!(fwd.unwrap().is_err(), "forward 应拒绝 {amount}");
+            let cost = catch_unwind(AssertUnwindSafe(|| from_total_cost(&cfg, amount)));
+            assert!(cost.is_ok(), "from_total_cost 在 {amount} 上 panic");
+            assert!(cost.unwrap().is_err(), "from_total_cost 应拒绝 {amount}");
+        }
+        assert!(matches!(
+            forward(&cfg, dec!(92233720368547758.07)),
+            Err(CalcError::AmountTooLarge { .. })
+        ));
+        assert!(matches!(
+            forward(&cfg, Decimal::MAX),
+            Err(CalcError::AmountTooLarge { .. })
+        ));
+        // 上限本数仍可计算；再多一分则拒绝。按企业总支出测算该上限时，只要求不 panic：
+        // 该金额可能恰好可达，也可能落在舍入空位上。
+        let at_max = forward(&cfg, max).unwrap();
+        assert_eq!(at_max.net_income, max);
+        let back = catch_unwind(AssertUnwindSafe(|| from_total_cost(&cfg, max)))
+            .expect("上限金额的按企业总支出测算不应 panic");
+        match back {
+            Ok(_) | Err(CalcError::CostUnreachable(_)) => {}
+            Err(e) => panic!("上限金额应算出结果或报不可达，实际 {e}"),
+        }
+    }
+
+    #[test]
+    fn invalid_config_does_not_panic() {
+        let mut empty = cfg();
+        empty.iit.brackets.clear();
+        for amount in [dec!(0), dec!(10000), dec!(10103)] {
+            assert!(matches!(
+                forward(&empty, amount),
+                Err(CalcError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                from_total_cost(&empty, amount),
+                Err(CalcError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                crate::reverse(&empty, amount),
+                Err(CalcError::InvalidConfig(_))
+            ));
+        }
+        let mut huge_cap = cfg();
+        huge_cap.reverse.max_net_income = Decimal::MAX;
+        assert!(matches!(
+            forward(&huge_cap, dec!(1)),
+            Err(CalcError::InvalidConfig(_))
+        ));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        #[test]
+        fn prop_large_amounts_do_not_panic(
+            lo in any::<u32>(),
+            mid in any::<u32>(),
+            hi in any::<u32>(),
+            scale in 0u32..28,
+            neg in any::<bool>(),
+        ) {
+            let amount = Decimal::from_parts(lo, mid, hi, neg, scale);
+            let cfg = cfg();
+            let rev = crate::Reverser::new(&cfg).unwrap();
+            let ran = catch_unwind(AssertUnwindSafe(|| {
+                let _ = forward(&cfg, amount);
+                let _ = from_total_cost(&cfg, amount);
+                let _ = rev.reverse(amount);
+            }));
+            prop_assert!(ran.is_ok(), "大额输入 {amount} 导致 panic");
+        }
     }
 }

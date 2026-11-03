@@ -187,6 +187,13 @@ pub const DEFAULT_RELIEF_RATE: Decimal = Decimal::from_parts(5, 0, 0, false, 1);
 /// 旧版配置中的合并项目名称，读入时视为教育费附加。
 pub const LEGACY_SURCHARGE_NAME: &str = "附加税";
 
+/// 单笔输入金额换算成最小货币单位后的安全上限（含本数）。
+///
+/// 这不是税务规则，而是防止 `Decimal` / `i64` 溢出的实现上限，见 `docs/ASSUMPTIONS.md`。
+/// 取值 `i64::MAX / 8`：金额本身、相邻 1 个最小单位，以及数倍于本金的税额相加仍能装进 `i64`，
+/// 按企业总支出测算的二分中点也不会溢出。默认两位小数时约为 11_529_215_046_068_469.75 元。
+pub const MAX_INPUT_TICKS: i64 = i64::MAX / 8;
+
 fn yes() -> bool {
     true
 }
@@ -494,7 +501,18 @@ impl Config {
         if self.reverse.max_net_income <= Decimal::ZERO {
             return bad("reverse.max_net_income 必须为正");
         }
+        if self.reverse.max_net_income > self.max_input_amount() {
+            return bad("reverse.max_net_income 超过单笔金额安全上限");
+        }
         Ok(())
+    }
+
+    /// 当前小数位下允许的单笔输入金额上限（含本数）。
+    ///
+    /// 不含增值税收入、税后实发金额、企业总支出都用这一上限。超过时计算入口返回
+    /// [`CalcError::AmountTooLarge`]，不发生 panic。
+    pub fn max_input_amount(&self) -> Decimal {
+        Decimal::new(MAX_INPUT_TICKS, self.rounding.scale)
     }
 
     /// 按配置舍入到最小金额单位。
