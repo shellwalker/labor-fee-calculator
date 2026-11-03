@@ -523,5 +523,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+        let b = resp.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(b.to_vec()).unwrap();
+        assert!(
+            !html.contains("innerHTML"),
+            "页面不得再用 innerHTML 拼接内容"
+        );
+        assert!(html.contains("textContent"));
     }
 }

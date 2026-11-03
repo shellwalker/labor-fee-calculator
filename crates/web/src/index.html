@@ -52,69 +52,116 @@
 
 <script>
 const fmtPct = r => (Number(r) * 100).toFixed(2).replace(/\.?0+$/, '') + '%';
-function row(k, v) { return `<tr><td>${k}</td><td class="v">${v}</td></tr>`; }
+function el(tag, className, text) {
+  const n = document.createElement(tag);
+  if (className) n.className = className;
+  if (text != null) n.textContent = String(text);
+  return n;
+}
+function show(parent, className, text) {
+  parent.replaceChildren(el('p', className, text));
+}
+function addRow(table, key, value, bold) {
+  const tr = document.createElement('tr');
+  const tdK = document.createElement('td');
+  const tdV = document.createElement('td');
+  tdV.className = 'v';
+  if (bold) {
+    tdK.appendChild(el('b', null, key));
+    tdV.appendChild(el('b', null, value));
+  } else {
+    tdK.textContent = String(key);
+    tdV.textContent = String(value);
+  }
+  tr.append(tdK, tdV);
+  table.appendChild(tr);
+}
 function render(b) {
-  let h = '<table>';
-  h += row('不含增值税收入', b.net_income + (b.vat_exempt ? '（未达到起征点，不征收增值税及附加税费）' : ''));
-  h += row('增值税税额', b.vat);
+  const table = document.createElement('table');
+  const exempt = b.vat_exempt ? '（未达到起征点，不征收增值税及附加税费）' : '';
+  addRow(table, '不含增值税收入', String(b.net_income) + exempt, false);
+  addRow(table, '增值税税额', b.vat, false);
   for (const s of b.surcharges) {
-    if (Number(s.relief_rate) === 0) h += row(`${s.name}（${fmtPct(s.statutory_rate)}）`, s.amount);
-    else h += row(`${s.name}（法定 ${fmtPct(s.statutory_rate)}，减征 ${fmtPct(s.relief_rate)}，实际 ${fmtPct(s.rate)}；减征前 ${s.amount_before_relief}）`, s.amount);
+    const key = Number(s.relief_rate) === 0
+      ? `${s.name}（${fmtPct(s.statutory_rate)}）`
+      : `${s.name}（法定 ${fmtPct(s.statutory_rate)}，减征 ${fmtPct(s.relief_rate)}，实际 ${fmtPct(s.rate)}；减征前 ${s.amount_before_relief}）`;
+    addRow(table, key, s.amount, false);
   }
   if (Number(b.surcharge_relief) !== 0) {
-    h += row('附加税费合计（减征前）', b.surcharge_before_relief);
-    h += row('附加税费减征额', b.surcharge_relief);
+    addRow(table, '附加税费合计（减征前）', b.surcharge_before_relief, false);
+    addRow(table, '附加税费减征额', b.surcharge_relief, false);
   }
-  h += row('增值税附加税费合计', b.surcharge_total);
-  h += row('<b>企业总支出</b>', `<b>${b.total_cost}</b>`);
-  h += row('每次收入', b.iit.income);
-  h += row('减除费用', b.iit.deduction);
-  h += row('预扣预缴应纳税所得额', b.iit.taxable_income);
-  h += row('预扣率', fmtPct(b.iit.rate));
-  h += row('速算扣除数', b.iit.quick_deduction);
-  h += row('应预扣预缴税额', b.iit.tax);
-  h += row('<b>税后实发金额</b>', `<b>${b.take_home}</b>`);
-  return h + '</table>';
+  addRow(table, '增值税附加税费合计', b.surcharge_total, false);
+  addRow(table, '企业总支出', b.total_cost, true);
+  addRow(table, '每次收入', b.iit.income, false);
+  addRow(table, '减除费用', b.iit.deduction, false);
+  addRow(table, '预扣预缴应纳税所得额', b.iit.taxable_income, false);
+  addRow(table, '预扣率', fmtPct(b.iit.rate), false);
+  addRow(table, '速算扣除数', b.iit.quick_deduction, false);
+  addRow(table, '应预扣预缴税额', b.iit.tax, false);
+  addRow(table, '税后实发金额', b.take_home, true);
+  return table;
+}
+function costLink(cost) {
+  const a = document.createElement('a');
+  a.href = '#';
+  a.textContent = String(cost);
+  a.addEventListener('click', ev => { ev.preventDefault(); useCost(String(cost)); });
+  return a;
 }
 async function calc(kind) {
-  const el = document.getElementById('single');
+  const box = document.getElementById('single');
   const amount = document.getElementById('amount').value.trim();
-  if (!amount) { el.innerHTML = '<p class="warn">请输入金额</p>'; return; }
+  if (!amount) { show(box, 'warn', '请输入金额'); return; }
   const param = { 'forward': 'net_income', 'reverse': 'take_home', 'from-cost': 'total_cost' }[kind];
   const resp = await fetch(`/api/${kind}?${param}=${encodeURIComponent(amount)}`);
   const data = await resp.json();
   if (!resp.ok) {
-    let h = `<p class="warn">${data.error}</p>`;
+    box.replaceChildren(el('p', 'warn', data.error == null ? '' : data.error));
     if (data.gap) {
       const g = data.gap;
-      h += '<p class="muted">原因：' + (g.reason === 'threshold' ? `增值税起征点（${g.threshold} 元）形成的不可达区间` : '增值税税额及附加税费按分舍入') + '</p>';
-      h += `<p>两侧最近的有效企业总支出：<a href="#" onclick="useCost('${g.lower.total_cost}');return false">${g.lower.total_cost}</a>（不含增值税收入 ${g.lower.net_income}）、<a href="#" onclick="useCost('${g.upper.total_cost}');return false">${g.upper.total_cost}</a>（不含增值税收入 ${g.upper.net_income}）</p>`;
+      const reason = g.reason === 'threshold'
+        ? `增值税起征点（${g.threshold} 元）形成的不可达区间`
+        : '增值税税额及附加税费按分舍入';
+      box.appendChild(el('p', 'muted', '原因：' + reason));
+      const p = document.createElement('p');
+      p.append('两侧最近的有效企业总支出：', costLink(g.lower.total_cost),
+        `（不含增值税收入 ${g.lower.net_income}）、`, costLink(g.upper.total_cost),
+        `（不含增值税收入 ${g.upper.net_income}）`);
+      box.appendChild(p);
     }
-    el.innerHTML = h; return;
+    return;
   }
-  if (kind !== 'reverse') { el.innerHTML = render(data); return; }
-  let head = data.exact
-    ? '<p class="ok">精确匹配：按测算结果计算的税后实发金额与目标一致</p>'
-    : `<p class="warn">无法精确匹配，已取最接近的不含增值税收入，差额 ${data.diff}（计算结果 − 目标）</p>`;
-  if (data.other_solutions && data.other_solutions.length)
-    head += `<p class="muted">另有不含增值税收入 ${data.other_solutions.join('、')} 亦可精确匹配（分段变化导致多解）</p>`;
-  el.innerHTML = head + render(data.breakdown);
+  if (kind !== 'reverse') { box.replaceChildren(render(data)); return; }
+  const parts = [];
+  parts.push(el('p', data.exact ? 'ok' : 'warn', data.exact
+    ? '精确匹配：按测算结果计算的税后实发金额与目标一致'
+    : `无法精确匹配，已取最接近的不含增值税收入，差额 ${data.diff}（计算结果 − 目标）`));
+  if (data.other_solutions && data.other_solutions.length) {
+    parts.push(el('p', 'muted', `另有不含增值税收入 ${data.other_solutions.join('、')} 亦可精确匹配（分段变化导致多解）`));
+  }
+  parts.push(render(data.breakdown));
+  box.replaceChildren(...parts);
 }
 function useCost(c) { document.getElementById('amount').value = c; calc('from-cost'); }
 document.getElementById('amount').addEventListener('keydown', e => { if (e.key === 'Enter') calc('reverse'); });
 document.getElementById('batchForm').addEventListener('submit', async e => {
   e.preventDefault();
-  const el = document.getElementById('batch');
-  el.innerHTML = '<p class="muted">处理中…</p>';
+  const box = document.getElementById('batch');
+  show(box, 'muted', '处理中…');
   const resp = await fetch('/api/batch', { method: 'POST', body: new FormData(e.target) });
-  if (!resp.ok) { const d = await resp.json().catch(() => ({ error: resp.statusText })); el.innerHTML = `<p class="warn">${d.error}</p>`; return; }
+  if (!resp.ok) {
+    const d = await resp.json().catch(() => ({ error: resp.statusText }));
+    show(box, 'warn', d.error == null ? '' : d.error);
+    return;
+  }
   const cd = resp.headers.get('content-disposition') || '';
   const m = cd.match(/filename\*=UTF-8''([^;]+)/);
   const name = m ? decodeURIComponent(m[1]) : 'result';
   const blob = await resp.blob();
   const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name; a.click();
   const s = Object.fromEntries((resp.headers.get('x-batch-summary') || '').split(';').filter(Boolean).map(kv => kv.split('=')));
-  el.innerHTML = `<p class="ok">已下载 ${name}：共 ${s.rows} 行，成功 ${s.exact}，无法精确匹配 ${s.inexact}，总支出不可达 ${s.unreachable_cost}，数据错误 ${s.errors}，空白 ${s.empty}</p>`;
+  show(box, 'ok', `已下载 ${name}：共 ${s.rows} 行，成功 ${s.exact}，无法精确匹配 ${s.inexact}，总支出不可达 ${s.unreachable_cost}，数据错误 ${s.errors}，空白 ${s.empty}`);
 });
 async function loadColumns() {
   const kind = document.querySelector('#batchForm select[name=input_kind]').value;
