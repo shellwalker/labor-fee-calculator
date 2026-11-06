@@ -1,6 +1,6 @@
 //! 劳务报酬计算简易 Web 服务：单笔计算/测算查询 + 批量上传下载。
 //!
-//! API（金额均为字符串，单位元，最多两位小数）：
+//! API（金额均为字符串，单位元，精度由配置决定，默认两位小数）：
 //! - `GET /api/forward?net_income=`：按不含增值税收入计算全部金额；
 //! - `GET /api/from-cost?total_cost=`：按企业总支出测算；不可达时返回 422 及原因、两侧最近的有效总支出；
 //! - `GET /api/reverse?take_home=`：按税后实发金额测算；
@@ -19,7 +19,7 @@ use axum::{
 use clap::Parser;
 use labor_fee_core::{forward, from_total_cost, CalcError, Config, Decimal, Reverser};
 use serde::Deserialize;
-use std::{net::SocketAddr, path::PathBuf, str::FromStr, sync::Arc};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::sync::Semaphore;
 
 #[derive(Parser)]
@@ -72,11 +72,7 @@ fn err(status: StatusCode, msg: impl ToString) -> Response {
 }
 
 fn parse_amount(s: &str) -> Result<Decimal, String> {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace() && *c != ',' && *c != '，')
-        .collect();
-    Decimal::from_str(&cleaned).map_err(|_| format!("无法解析金额：{s}"))
+    labor_fee_core::parse_amount(s)
 }
 
 #[derive(Deserialize)]
@@ -185,6 +181,9 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
     let mut column: Option<String> = None;
     let mut kind = labor_fee_batch::InputKind::default();
     let mut columns_spec: Option<String> = None;
+    let mut daily_threshold = false;
+    let mut person_column = String::new();
+    let mut date_column = String::new();
     loop {
         let field = match mp.next_field().await {
             Ok(Some(f)) => f,
@@ -215,6 +214,16 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
                     }
                 }
             }
+            Some("daily_threshold") => {
+                let value = field.text().await.unwrap_or_default();
+                match value.trim() {
+                    "true" | "on" | "1" => daily_threshold = true,
+                    "false" | "off" | "0" | "" => daily_threshold = false,
+                    _ => return err(StatusCode::BAD_REQUEST, "无效的人日合并开关"),
+                }
+            }
+            Some("person_column") => person_column = field.text().await.unwrap_or_default(),
+            Some("date_column") => date_column = field.text().await.unwrap_or_default(),
             Some("input_kind") => {
                 let t = field.text().await.unwrap_or_default();
                 if !t.trim().is_empty() {
@@ -264,6 +273,10 @@ async fn api_batch(State(st): State<Shared>, mut mp: Multipart) -> Response {
         kind,
         column,
         columns,
+        vat_grouping: daily_threshold.then_some(labor_fee_batch::VatGrouping {
+            person_column,
+            date_column,
+        }),
         limits,
         ..Default::default()
     };
@@ -389,6 +402,22 @@ mod tests {
     async fn body_json(resp: Response) -> serde_json::Value {
         let b = resp.into_body().collect().await.unwrap().to_bytes();
         serde_json::from_slice(&b).unwrap()
+    }
+
+    #[tokio::test]
+    async fn amount_formats_share_core_parser() {
+        for input in ["%EF%BF%A51%2C000%E5%85%83", "1%20000", "1e3"] {
+            let resp = router()
+                .oneshot(
+                    Request::get(format!("/api/forward?net_income={input}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_json(resp).await["net_income"], "1000.00");
+        }
     }
 
     #[tokio::test]
@@ -535,12 +564,78 @@ mod tests {
         let mut lines = s.lines();
         assert_eq!(
             lines.next().unwrap(),
-            "税后实发金额,不含增值税收入,姓名,税后实发金额"
+            "姓名,税后实发金额,税后实发金额,不含增值税收入"
         );
-        assert_eq!(lines.next().unwrap(), "8400.00,10000.00,张三,8400");
+        assert_eq!(lines.next().unwrap(), "张三,8400,8400.00,10000.00");
 
         let resp = batch_with_columns("不存在的列").await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn batch_grouping_form_changes_vat_only() {
+        let boundary = "GROUP";
+        let mut body = String::new();
+        for (name, value) in [
+            ("daily_threshold", "true"),
+            ("person_column", "姓名"),
+            ("date_column", "日期"),
+            ("input_kind", "net-income"),
+        ] {
+            body.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"));
+        }
+        body.push_str(&format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"input.csv\"\r\n\r\n姓名,日期,不含增值税收入\n甲,2026-01-02,600\n甲,2026/1/2,600\n\r\n--{boundary}--\r\n"));
+        let resp = router()
+            .oneshot(
+                Request::post("/api/batch")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()["x-batch-summary"],
+            "rows=2;exact=2;inexact=0;unreachable_cost=0;errors=0;empty=0"
+        );
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.contains("606.18"));
+    }
+
+    #[tokio::test]
+    async fn batch_gb18030_does_not_claim_utf8() {
+        let boundary = "GBK";
+        let (csv, _, errors) = encoding_rs::GB18030.encode("姓名,税后实发金额\n张三,8400\n");
+        assert!(!errors);
+        let mut body = format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"input.csv\"\r\n\r\n").into_bytes();
+        body.extend_from_slice(&csv);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        let resp = router()
+            .oneshot(
+                Request::post("/api/batch")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/csv");
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(&bytes).is_err());
+        let (text, _, errors) = encoding_rs::GB18030.decode(&bytes);
+        assert!(!errors);
+        assert!(text.starts_with("姓名,税后实发金额,"));
+        assert!(text.contains("张三,8400,"));
+        assert!(text.contains("10103.00"));
     }
 
     #[tokio::test]

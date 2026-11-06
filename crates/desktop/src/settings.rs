@@ -11,7 +11,7 @@
 use eframe::egui::ThemePreference;
 use labor_fee_core::{
     Bracket, Config, Decimal, Prefer, Reverser, RoundingMode, SurchargeBase, SurchargeItem,
-    SurchargeRounding, UrbanRegion, URBAN_CONSTRUCTION_TAX,
+    UrbanRegion, URBAN_CONSTRUCTION_TAX,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -290,7 +290,6 @@ pub struct SettingsDraft {
     pub brackets: Vec<BracketDraft>,
     pub scale: String,
     pub mode: RoundingMode,
-    pub surcharge_rounding: SurchargeRounding,
     pub prefer: Prefer,
     pub search_window: String,
     pub max_net_income: String,
@@ -331,7 +330,6 @@ pub mod key {
     /// 减征优惠（是否享受 + 减征比例，一行确认）。
     pub const RELIEF: &str = "surcharge.relief";
     pub const MODE: &str = "rounding.mode";
-    pub const SURCHARGE_ROUNDING: &str = "rounding.surcharge";
     pub const PREFER: &str = "reverse.prefer";
     pub const BRACKETS: &str = "iit.brackets";
     pub const SCALE: &str = "rounding.scale";
@@ -392,7 +390,6 @@ impl SettingsDraft {
                 .collect(),
             scale: cfg.rounding.scale.to_string(),
             mode: cfg.rounding.mode,
-            surcharge_rounding: cfg.rounding.surcharge,
             prefer: cfg.reverse.prefer,
             search_window: cfg.reverse.search_window.to_string(),
             max_net_income: num_text(cfg.reverse.max_net_income),
@@ -544,7 +541,6 @@ impl SettingsDraft {
             _ => err(key::SCALE, "请输入 0～6 的整数（2 表示到分）"),
         }
         cfg.rounding.mode = self.mode;
-        cfg.rounding.surcharge = self.surcharge_rounding;
         cfg.reverse.prefer = self.prefer;
         match self.search_window.trim().parse::<u32>() {
             Ok(w) if (1..=10_000).contains(&w) => cfg.reverse.search_window = w,
@@ -608,10 +604,6 @@ impl SettingsDraft {
         add(key::BRACKETS, self.brackets != d.brackets);
         add(key::SCALE, self.scale.trim() != d.scale);
         add(key::MODE, self.mode != d.mode);
-        add(
-            key::SURCHARGE_ROUNDING,
-            self.surcharge_rounding != d.surcharge_rounding,
-        );
         add(key::PREFER, self.prefer != d.prefer);
         add(
             key::SEARCH_WINDOW,
@@ -698,13 +690,6 @@ pub fn rounding_mode_text(m: RoundingMode) -> &'static str {
     }
 }
 
-pub fn surcharge_rounding_text(m: SurchargeRounding) -> &'static str {
-    match m {
-        SurchargeRounding::PerItem => "各项目分别按分舍入后相加",
-        SurchargeRounding::Total => "合计后一次舍入",
-    }
-}
-
 pub fn surcharge_base_text(b: SurchargeBase) -> &'static str {
     match b {
         SurchargeBase::Vat => "实际缴纳的增值税税额",
@@ -777,7 +762,6 @@ impl SettingsDraft {
                 key::BRACKETS,
                 key::SCALE,
                 key::MODE,
-                key::SURCHARGE_ROUNDING,
                 key::PREFER,
                 key::SEARCH_WINDOW,
                 key::MAX_NET,
@@ -815,7 +799,6 @@ impl SettingsDraft {
             key::BRACKETS => brackets_same(&self.brackets, &other.brackets),
             key::SCALE => self.scale.trim() == other.scale.trim(),
             key::MODE => self.mode == other.mode,
-            key::SURCHARGE_ROUNDING => self.surcharge_rounding == other.surcharge_rounding,
             key::PREFER => self.prefer == other.prefer,
             key::SEARCH_WINDOW => self.search_window.trim() == other.search_window.trim(),
             key::MAX_NET => same_value(&self.max_net_income, &other.max_net_income),
@@ -867,7 +850,6 @@ impl SettingsDraft {
             key::BRACKETS => self.brackets = src.brackets.clone(),
             key::SCALE => self.scale = src.scale.clone(),
             key::MODE => self.mode = src.mode,
-            key::SURCHARGE_ROUNDING => self.surcharge_rounding = src.surcharge_rounding,
             key::PREFER => self.prefer = src.prefer,
             key::SEARCH_WINDOW => self.search_window = src.search_window.clone(),
             key::MAX_NET => self.max_net_income = src.max_net_income.clone(),

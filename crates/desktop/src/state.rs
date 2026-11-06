@@ -10,7 +10,6 @@ use labor_fee_core::{
     ReverseOutcome, Reverser,
 };
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 
@@ -215,6 +214,9 @@ pub struct BatchTab {
     pub kind: InputKind,
     /// 列标题，空则用输入列类型的默认标题。
     pub column: String,
+    pub vat_grouping_enabled: bool,
+    pub person_column: String,
+    pub date_column: String,
     pub result: Option<BatchResult>,
     pub message: Option<Status>,
     /// 各测算方式的导出列设置（选择与顺序），下标见 [`kind_index`]。
@@ -231,6 +233,9 @@ pub struct BatchTab {
 struct ModeStash {
     path: String,
     column: String,
+    vat_grouping_enabled: bool,
+    person_column: String,
+    date_column: String,
     result: Option<BatchResult>,
     message: Option<Status>,
     pending: Option<BatchInput>,
@@ -344,14 +349,7 @@ pub struct AppState {
 
 /// 解析金额输入：允许空白、千分位逗号、¥、元。
 pub fn parse_amount(s: &str) -> Result<Decimal, String> {
-    let cleaned: String = s
-        .chars()
-        .filter(|c| !c.is_whitespace() && !matches!(c, ',' | '，' | '¥' | '￥' | '元'))
-        .collect();
-    if cleaned.is_empty() {
-        return Err("请输入金额".into());
-    }
-    Decimal::from_str(&cleaned).map_err(|_| format!("无法解析金额：{}", s.trim()))
+    labor_fee_core::parse_amount(s)
 }
 
 fn pct(d: Decimal) -> String {
@@ -875,6 +873,13 @@ impl AppState {
 
     // ---------------- 批量测算 ----------------
 
+    /// 分组输入改变后清除旧结果，防止导出与当前选项不一致。
+    pub fn batch_grouping_changed(&mut self) {
+        self.batch.result = None;
+        self.batch.pending = None;
+        self.persist_batch();
+    }
+
     /// 当前测算方式在当前参数下可导出的全部列（默认顺序）。
     pub fn batch_available_columns(&self) -> Vec<ExportColumn> {
         labor_fee_batch::available_columns(&self.cfg, self.batch.kind)
@@ -958,6 +963,9 @@ impl AppState {
         b.others[old] = ModeStash {
             path: b.path.clone(),
             column: std::mem::take(&mut b.column),
+            vat_grouping_enabled: b.vat_grouping_enabled,
+            person_column: std::mem::take(&mut b.person_column),
+            date_column: std::mem::take(&mut b.date_column),
             result: b.result.take(),
             message: b.message.take(),
             pending: b.pending.take(),
@@ -967,6 +975,9 @@ impl AppState {
             b.path = s.path;
         }
         b.column = s.column;
+        b.vat_grouping_enabled = s.vat_grouping_enabled;
+        b.person_column = s.person_column;
+        b.date_column = s.date_column;
         b.result = s.result;
         b.message = s.message;
         b.pending = s.pending;
@@ -992,6 +1003,13 @@ impl AppState {
         let cfg = self.cfg.clone();
         let kind = self.batch.kind;
         let column = Some(self.batch.column.trim().to_string()).filter(|c| !c.is_empty());
+        let vat_grouping = self
+            .batch
+            .vat_grouping_enabled
+            .then(|| labor_fee_batch::VatGrouping {
+                person_column: self.batch.person_column.trim().to_string(),
+                date_column: self.batch.date_column.trim().to_string(),
+            });
         Ok(move || {
             let bytes = match snapshot {
                 Some(b) => b,
@@ -1000,6 +1018,7 @@ impl AppState {
             let opts = labor_fee_batch::Options {
                 kind,
                 column,
+                vat_grouping,
                 ..Default::default()
             };
             let computed =
@@ -1100,6 +1119,23 @@ impl AppState {
             let m = bp.mode_mut(k);
             m.path = path.trim().to_string();
             m.column = column.trim().to_string();
+            let (enabled, person, date) = if k == self.batch.kind {
+                (
+                    self.batch.vat_grouping_enabled,
+                    &self.batch.person_column,
+                    &self.batch.date_column,
+                )
+            } else {
+                let stash = &self.batch.others[i];
+                (
+                    stash.vat_grouping_enabled,
+                    &stash.person_column,
+                    &stash.date_column,
+                )
+            };
+            m.vat_grouping_enabled = enabled;
+            m.person_column = person.clone();
+            m.date_column = date.clone();
             m.set_layout(&self.batch.layouts[i]);
         }
         if let Err(e) = store.save_batch(&bp) {
@@ -1132,6 +1168,9 @@ impl AppState {
             let s = ModeStash {
                 path: m.path.clone(),
                 column: m.column.clone(),
+                vat_grouping_enabled: m.vat_grouping_enabled,
+                person_column: m.person_column.clone(),
+                date_column: m.date_column.clone(),
                 result: None,
                 message,
                 pending,
@@ -1139,6 +1178,9 @@ impl AppState {
             if k == kind {
                 self.batch.path = s.path;
                 self.batch.column = s.column;
+                self.batch.vat_grouping_enabled = s.vat_grouping_enabled;
+                self.batch.person_column = s.person_column;
+                self.batch.date_column = s.date_column;
                 self.batch.message = s.message;
                 self.batch.pending = s.pending;
             } else {

@@ -147,10 +147,7 @@ pub fn surcharge_lines(cfg: &Config) -> Vec<String> {
         v.push(format!(
             "增值税附加税费 = {}（{}）",
             names.join(" + "),
-            match cfg.rounding.surcharge {
-                labor_fee_core::SurchargeRounding::PerItem => "各项分别按分舍入",
-                labor_fee_core::SurchargeRounding::Total => "合计后一次舍入",
-            }
+            "各项分别按分舍入"
         ));
         let (st, ac) = (
             cfg.surcharge.statutory_total_rate(),

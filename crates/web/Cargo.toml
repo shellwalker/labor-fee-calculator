@@ -22,5 +22,6 @@ axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
 
 [dev-dependencies]
+encoding_rs = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"

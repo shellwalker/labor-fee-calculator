@@ -99,7 +99,7 @@ impl ExportColumn {
     /// 简要说明（界面悬停提示）。
     pub fn description(&self) -> &'static str {
         match self {
-            ExportColumn::Source => "输入表格原有的全部列，按原顺序整体输出",
+            ExportColumn::Source => "原表各列固定保留在左侧，结果列在右侧追加；此标识兼容旧列设置",
             ExportColumn::NetIncome => "劳务报酬不含增值税收入",
             ExportColumn::Vat => "增值税税额（未达到起征点时为 0）",
             ExportColumn::Surcharge(_) => "该项附加税费实际金额（已考虑减征优惠）",

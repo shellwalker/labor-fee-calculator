@@ -2281,10 +2281,12 @@ dependencies = [
  "csv",
  "encoding_rs",
  "labor-fee-core",
+ "quick-xml 0.38.4",
  "rust_decimal",
  "rust_decimal_macros",
  "rust_xlsxwriter",
  "thiserror 2.0.21",
+ "zip 4.6.1",
 ]
 
 [[package]]
@@ -2339,6 +2341,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "encoding_rs",
  "http-body-util",
  "labor-fee-batch",
  "labor-fee-core",

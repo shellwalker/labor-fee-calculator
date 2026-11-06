@@ -11,7 +11,10 @@
 //! 计算全部使用十进制；仅在读取 Excel 数值单元格、写出 Excel 数值单元格这两个 I/O 边界上与 f64 互转
 //! （Excel 文件格式本身以浮点存储数值），读入时会校验小数位不超过两位。
 
-use labor_fee_core::{forward, from_total_cost, Breakdown, CalcError, Config, Decimal, Reverser};
+use labor_fee_core::{
+    forward, forward_with_vat_reference, from_total_cost, from_total_cost_with_vat_reference,
+    Breakdown, CalcError, Config, Decimal, Reverser,
+};
 use rust_decimal::prelude::ToPrimitive;
 use std::borrow::Cow;
 use std::io::Cursor;
@@ -19,6 +22,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 pub mod columns;
+mod preserve_xlsx;
 pub use columns::{available_columns, parse_columns, ColumnLayout, ExportColumn};
 
 /// 默认读取的列标题（按税后实发金额测算）。
@@ -105,6 +109,8 @@ pub enum BatchError {
     ColumnNotFound(String),
     #[error("读取文件失败：{0}")]
     Read(String),
+    #[error("增值税起征点分组失败：{0}")]
+    Grouping(String),
     #[error("未选择任何导出列")]
     NoColumns,
     #[error("写出文件失败：{0}")]
@@ -169,7 +175,7 @@ impl Format {
     /// 输出文件 MIME 类型。
     pub fn content_type(self) -> &'static str {
         match self {
-            Format::Csv => "text/csv; charset=utf-8",
+            Format::Csv => "text/csv",
             Format::Spreadsheet => {
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             }
@@ -245,6 +251,15 @@ pub struct Options {
     pub columns: Option<Vec<ExportColumn>>,
     /// 文件大小、行数、列数、单元格长度上限。
     pub limits: Limits,
+    /// 按人员与日期合并判断增值税起征点；默认关闭。
+    pub vat_grouping: Option<VatGrouping>,
+}
+
+/// 批量增值税起征点分组所使用的标题；日期归一到公历日，拒绝时间部分。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VatGrouping {
+    pub person_column: String,
+    pub date_column: String,
 }
 
 impl Options {
@@ -351,9 +366,7 @@ fn parse_amount(cell: &Cell, scale: u32) -> Result<Option<Decimal>, String> {
             if cleaned.is_empty() {
                 return Ok(None);
             }
-            let d = Decimal::from_str(&cleaned)
-                .or_else(|_| Decimal::from_scientific(&cleaned))
-                .map_err(|_| format!("无法解析金额：{s}"))?;
+            let d = labor_fee_core::parse_amount(s)?;
             (d, false)
         }
     };
@@ -421,6 +434,54 @@ fn error_values(cols: &[ExportColumn], status: &str, msg: &str) -> Vec<Out> {
         .collect()
 }
 
+fn money_format(scale: u32) -> String {
+    if scale == 0 {
+        "0".into()
+    } else {
+        format!("0.{}", "0".repeat(scale as usize))
+    }
+}
+
+fn decimal_number(value: Decimal) -> Result<f64, BatchError> {
+    value
+        .to_f64()
+        .filter(|v| v.is_finite())
+        .ok_or_else(|| BatchError::Write(format!("金额无法写入 Excel 数值：{value}")))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CsvEncoding {
+    Utf8,
+    Utf8Bom,
+    Gb18030,
+}
+impl CsvEncoding {
+    fn detect(input: &[u8], format: Format) -> Self {
+        if format != Format::Csv || input.starts_with(b"\xef\xbb\xbf") {
+            Self::Utf8Bom
+        } else if std::str::from_utf8(input).is_ok() {
+            Self::Utf8
+        } else {
+            Self::Gb18030
+        }
+    }
+    fn encode(self, bytes: Vec<u8>) -> Result<Vec<u8>, BatchError> {
+        match self {
+            Self::Utf8 => Ok(bytes),
+            Self::Utf8Bom => Ok([b"\xef\xbb\xbf".as_slice(), &bytes].concat()),
+            Self::Gb18030 => {
+                let text =
+                    std::str::from_utf8(&bytes).map_err(|e| BatchError::Write(e.to_string()))?;
+                let (encoded, _, bad) = encoding_rs::GB18030.encode(text);
+                if bad {
+                    return Err(BatchError::Write("结果包含 GB18030 无法表示的字符".into()));
+                }
+                Ok(encoded.into_owned())
+            }
+        }
+    }
+}
+
 /// 读取 CSV：自动识别 UTF-8（含 BOM）与 GBK/GB18030 编码。
 fn read_csv(input: &[u8]) -> Result<Vec<Vec<Cell>>, BatchError> {
     let text: String = match std::str::from_utf8(input) {
@@ -475,6 +536,14 @@ fn read_spreadsheet(input: &[u8]) -> Result<Vec<Vec<Cell>>, BatchError> {
                     Data::Int(i) => Cell::Number(*i as f64),
                     Data::Float(f) => Cell::Number(*f),
                     Data::String(s) => Cell::Text(s.clone()),
+                    Data::DateTime(d) if d.is_datetime() => {
+                        let (y, m, day, h, min, sec, milli) = d.to_ymd_hms_milli();
+                        Cell::Text(if (h, min, sec, milli) == (0, 0, 0, 0) {
+                            format!("{y:04}-{m:02}-{day:02}")
+                        } else {
+                            format!("{y:04}-{m:02}-{day:02}T{h:02}:{min:02}:{sec:02}.{milli:03}")
+                        })
+                    }
                     other => Cell::Text(other.to_string()),
                 })
                 .collect()
@@ -517,6 +586,9 @@ pub struct Computed {
     pub format: Format,
     pub summary: Summary,
     header: Vec<Cell>,
+    original_xlsx: Option<Vec<u8>>,
+    csv_encoding: CsvEncoding,
+    money_scale: u32,
     columns: Vec<ExportColumn>,
     rows: Vec<(Vec<Cell>, Vec<Out>)>,
 }
@@ -538,10 +610,13 @@ impl Computed {
     }
 
     fn plan(&self, columns: &[ExportColumn]) -> Vec<Slot> {
-        let mut plan = Vec::new();
+        if columns.is_empty() {
+            return Vec::new();
+        }
+        let mut plan: Vec<_> = (0..self.header.len()).map(Slot::Source).collect();
         for c in columns {
             match c {
-                ExportColumn::Source => plan.extend((0..self.header.len()).map(Slot::Source)),
+                ExportColumn::Source => {}
                 c => {
                     if let Some(i) = self.columns.iter().position(|x| x == c) {
                         plan.push(Slot::Result(i));
@@ -602,7 +677,7 @@ impl Computed {
     }
 
     fn write_csv(&self, plan: &[Slot]) -> Result<Vec<u8>, BatchError> {
-        let mut buf = "\u{feff}".as_bytes().to_vec(); // BOM，便于 Excel 直接打开
+        let mut buf = Vec::new();
         {
             let mut w = csv::WriterBuilder::new()
                 .flexible(true)
@@ -616,17 +691,20 @@ impl Computed {
             }
             w.flush().map_err(|e| BatchError::Write(e.to_string()))?;
         }
-        Ok(buf)
+        self.csv_encoding.encode(buf)
     }
 
     fn write_xlsx(&self, plan: &[Slot]) -> Result<Vec<u8>, BatchError> {
+        if let Some(original) = &self.original_xlsx {
+            return preserve_xlsx::append(self, original, plan);
+        }
         use rust_xlsxwriter::{Format as XFormat, Workbook};
         let werr = |e: rust_xlsxwriter::XlsxError| BatchError::Write(e.to_string());
         let mut wb = Workbook::new();
         let ws = wb.add_worksheet();
         ws.set_name("计算结果").map_err(werr)?;
         let bold = XFormat::new().set_bold();
-        let money = XFormat::new().set_num_format("0.00");
+        let money = XFormat::new().set_num_format(money_format(self.money_scale));
         let pct = XFormat::new().set_num_format("0%");
         for (c, s) in plan.iter().enumerate() {
             let c = c as u16;
@@ -666,11 +744,11 @@ impl Computed {
                     Slot::Result(i) => match &out[i] {
                         Out::Empty => {}
                         Out::Money(d) => {
-                            ws.write_number_with_format(r, c, d.to_f64().unwrap_or(0.0), &money)
+                            ws.write_number_with_format(r, c, decimal_number(*d)?, &money)
                                 .map_err(werr)?;
                         }
                         Out::Rate(d) => {
-                            ws.write_number_with_format(r, c, d.to_f64().unwrap_or(0.0), &pct)
+                            ws.write_number_with_format(r, c, decimal_number(*d)?, &pct)
                                 .map_err(werr)?;
                         }
                         Out::Text(t) => {
@@ -721,6 +799,162 @@ fn enforce_table_limits(table: &[Vec<Cell>], limits: &Limits) -> Result<(), Batc
     Ok(())
 }
 
+fn normalize_date(text: &str) -> Result<String, String> {
+    let error = || format!("日期 {text} 无效；请使用 YYYY-MM-DD 或 YYYY/M/D 的纯日期（不含时间）");
+    let separator = if text.contains('/') { '/' } else { '-' };
+    let parts: Vec<_> = text.split(separator).collect();
+    if parts.len() != 3
+        || parts[0].len() != 4
+        || parts[1].is_empty()
+        || parts[1].len() > 2
+        || parts[2].is_empty()
+        || parts[2].len() > 2
+        || parts.iter().any(|s| !s.bytes().all(|b| b.is_ascii_digit()))
+    {
+        return Err(error());
+    }
+    let year = parts[0].parse::<u32>().map_err(|_| error())?;
+    let month = parts[1].parse::<u32>().map_err(|_| error())?;
+    let day = parts[2].parse::<u32>().map_err(|_| error())?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if year == 0 || day == 0 || day > max {
+        return Err(error());
+    }
+    Ok(format!("{year:04}-{month:02}-{day:02}"))
+}
+
+// Grouping validates every nonempty amount before making a group-wide decision. A bad row
+// must never silently reduce the reference aggregate and exempt other rows in its group.
+fn grouping_references(
+    cfg: &Config,
+    opts: &Options,
+    header: &[Cell],
+    table: &[Vec<Cell>],
+    amount_col: usize,
+    reverser: Option<&Reverser>,
+) -> Result<Option<Vec<Option<Decimal>>>, BatchError> {
+    let Some(grouping) = &opts.vat_grouping else {
+        return Ok(None);
+    };
+    let find = |name: &str| {
+        if name.trim().is_empty() {
+            return Err(BatchError::Grouping("人员与日期列名不能为空".into()));
+        }
+        let found: Vec<_> = header
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.text().trim() == name.trim())
+            .map(|(i, _)| i)
+            .collect();
+        if found.len() != 1 {
+            return Err(BatchError::Grouping(format!(
+                "人员或日期标题必须唯一：{name}"
+            )));
+        }
+        Ok(found[0])
+    };
+    let person_col = find(&grouping.person_column)?;
+    let date_col = find(&grouping.date_column)?;
+    if person_col == date_col || person_col == amount_col || date_col == amount_col {
+        return Err(BatchError::Grouping(
+            "人员、日期与金额必须使用不同的列".into(),
+        ));
+    }
+    let fail = |row: usize, msg: String| BatchError::Grouping(format!("第 {} 行：{msg}", row + 2));
+    let mut groups: std::collections::BTreeMap<(String, String), Vec<(usize, Decimal)>> =
+        std::collections::BTreeMap::new();
+    for (i, row) in table.iter().enumerate() {
+        let amount = parse_amount(
+            row.get(amount_col).unwrap_or(&Cell::Empty),
+            cfg.rounding.scale,
+        )
+        .map_err(|e| fail(i, e))?;
+        let Some(amount) = amount else {
+            continue;
+        };
+        let person = row
+            .get(person_col)
+            .map(Cell::text)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        let raw_date = row.get(date_col).map(Cell::text).unwrap_or_default();
+        let date = normalize_date(raw_date.trim()).map_err(|e| fail(i, e))?;
+        if person.is_empty() || date.is_empty() {
+            return Err(fail(i, "非空金额行必须有人员与日期".into()));
+        }
+        let net = match opts.kind {
+            InputKind::NetIncome => forward(cfg, amount).map(|b| b.net_income),
+            InputKind::TakeHome => reverser
+                .expect("take-home reverser initialized")
+                .reverse(amount)
+                .map(|r| r.breakdown.net_income),
+            InputKind::TotalCost => forward(cfg, amount).map(|_| amount),
+        }
+        .map_err(|e| fail(i, e.to_string()))?;
+        groups.entry((person, date)).or_default().push((i, net));
+    }
+    let mut references = vec![None; table.len()];
+    let sum = |values: &[Decimal]| -> Result<Decimal, BatchError> {
+        values.iter().try_fold(Decimal::ZERO, |acc, v| {
+            acc.checked_add(*v)
+                .ok_or_else(|| BatchError::Grouping("分组金额合计溢出".into()))
+        })
+    };
+    for ((person, date), members) in groups {
+        let amounts: Vec<_> = members.iter().map(|(_, amount)| *amount).collect();
+        let aggregate = sum(&amounts)?;
+        let reference = if opts.kind != InputKind::TotalCost || !cfg.levied(aggregate) {
+            aggregate
+        } else {
+            // Try the taxable regime consistently for every entry, then check the group's
+            // recovered aggregate. A threshold gap has no self-consistent solution.
+            let taxable_reference = if cfg.vat.threshold_enabled {
+                cfg.vat
+                    .threshold
+                    .checked_add(cfg.unit())
+                    .ok_or_else(|| BatchError::Grouping("起征点超出可计算范围".into()))?
+            } else {
+                Decimal::ZERO
+            };
+            let candidates: Result<Vec<_>, _> = members
+                .iter()
+                .map(|(_, cost)| {
+                    from_total_cost_with_vat_reference(cfg, *cost, taxable_reference)
+                        .map(|b| b.net_income)
+                })
+                .collect();
+            match candidates {
+                Ok(candidates) => {
+                    let aggregate = sum(&candidates)?;
+                    if !cfg.levied(aggregate) {
+                        return Err(BatchError::Grouping(format!(
+                            "人员 {person} 日期 {date} 的企业总支出无一致的起征点解"
+                        )));
+                    }
+                    aggregate
+                }
+                Err(e) => {
+                    return Err(BatchError::Grouping(format!(
+                        "人员 {person} 日期 {date}：{e}"
+                    )))
+                }
+            }
+        };
+        for (index, _) in members {
+            references[index] = Some(reference);
+        }
+    }
+    Ok(Some(references))
+}
+
 pub fn compute(
     cfg: &Config,
     input: &[u8],
@@ -732,6 +966,9 @@ pub fn compute(
             size: input.len(),
             max: opts.limits.max_file_bytes,
         });
+    }
+    if format == Format::Spreadsheet {
+        preserve_xlsx::check_size(input, opts.limits.max_file_bytes)?;
     }
     let mut table = match format {
         Format::Csv => read_csv(input)?,
@@ -779,11 +1016,12 @@ pub fn compute(
             None
         }
     };
+    let group_references = grouping_references(cfg, opts, &header, &table, col, rev.as_ref())?;
     let columns = available_columns(cfg, opts.kind);
     let n = columns.len();
     let mut summary = Summary::default();
     let mut rows = Vec::with_capacity(table.len());
-    for mut orig in table {
+    for (row_index, mut orig) in table.into_iter().enumerate() {
         orig.resize(width, Cell::Empty);
         summary.rows += 1;
         let amount = match parse_amount(&orig[col], cfg.rounding.scale) {
@@ -799,32 +1037,47 @@ pub fn compute(
             }
             Ok(Some(a)) => a,
         };
+        let reference = group_references.as_ref().and_then(|refs| refs[row_index]);
         let res: Result<RowResult, CalcError> = match (opts.kind, &rev) {
-            (InputKind::TakeHome, Some(rev)) => rev.reverse(amount).map(|r| {
+            (InputKind::TakeHome, Some(rev)) => rev.reverse(amount).and_then(|mut r| {
+                if let Some(reference) = reference {
+                    r.breakdown =
+                        forward_with_vat_reference(cfg, r.breakdown.net_income, reference)?;
+                }
                 let mut notes = Vec::new();
                 if !r.other_solutions.is_empty() {
                     let s: Vec<String> = r.other_solutions.iter().map(|d| d.to_string()).collect();
                     notes.push(format!("另有不含增值税收入 {} 亦可精确匹配", s.join("、")));
                 }
-                RowResult {
+                Ok(RowResult {
                     status: r.status_text(),
                     diff: Some(r.diff),
                     breakdown: r.breakdown,
                     notes,
-                }
+                })
             }),
-            (InputKind::NetIncome, _) => forward(cfg, amount).map(|b| RowResult {
-                breakdown: b,
-                status: STATUS_DONE.into(),
-                diff: None,
-                notes: Vec::new(),
-            }),
-            _ => from_total_cost(cfg, amount).map(|b| RowResult {
-                breakdown: b,
-                status: STATUS_DONE.into(),
-                diff: None,
-                notes: Vec::new(),
-            }),
+            (InputKind::NetIncome, _) => reference
+                .map_or_else(
+                    || forward(cfg, amount),
+                    |reference| forward_with_vat_reference(cfg, amount, reference),
+                )
+                .map(|b| RowResult {
+                    breakdown: b,
+                    status: STATUS_DONE.into(),
+                    diff: None,
+                    notes: Vec::new(),
+                }),
+            _ => reference
+                .map_or_else(
+                    || from_total_cost(cfg, amount),
+                    |reference| from_total_cost_with_vat_reference(cfg, amount, reference),
+                )
+                .map(|b| RowResult {
+                    breakdown: b,
+                    status: STATUS_DONE.into(),
+                    diff: None,
+                    notes: Vec::new(),
+                }),
         };
         let out = match res {
             Ok(r) => {
@@ -851,6 +1104,10 @@ pub fn compute(
         format,
         summary,
         header,
+        original_xlsx: (format == Format::Spreadsheet && preserve_xlsx::is_xlsx(input))
+            .then(|| input.to_vec()),
+        csv_encoding: CsvEncoding::detect(input, format),
+        money_scale: cfg.rounding.scale,
         columns,
         rows,
     })
@@ -888,6 +1145,21 @@ mod tests {
     use calamine::{Data, Reader};
     use rust_decimal_macros::dec;
     use std::io::Cursor;
+
+    #[test]
+    fn gb18030_encoding_failure_is_explicit() {
+        // WHATWG GB18030 deliberately excludes U+E5E5; never emit a replacement entity.
+        let value = "备注\u{e5e5}".as_bytes().to_vec();
+        assert!(
+            encoding_rs::GB18030
+                .encode(std::str::from_utf8(&value).unwrap())
+                .2
+        );
+        assert!(matches!(
+            CsvEncoding::Gb18030.encode(value),
+            Err(BatchError::Write(_))
+        ));
+    }
 
     #[test]
     fn amount_parsing() {
@@ -943,6 +1215,9 @@ mod tests {
             kind: InputKind::NetIncome,
             format: Format::Csv,
             summary: Summary::default(),
+            original_xlsx: None,
+            csv_encoding: CsvEncoding::Utf8Bom,
+            money_scale: 2,
             header: vec![Cell::Text("=抬头".into()), Cell::Number(-12.5)],
             columns: vec![ExportColumn::NetIncome, ExportColumn::Notes],
             rows: vec![(

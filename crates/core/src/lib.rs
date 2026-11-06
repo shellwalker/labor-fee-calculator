@@ -15,13 +15,32 @@ mod reverse;
 
 pub use config::{
     Bracket, Config, IitConfig, Prefer, ReverseConfig, RoundingConfig, RoundingMode, SurchargeBase,
-    SurchargeConfig, SurchargeItem, SurchargeRounding, UrbanConstructionConfig, UrbanRegion,
-    VatConfig, DEFAULT_CONFIG_TOML, DEFAULT_RELIEF_RATE, DEFAULT_URBAN_REGION, EDUCATION_SURCHARGE,
+    SurchargeConfig, SurchargeItem, UrbanConstructionConfig, UrbanRegion, VatConfig,
+    DEFAULT_CONFIG_TOML, DEFAULT_RELIEF_RATE, DEFAULT_URBAN_REGION, EDUCATION_SURCHARGE,
     LEGACY_SURCHARGE_NAME, LOCAL_EDUCATION_SURCHARGE, MAX_INPUT_TICKS, URBAN_CONSTRUCTION_RATES,
     URBAN_CONSTRUCTION_TAX,
 };
 pub use error::{CalcError, CostGap, CostGapReason, ReachableCost};
-pub use forward::{forward, from_total_cost, Breakdown, IitBreakdown, SurchargeLine};
+pub use forward::{
+    forward, forward_with_vat_reference, from_total_cost, from_total_cost_with_vat_reference,
+    Breakdown, IitBreakdown, SurchargeLine,
+};
 pub use reverse::{reverse, ReverseOutcome, Reverser};
 
 pub use rust_decimal::Decimal;
+
+/// 解析各界面共用的金额文本，允许空白、千分位逗号、人民币符号、元和科学计数法。
+/// 这里只解析数值；金额范围与精度由计算入口统一校验。
+pub fn parse_amount(s: &str) -> Result<Decimal, String> {
+    let cleaned: String = s
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, ',' | '，' | '¥' | '￥' | '元'))
+        .collect();
+    if cleaned.is_empty() {
+        return Err("请输入金额".into());
+    }
+    cleaned
+        .parse::<Decimal>()
+        .or_else(|_| Decimal::from_scientific(&cleaned))
+        .map_err(|_| format!("无法解析金额：{}", s.trim()))
+}
