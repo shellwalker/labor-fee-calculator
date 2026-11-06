@@ -135,7 +135,13 @@ fn extent(sheet: &str) -> Result<(usize, usize, usize, usize), BatchError> {
             Event::Start(e) | Event::Empty(e) => {
                 let local = e.local_name();
                 if local.as_ref() == b"row" {
-                    if let Some(row) = attr(&e, b"r").and_then(|s| s.parse::<usize>().ok()) {
+                    if let Some(row) = attr(&e, b"r") {
+                        let row = row
+                            .parse::<usize>()
+                            .map_err(|_| error("无效的工作表行号"))?;
+                        if !(1..=1048576).contains(&row) {
+                            return Err(error("工作表行号超出 Excel 上限"));
+                        }
                         bottom = bottom.max(row);
                     }
                 }
@@ -146,19 +152,23 @@ fn extent(sheet: &str) -> Result<(usize, usize, usize, usize), BatchError> {
                 };
                 if let Some(value) = key.and_then(|key| attr(&e, key)) {
                     for coordinate in value.split(':') {
-                        let col = coordinate.bytes().take_while(u8::is_ascii_alphabetic).fold(
-                            0usize,
-                            |n, c| {
-                                n.saturating_mul(26)
-                                    .saturating_add((c.to_ascii_uppercase() - b'A' + 1) as usize)
-                            },
-                        );
+                        let col = coordinate
+                            .bytes()
+                            .take_while(u8::is_ascii_alphabetic)
+                            .try_fold(0usize, |n, c| {
+                                n.checked_mul(26)
+                                    .and_then(|n| {
+                                        n.checked_add((c.to_ascii_uppercase() - b'A' + 1) as usize)
+                                    })
+                                    .filter(|&n| n <= 16384)
+                                    .ok_or_else(|| error("工作表列号超出 Excel 上限"))
+                            })?;
                         let row = coordinate
                             .trim_start_matches(|c: char| c.is_ascii_alphabetic())
                             .parse::<usize>()
                             .map_err(|_| error("无效的工作表单元格坐标"))?;
-                        if col == 0 || row == 0 {
-                            return Err(error("无效的工作表单元格坐标"));
+                        if col == 0 || !(1..=1048576).contains(&row) {
+                            return Err(error("工作表单元格坐标超出 Excel 行列上限"));
                         }
                         edge = edge.max(col);
                         bottom = bottom.max(row);
@@ -340,7 +350,8 @@ pub(super) fn append(
         })
         .collect();
     let width = computed.header.len();
-    if width + results.len() > 16384 || computed.rows.len() >= 1048576 {
+    if width.checked_add(results.len()).is_none_or(|n| n > 16384) || computed.rows.len() >= 1048576
+    {
         return Err(error("结果超出 Excel 行列上限"));
     }
     // Calamine's range begins at the first used row/column. Keep the absolute origin.
@@ -354,8 +365,17 @@ pub(super) fn append(
     let (row_offset, col_offset) = range.start().unwrap_or((0, 0));
     let first_row = row_offset as usize + 1;
     let (right, bottom, left, top) = extent(&sheet)?;
-    let first_col = (col_offset as usize + width).max(right);
-    if first_col + results.len() > 16384 || first_row + computed.rows.len() > 1048576 {
+    let first_col = (col_offset as usize)
+        .checked_add(width)
+        .ok_or_else(|| error("结果超出 Excel 列上限"))?
+        .max(right);
+    if first_col
+        .checked_add(results.len())
+        .is_none_or(|n| n > 16384)
+        || first_row
+            .checked_add(computed.rows.len())
+            .is_none_or(|n| n > 1048576)
+    {
         return Err(error("结果超出 Excel 行列上限"));
     }
     let mut cells = BTreeMap::new();
@@ -482,6 +502,42 @@ pub(super) fn append(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extent_rejects_references_outside_excel_limits() {
+        for coordinate in [
+            "XFE1".to_string(),
+            "A1048577".to_string(),
+            format!("{}1", "Z".repeat(100)),
+            format!("A{}", usize::MAX),
+        ] {
+            for element in [
+                format!("<dimension ref=\"A1:{coordinate}\"/>"),
+                format!("<mergeCell ref=\"A1:{coordinate}\"/>"),
+                format!("<c r=\"{coordinate}\"/>"),
+            ] {
+                let sheet = format!("<worksheet>{element}</worksheet>");
+                let result = std::panic::catch_unwind(|| extent(&sheet));
+                assert!(matches!(result, Ok(Err(BatchError::Write(_)))), "{sheet}");
+            }
+        }
+        for row in [
+            "0".to_string(),
+            "1048577".to_string(),
+            usize::MAX.to_string(),
+            "9".repeat(100),
+        ] {
+            let sheet = format!("<worksheet><row r=\"{row}\"/></worksheet>");
+            assert!(matches!(
+                std::panic::catch_unwind(|| extent(&sheet)),
+                Ok(Err(BatchError::Write(_)))
+            ));
+        }
+        assert_eq!(
+            extent("<worksheet><dimension ref=\"A1:XFD1048576\"/></worksheet>").unwrap(),
+            (16384, 1048576, 1, 1)
+        );
+    }
 
     #[test]
     fn render_rejects_malformed_xlsx_style_id_without_panicking() {
