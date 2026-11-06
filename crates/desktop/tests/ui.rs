@@ -1689,7 +1689,7 @@ fn batch_columns_toggle_move_reset_and_export() {
         .preview(&st.batch_selected_columns());
     assert_eq!(
         pv[0],
-        ["税后实发金额", "不含增值税收入", "姓名", "到手金额"]
+        ["姓名", "到手金额", "税后实发金额", "不含增值税收入"]
     );
     // CSV 按设置导出
     let csv = dir.join("cols.csv");
@@ -1697,7 +1697,7 @@ fn batch_columns_toggle_move_reset_and_export() {
     assert!(st.batch.message.as_ref().unwrap().text.contains("（4 列）"));
     let text = std::fs::read_to_string(&csv).unwrap();
     let first = text.trim_start_matches('\u{feff}').lines().next().unwrap();
-    assert_eq!(first, "税后实发金额,不含增值税收入,姓名,到手金额");
+    assert_eq!(first, "姓名,到手金额,税后实发金额,不含增值税收入");
     // xlsx 按设置导出
     let xlsx = dir.join("cols.xlsx");
     st.save_batch(&xlsx);
@@ -1903,4 +1903,62 @@ fn ui_batch_columns_drag_reorder() {
     let t = export_titles(h.state());
     assert_eq!(t[2], "原表各列", "{t:?}");
     assert_eq!(t[0], "不含增值税收入");
+}
+
+#[test]
+fn ui_batch_vat_grouping_is_opt_in() {
+    let mut st = AppState::with_default_config();
+    st.tab = Tab::Batch;
+    let mut h = harness(st);
+    h.run();
+    let label = "按人员和日期合并判断增值税起征点";
+    h.get_by_role_and_label(Role::CheckBox, label).click();
+    h.run();
+    assert!(h.state().batch.vat_grouping_enabled);
+    h.get_by_role_and_label(Role::TextInput, "人员列标题");
+    h.get_by_role_and_label(Role::TextInput, "日期列标题");
+    h.get_by_role_and_label(Role::CheckBox, label).click();
+    h.run();
+    assert!(!h.state().batch.vat_grouping_enabled);
+}
+
+#[test]
+fn amount_parser_matches_core() {
+    for s in ["￥1,000元", "1 000", "1e3", "", "abc", "1.001"] {
+        assert_eq!(
+            labor_fee_desktop::state::parse_amount(s),
+            labor_fee_core::parse_amount(s)
+        );
+    }
+}
+
+#[test]
+fn batch_grouping_persists_per_mode_and_invalidates_old_result() {
+    let dir = tmp_dir("group-prefs");
+    let store = SettingsStore::at(dir.join("settings"));
+    let mut st = AppState::with_default_config();
+    st.store = Some(store.clone());
+    st.batch.vat_grouping_enabled = true;
+    st.batch.person_column = "收款人".into();
+    st.batch.date_column = "付款日".into();
+    st.batch_grouping_changed();
+    st.set_batch_kind(InputKind::NetIncome);
+    assert!(!st.batch.vat_grouping_enabled);
+    st.set_batch_kind(InputKind::TakeHome);
+    assert!(st.batch.vat_grouping_enabled);
+    assert_eq!(st.batch.person_column, "收款人");
+    assert_eq!(st.batch.date_column, "付款日");
+    let saved = store.load_batch();
+    assert!(saved.take_home.vat_grouping_enabled);
+    assert_eq!(saved.take_home.person_column, "收款人");
+    assert_eq!(saved.take_home.date_column, "付款日");
+    assert!(!saved.net_income.vat_grouping_enabled);
+    st.batch.vat_grouping_enabled = false;
+    st.batch.path = sample_csv(&dir).display().to_string();
+    st.run_batch_blocking();
+    assert!(st.batch.result.is_some());
+    st.batch.vat_grouping_enabled = true;
+    st.batch_grouping_changed();
+    assert!(st.batch.result.is_none());
+    assert!(!st.batch_needs_refresh());
 }

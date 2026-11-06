@@ -39,11 +39,14 @@
       <option value="total-cost">企业总支出</option>
     </select>
     列标题 <input type="text" name="column" placeholder="缺省按输入列识别" style="width:110px">
+    <br><label><input type="checkbox" name="daily_threshold">按人员和日期合并判断增值税起征点</label>
+    <label>人员列标题 <input type="text" name="person_column" placeholder="姓名"></label>
+    <label>日期列标题 <input type="text" name="date_column" placeholder="日期"></label>
     <br>导出列 <input type="text" name="columns" id="columns" placeholder="缺省导出全部列，按默认顺序" style="width:420px">
     <button type="submit">上传并测算</button>
   </form>
   <p class="muted">读取首行标题为“税后实发金额”（兼容旧列名“实发金额”“到手金额”）或所选输入列的列，在右侧追加不含增值税收入、增值税税额、附加税费、企业总支出、个人所得税、测算状态、备注等列，结果文件自动下载。企业总支出无对应收入的行，备注列写明原因和两侧最近的有效总支出。</p>
-  <p class="muted">导出列：逗号分隔的列标识或列标题，按填写顺序导出；留空导出全部列。可用的列（随输入列变化）：<span id="colList">加载中…</span></p>
+  <p class="muted">导出列：逗号分隔的列标识或列标题，原表各列固定保留，结果在右侧按填写顺序追加；留空追加全部结果列。可用的列（随输入列变化）：<span id="colList">加载中…</span></p>
   <div id="batch"></div>
 </section>
 

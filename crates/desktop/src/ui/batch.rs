@@ -169,12 +169,44 @@ pub fn page(ui: &mut Ui, st: &mut AppState) {
                     .hint_text(st.batch.kind.default_column()),
             )
             .labelled_by(l.id);
+            let mut changed = false;
+            ui.add_enabled_ui(!running, |ui| {
+                changed |= ui
+                    .checkbox(
+                        &mut st.batch.vat_grouping_enabled,
+                        "按人员和日期合并判断增值税起征点",
+                    )
+                    .changed();
+                if st.batch.vat_grouping_enabled {
+                    let l = ui.label("人员列标题");
+                    changed |= ui
+                        .add(
+                            TextEdit::singleline(&mut st.batch.person_column)
+                                .hint_text("姓名")
+                                .desired_width(ui.available_width()),
+                        )
+                        .labelled_by(l.id)
+                        .changed();
+                    let l = ui.label("日期列标题");
+                    changed |= ui
+                        .add(
+                            TextEdit::singleline(&mut st.batch.date_column)
+                                .hint_text("日期")
+                                .desired_width(ui.available_width()),
+                        )
+                        .labelled_by(l.id)
+                        .changed();
+                }
+            });
+            if changed {
+                st.batch_grouping_changed();
+            }
         }),
         2 => step_card(ui, step_h, |ui| {
             step_header(ui, 3, "执行测算", has_result, has_file && !has_result);
             small(
                 ui,
-                "按首行标题识别所选列，逐行测算；导出列及顺序见下方“导出列”。",
+                "按首行标题识别所选列，逐行测算；原表固定保留，结果在右侧追加。",
             );
             ui.add_space(theme::SP2);
             ui.horizontal(|ui| {
@@ -282,11 +314,11 @@ pub fn page(ui: &mut Ui, st: &mut AppState) {
         let mut dlg = rfd::FileDialog::new()
             .set_file_name(res.default_file_name())
             .add_filter("Excel 工作簿（xlsx）", &["xlsx"])
-            .add_filter("CSV（UTF-8，逗号分隔）", &["csv"]);
+            .add_filter("CSV（沿用输入编码）", &["csv"]);
         if res.computed.format.output_extension() == "csv" {
             dlg = rfd::FileDialog::new()
                 .set_file_name(res.default_file_name())
-                .add_filter("CSV（UTF-8，逗号分隔）", &["csv"])
+                .add_filter("CSV（沿用输入编码）", &["csv"])
                 .add_filter("Excel 工作簿（xlsx）", &["xlsx"]);
         }
         if let Some(dir) = res.input.parent() {
@@ -322,16 +354,7 @@ fn columns_card(ui: &mut Ui, st: &mut AppState, height: f32) {
                 bg,
             );
         });
-        small(
-            ui,
-            format!(
-                "{}：勾选要导出的列，拖动 {} 或点 {} {} 调整顺序；保存 xlsx / csv 均按此设置。",
-                kind_short(st.batch.kind),
-                icons::DRAG,
-                icons::UP,
-                icons::DOWN
-            ),
-        );
+        small(ui, "原表固定保留；勾选结果列，拖动或用按钮排序。");
         ui.add_space(theme::SP1);
         ui.horizontal_wrapped(|ui| {
             if ui
@@ -387,14 +410,6 @@ fn columns_card(ui: &mut Ui, st: &mut AppState, height: f32) {
         Some(ColumnAction::All(on)) => st.set_all_batch_columns(on),
         Some(ColumnAction::Reset) => st.reset_batch_columns(),
         None => {}
-    }
-}
-
-fn kind_short(k: InputKind) -> &'static str {
-    match k {
-        InputKind::TakeHome => "按税后实发金额测算",
-        InputKind::NetIncome => "按不含增值税收入计算",
-        InputKind::TotalCost => "按企业总支出测算",
     }
 }
 

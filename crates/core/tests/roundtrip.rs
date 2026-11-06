@@ -2,7 +2,7 @@
 
 use labor_fee_core::{
     forward, from_total_cost, CalcError, Config, CostGapReason, Reverser, RoundingMode,
-    SurchargeItem, SurchargeRounding,
+    SurchargeItem,
 };
 use proptest::prelude::*;
 use rust_decimal::Decimal;
@@ -19,10 +19,9 @@ fn configs() -> Vec<(&'static str, Config)> {
     not_equal.vat.levy_at_threshold = false;
     let mut no_threshold = base.clone();
     no_threshold.vat.threshold_enabled = false;
-    // 3% 征收率、三项全开（7% / 3% / 2%）、合计后舍入、不享受减征
+    // 3% 征收率、三项全开（7% / 3% / 2%）、不享受减征
     let mut itemized = base.clone();
     itemized.vat.rate = dec!(0.03);
-    itemized.rounding.surcharge = SurchargeRounding::Total;
     itemized.surcharge.items = three_items();
     itemized.surcharge.relief_enabled = false;
     let mut half_even = base.clone();
@@ -30,10 +29,9 @@ fn configs() -> Vec<(&'static str, Config)> {
     // 不享受减征（旧版默认）
     let mut no_relief = base.clone();
     no_relief.surcharge.relief_enabled = false;
-    // 3% 征收率、三项全开、减征 30%、合计后舍入
+    // 3% 征收率、三项全开、减征 30%
     let mut relief30 = base.clone();
     relief30.vat.rate = dec!(0.03);
-    relief30.rounding.surcharge = SurchargeRounding::Total;
     relief30.surcharge.items = three_items();
     relief30.surcharge.relief_rate = dec!(0.3);
     // 仅征收教育费附加（城市维护建设税、地方教育附加选“否”）
@@ -47,10 +45,10 @@ fn configs() -> Vec<(&'static str, Config)> {
         ("默认", base),
         ("门槛不含本数", not_equal),
         ("无门槛", no_threshold),
-        ("3%三项全开合计舍入", itemized),
+        ("3%三项全开逐项舍入", itemized),
         ("银行家舍入", half_even),
         ("不享受减征", no_relief),
-        ("3%三项全开减征30%合计舍入", relief30),
+        ("3%三项全开减征30%逐项舍入", relief30),
         ("仅教育费附加", edu_only),
         ("1%三项全开减半逐项舍入", three),
     ]
@@ -115,7 +113,7 @@ fn check_from_cost_sweep(cfg: &Config, upto_cents: i64) {
 
 #[test]
 fn from_total_cost_three_items_every_cent() {
-    // 7%/3%/2% 三项全开：1% 征收率逐项舍入、3% 征收率合计舍入
+    // 7%/3%/2% 三项全开：1% 征收率逐项舍入、3% 征收率逐项舍入
     for (name, cfg) in configs() {
         if name.contains("三项") || name == "不享受减征" {
             check_from_cost_sweep(&cfg, 3_000_000);
@@ -367,9 +365,8 @@ proptest! {
         relief in 0i64..=100,
         mask in 1u8..8,
         enabled: bool,
-        total in any::<bool>(),
     ) {
-        // 任意减征比例 × 征收项组合 × 舍入方式：减征前后关系、各项合计、反算可逆
+        // 任意减征比例 × 征收项组合 ：减征前后关系、各项合计、反算可逆
         let mut cfg = Config::default();
         cfg.surcharge.items = three_items();
         for (i, it) in cfg.surcharge.items.iter_mut().enumerate() {
@@ -377,9 +374,6 @@ proptest! {
         }
         cfg.surcharge.relief_enabled = enabled;
         cfg.surcharge.relief_rate = Decimal::new(relief, 2);
-        if total {
-            cfg.rounding.surcharge = SurchargeRounding::Total;
-        }
         let b = forward(&cfg, cents(n)).unwrap();
         prop_assert!(b.surcharge_total <= b.surcharge_before_relief);
         prop_assert_eq!(b.surcharge_before_relief - b.surcharge_relief, b.surcharge_total);

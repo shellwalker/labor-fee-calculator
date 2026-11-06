@@ -1,4 +1,4 @@
-use crate::config::{Config, SurchargeBase, SurchargeRounding};
+use crate::config::{Config, SurchargeBase};
 use crate::error::{CalcError, CostGap, CostGapReason, ReachableCost};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -125,28 +125,14 @@ pub(crate) fn from_ticks(cfg: &Config, t: i64) -> Decimal {
     Decimal::new(t, cfg.rounding.scale)
 }
 
-/// 按舍入时点舍入各项目金额：返回（各项金额, 合计）。
+/// 各项目分别舍入后相加。
 fn round_items(cfg: &Config, raw: &[Decimal]) -> Result<(Vec<Decimal>, Decimal), CalcError> {
-    match cfg.rounding.surcharge {
-        SurchargeRounding::PerItem => {
-            let a: Vec<Decimal> = raw.iter().map(|x| cfg.round(*x)).collect();
-            let t = checked_sum(a.iter().copied())?;
-            Ok((a, t))
-        }
-        SurchargeRounding::Total => {
-            let total = cfg.round(checked_sum(raw.iter().copied())?);
-            // 明细逐项舍入，末项倒挤，保证明细之和等于合计
-            let mut a: Vec<Decimal> = raw.iter().map(|x| cfg.round(*x)).collect();
-            if let Some(last) = a.last_mut() {
-                let others = checked_sum(raw.iter().take(raw.len() - 1).map(|x| cfg.round(*x)))?;
-                *last = checked_sub(total, others)?;
-            }
-            Ok((a, total))
-        }
-    }
+    let amounts: Vec<_> = raw.iter().map(|x| cfg.round(*x)).collect();
+    let total = checked_sum(amounts.iter().copied())?;
+    Ok((amounts, total))
 }
 
-/// 增值税附加税费：每项 = 计税依据 × 法定费率 × (1 − 减征比例)，按 `rounding.surcharge` 舍入。
+/// 增值税附加税费：每项 = 计税依据 × 法定费率 × (1 − 减征比例)，逐项舍入。
 /// 返回（明细, 实际合计, 减征前合计）。
 fn surcharges(
     cfg: &Config,
@@ -182,14 +168,26 @@ fn surcharges(
     Ok((lines, total, before_total))
 }
 
+/// 未对展示字段补齐精度的应纳税所得额，供反算划分预扣率区间。
+pub(crate) fn iit_taxable_income(cfg: &Config, income: Decimal) -> Result<Decimal, CalcError> {
+    let income = income.max(Decimal::ZERO);
+    let deduction = iit_deduction(cfg, income)?;
+    Ok(checked_sub(income, deduction)?.max(Decimal::ZERO))
+}
+
+fn iit_deduction(cfg: &Config, income: Decimal) -> Result<Decimal, CalcError> {
+    let c = &cfg.iit;
+    if income <= c.fixed_deduction_limit {
+        Ok(c.fixed_deduction.min(income))
+    } else {
+        Ok(cfg.round(checked_mul(income, c.percent_deduction_rate)?))
+    }
+}
+
 fn iit(cfg: &Config, income: Decimal) -> Result<IitBreakdown, CalcError> {
     let c = &cfg.iit;
     let income = income.max(Decimal::ZERO);
-    let deduction = if income <= c.fixed_deduction_limit {
-        c.fixed_deduction.min(income)
-    } else {
-        cfg.round(checked_mul(income, c.percent_deduction_rate)?)
-    };
+    let deduction = iit_deduction(cfg, income)?;
     let taxable_income = checked_sub(income, deduction)?.max(Decimal::ZERO);
     let bracket = c
         .brackets
@@ -216,7 +214,10 @@ fn iit(cfg: &Config, income: Decimal) -> Result<IitBreakdown, CalcError> {
 
 /// 由不含税收入计算全部金额（`net` 已校验，配置已通过 [`Config::validate`]）。
 pub(crate) fn eval_net(cfg: &Config, net: Decimal) -> Result<Breakdown, CalcError> {
-    let levied = cfg.levied(net);
+    eval_net_with_levy(cfg, net, cfg.levied(net))
+}
+
+fn eval_net_with_levy(cfg: &Config, net: Decimal, levied: bool) -> Result<Breakdown, CalcError> {
     let vat = if levied {
         cfg.round(checked_mul(net, cfg.vat.rate)?)
     } else {
@@ -268,16 +269,89 @@ pub fn forward(cfg: &Config, net_income: Decimal) -> Result<Breakdown, CalcError
     eval_net(cfg, net)
 }
 
+/// 批量按人员与日期合并判断增值税起征点；个税仍按本笔收入计算。
+/// `reference` 是该组已校验收入的合计，仅用于判断是否达到起征点。
+pub fn forward_with_vat_reference(
+    cfg: &Config,
+    net_income: Decimal,
+    reference: Decimal,
+) -> Result<Breakdown, CalcError> {
+    cfg.validate()?;
+    let net = check_amount(cfg, net_income)?;
+    if reference < Decimal::ZERO {
+        return Err(CalcError::NegativeAmount(reference));
+    }
+    eval_net_with_levy(cfg, net, cfg.levied(reference))
+}
+
+/// 二分探测只计算实际增值税、实际附加税合计和总支出，不分配明细或计算个税。
+fn eval_total_cost(cfg: &Config, net: Decimal) -> Result<Decimal, CalcError> {
+    eval_total_cost_with_levy(cfg, net, cfg.levied(net))
+}
+
+fn eval_total_cost_with_levy(
+    cfg: &Config,
+    net: Decimal,
+    levied: bool,
+) -> Result<Decimal, CalcError> {
+    if !levied {
+        return Ok(net);
+    }
+    let vat = cfg.round(checked_mul(net, cfg.vat.rate)?);
+    let base = match cfg.surcharge.base {
+        SurchargeBase::Vat => vat,
+        SurchargeBase::NetRevenue => net,
+    };
+    let surcharge = cfg
+        .surcharge
+        .enabled_items()
+        .try_fold(Decimal::ZERO, |sum, item| {
+            checked_add(
+                sum,
+                cfg.round(checked_mul(base, cfg.surcharge.actual_rate(item.rate))?),
+            )
+        })?;
+    checked_add(checked_add(net, vat)?, surcharge)
+}
+
 /// 辅助：按企业总成本正算，内部求出对应的不含税收入。
 ///
 /// 企业总成本随不含税收入严格递增，但并非每个“分”都可达：征收门槛处有一段空白区间
 /// （默认 999.99 → 1010.30），增值税、附加税逐分舍入也会留下单分空位。
 /// 输入落在空位时返回 [`CalcError::CostUnreachable`]，说明原因并给出两侧最近的可达总成本。
 pub fn from_total_cost(cfg: &Config, total_cost: Decimal) -> Result<Breakdown, CalcError> {
+    from_total_cost_impl(cfg, total_cost, None)
+}
+
+/// 按企业总支出测算，仅按组收入合计判断增值税起征点。
+pub fn from_total_cost_with_vat_reference(
+    cfg: &Config,
+    total_cost: Decimal,
+    reference: Decimal,
+) -> Result<Breakdown, CalcError> {
+    if reference < Decimal::ZERO {
+        return Err(CalcError::NegativeAmount(reference));
+    }
+    from_total_cost_impl(cfg, total_cost, Some(reference))
+}
+
+fn from_total_cost_impl(
+    cfg: &Config,
+    total_cost: Decimal,
+    reference: Option<Decimal>,
+) -> Result<Breakdown, CalcError> {
     cfg.validate()?;
     let cost = check_amount(cfg, total_cost)?;
     let cost_of = |t: i64| -> Result<Decimal, CalcError> {
-        Ok(eval_net(cfg, from_ticks(cfg, t))?.total_cost)
+        let net = from_ticks(cfg, t);
+        match reference {
+            Some(reference) => eval_total_cost_with_levy(cfg, net, cfg.levied(reference)),
+            None => eval_total_cost(cfg, net),
+        }
+    };
+    let breakdown = |ticks| {
+        let net = from_ticks(cfg, ticks);
+        eval_net_with_levy(cfg, net, cfg.levied(reference.unwrap_or(net)))
     };
     // 二分：满足 总成本(收入) ≤ 输入 的最大不含税收入（总成本 ≥ 收入，故收入 ≤ 输入）
     let (mut lo, mut hi) = (0i64, to_ticks(cfg, cost)?);
@@ -289,12 +363,12 @@ pub fn from_total_cost(cfg: &Config, total_cost: Decimal) -> Result<Breakdown, C
             hi = m - 1;
         }
     }
-    let lower = eval_net(cfg, from_ticks(cfg, lo))?;
+    let lower = breakdown(lo)?;
     if lower.total_cost == cost {
         return Ok(lower);
     }
     let upper_ticks = lo.checked_add(1).ok_or(CalcError::Overflow)?;
-    let upper = eval_net(cfg, from_ticks(cfg, upper_ticks))?;
+    let upper = breakdown(upper_ticks)?;
     let reason = if lower.vat_exempt != upper.vat_exempt {
         CostGapReason::Threshold
     } else {
@@ -328,6 +402,74 @@ mod tests {
 
     fn at(net: Decimal) -> Breakdown {
         forward(&cfg(), net).unwrap()
+    }
+
+    #[test]
+    #[ignore = "manual release performance comparison"]
+    fn benchmark_cost_probes_against_full_breakdowns() {
+        use std::{hint::black_box, time::Instant};
+        let cfg = cfg();
+        let costs: Vec<_> = (0..2000)
+            .map(|i| {
+                forward(&cfg, Decimal::new(100_000 + i * 1319, 2))
+                    .unwrap()
+                    .total_cost
+            })
+            .collect();
+        let search = |full: bool| -> Result<i64, CalcError> {
+            let mut checksum = 0;
+            for cost in &costs {
+                let (mut lo, mut hi) = (0, to_ticks(&cfg, *cost)?);
+                while lo < hi {
+                    let mid = upper_midpoint(lo, hi);
+                    let net = from_ticks(&cfg, mid);
+                    let probe = if full {
+                        eval_net(&cfg, net)?.total_cost
+                    } else {
+                        eval_total_cost(&cfg, net)?
+                    };
+                    if probe <= *cost {
+                        lo = mid;
+                    } else {
+                        hi = mid - 1;
+                    }
+                }
+                // Include the final returned breakdown in both paths.
+                checksum += black_box(eval_net(&cfg, from_ticks(&cfg, lo))?)
+                    .net_income
+                    .mantissa();
+            }
+            Ok(i64::try_from(checksum).unwrap())
+        };
+        assert_eq!(search(true).unwrap(), search(false).unwrap());
+        for full in [true, false] {
+            let start = Instant::now();
+            for _ in 0..10 {
+                black_box(search(full).unwrap());
+            }
+            eprintln!(
+                "20000 from-cost searches, full_breakdown_probes={full}: {:?}",
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_cost_matches_full_breakdown_under_custom_rules() {
+        for base in [SurchargeBase::Vat, SurchargeBase::NetRevenue] {
+            for relief in [dec!(0), dec!(0.3), dec!(0.5), dec!(1)] {
+                let mut cfg = cfg();
+                cfg.surcharge.base = base;
+                cfg.surcharge.relief_rate = relief;
+                for ticks in (0..3_000_000).step_by(7919) {
+                    let net = from_ticks(&cfg, ticks);
+                    assert_eq!(
+                        eval_total_cost(&cfg, net).unwrap(),
+                        eval_net(&cfg, net).unwrap().total_cost
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -644,17 +786,16 @@ mod tests {
     #[test]
     fn relief_invariants() {
         // 各种组合：明细之和 = 合计，减征前 − 减征额 = 实际，实际 ≤ 减征前，总支出恒等式成立
-        for (relief_on, rate, mode, urban, local) in [
-            (true, dec!(0.5), SurchargeRounding::PerItem, true, true),
-            (true, dec!(0.5), SurchargeRounding::Total, true, true),
-            (true, dec!(0.3), SurchargeRounding::PerItem, true, false),
-            (false, dec!(0.5), SurchargeRounding::Total, false, true),
-            (true, dec!(0), SurchargeRounding::PerItem, true, true),
+        for (relief_on, rate, urban, local) in [
+            (true, dec!(0.5), true, true),
+            (true, dec!(0.5), true, true),
+            (true, dec!(0.3), true, false),
+            (false, dec!(0.5), false, true),
+            (true, dec!(0), true, true),
         ] {
             let mut c = cfg();
             c.surcharge.relief_enabled = relief_on;
             c.surcharge.relief_rate = rate;
-            c.rounding.surcharge = mode;
             c.surcharge.items[0].enabled = urban;
             c.surcharge.items[2].enabled = local;
             for t in (0..3_000_000i64).step_by(7919) {
@@ -676,19 +817,28 @@ mod tests {
 
     #[test]
     fn surcharge_total_rounding_sums() {
-        let mut c = cfg();
-        c.rounding.surcharge = SurchargeRounding::Total;
-        c.surcharge.items = vec![
-            crate::SurchargeItem::new("a", dec!(0.035), true),
-            crate::SurchargeItem::new("b", dec!(0.015), true),
-        ];
-        let b = forward(&c, dec!(1000)).unwrap();
-        let s: Decimal = b.surcharges.iter().map(|l| l.amount).sum();
-        assert_eq!(s, b.surcharge_total);
-        // 10.00 × (1.75% + 0.75%) = 0.25
-        assert_eq!(b.surcharge_total, dec!(0.25));
-        c.surcharge.relief_enabled = false;
-        assert_eq!(forward(&c, dec!(1000)).unwrap().surcharge_total, dec!(0.50));
+        // Legacy total setting is accepted but no longer changes the algorithm.
+        // At VAT 10.30, per-item 0.05 + 0.15 + 0.10 = 0.30 differs from
+        // rounding the combined 10.30 * 3% = 0.309 to 0.31.
+        let legacy =
+            crate::DEFAULT_CONFIG_TOML.replace("[rounding]", "[rounding]\nsurcharge = \"total\"");
+        let cfg = Config::from_toml_str(&legacy).unwrap();
+        let b = forward(&cfg, dec!(1030)).unwrap();
+        assert_eq!(b.vat, dec!(10.30));
+        assert_eq!(
+            b.surcharges.iter().map(|s| s.amount).collect::<Vec<_>>(),
+            vec![dec!(0.05), dec!(0.15), dec!(0.10)]
+        );
+        assert_eq!(b.surcharge_total, dec!(0.30));
+        assert_eq!(
+            b.surcharges.iter().map(|s| s.amount).sum::<Decimal>(),
+            b.surcharge_total
+        );
+        assert_eq!(b.total_cost, dec!(1040.60));
+        assert_eq!(b, forward(&Config::default(), dec!(1030)).unwrap());
+        assert!(!toml::to_string(&cfg.rounding)
+            .unwrap()
+            .contains("surcharge"));
     }
 
     #[test]

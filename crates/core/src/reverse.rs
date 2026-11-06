@@ -4,8 +4,7 @@
 //! 逐步舍入到分又会造成“相邻几个分的不含税收入得到同一到手”的平台。算法：
 //! 1. 按分段键（减除费用方式 / 预扣率档次 / 是否征收增值税）把不含税收入划分为若干区间；
 //! 2. 在每个区间内对“分”做二分，定位到手首次 ≥ 目标的位置；
-//! 3. 以该位置为中心按 0.01 上下逐分扫描（窗口见 `reverse.search_window`）做正算校准，
-//!    收集所有正算到手与目标完全相等的不含税收入；
+//! 3. 再二分定位精确解平台的末端，完整保留平台边界，不依赖扫描窗口；
 //! 4. 有精确解则按 `reverse.prefer` 取最小（默认）或最大不含税收入，其它区间的精确解列入 `other_solutions`；
 //!    无精确解则取差额绝对值最小者（同差额取较小收入），标记“不可精确达到”并给出差额。
 //!
@@ -14,7 +13,9 @@
 
 use crate::config::{Config, Prefer};
 use crate::error::CalcError;
-use crate::forward::{eval_net, from_ticks, to_ticks, validate_amount, Breakdown};
+use crate::forward::{
+    eval_net, from_ticks, iit_taxable_income, to_ticks, validate_amount, Breakdown,
+};
 use rust_decimal::Decimal;
 use serde::Serialize;
 
@@ -65,10 +66,15 @@ impl Ctx<'_> {
         let b = self.eval(ticks)?;
         let iit = &self.cfg.iit;
         let pct = b.iit.income > iit.fixed_deduction_limit;
+        // Breakdown amounts are rescaled for display. A fractional configured
+        // fixed deduction may put the actual taxable amount just above a
+        // bracket boundary even when its displayed amount equals that boundary.
+        let income = self.dec(ticks);
+        let taxable = iit_taxable_income(self.cfg, income)?;
         let idx = iit
             .brackets
             .iter()
-            .position(|br| br.upper.is_none_or(|u| b.iit.taxable_income <= u))
+            .position(|br| br.upper.is_none_or(|u| taxable <= u))
             .unwrap_or(iit.brackets.len());
         Ok((pct, idx, !b.vat_exempt))
     }
@@ -80,51 +86,64 @@ struct RegionResult {
     nearest: (i64, Decimal),
 }
 
-fn search_region(
-    ctx: &Ctx,
-    lo: i64,
-    hi: i64,
-    target: Decimal,
-    window: i64,
-) -> Result<RegionResult, CalcError> {
-    // 二分：区间内到手首次 ≥ 目标的位置
-    let pos = if ctx.th(hi)? < target {
-        hi
-    } else if ctx.th(lo)? >= target {
-        lo
-    } else {
-        let (mut l, mut h) = (lo, hi); // 不变式：th(l) < target ≤ th(h)
-        while h - l > 1 {
-            let m = l + (h - l) / 2;
-            if ctx.th(m)? >= target {
-                h = m;
-            } else {
-                l = m;
-            }
-        }
-        h
-    };
-    // 按 0.01 上下逐分校准扫描
-    let a = pos.saturating_sub(window).max(lo);
-    let b = pos.saturating_add(window).min(hi);
-    let mut exact_min = None;
-    let mut exact_max = None;
-    let mut nearest: Option<(i64, Decimal)> = None;
-    for t in a..=b {
-        let d = ctx.th(t)? - target;
-        if d.is_zero() {
-            exact_min.get_or_insert(t);
-            exact_max = Some(t);
-        }
-        if nearest.is_none_or(|(_, nd)| d.abs() < nd.abs()) {
-            nearest = Some((t, d));
+// Within a region both configured rates are < 1. Raising income by one tick
+// raises rounded percentage deduction by zero or one tick, hence taxable
+// income by zero or one tick. Rounded tax also rises by at most one tick.
+// Fixed deduction has the same property. This holds for all rounding modes,
+// including half-even (the raw increments are strictly less than one tick).
+// Thus nested rounding cannot create downward microsteps inside a region.
+fn first_at_least(ctx: &Ctx, lo: i64, hi: i64, value: Decimal) -> Result<i64, CalcError> {
+    if ctx.th(lo)? >= value {
+        return Ok(lo);
+    }
+    if ctx.th(hi)? < value {
+        return Ok(hi);
+    }
+    let (mut l, mut h) = (lo, hi);
+    while l < h {
+        let m = l + (h - l) / 2;
+        if ctx.th(m)? >= value {
+            h = m;
+        } else {
+            l = m + 1;
         }
     }
-    let nearest =
-        nearest.ok_or_else(|| CalcError::InvalidConfig("反算扫描窗口为空".to_string()))?;
+    Ok(l)
+}
+
+fn search_region(ctx: &Ctx, lo: i64, hi: i64, target: Decimal) -> Result<RegionResult, CalcError> {
+    let pos = first_at_least(ctx, lo, hi, target)?;
+    let value = ctx.th(pos)?;
+    if value == target {
+        let (mut l, mut h) = (pos, hi);
+        while l < h {
+            let m = l + (h - l) / 2 + (h - l) % 2;
+            if ctx.th(m)? <= target {
+                l = m;
+            } else {
+                h = m - 1;
+            }
+        }
+        return Ok(RegionResult {
+            exact_min: Some(pos),
+            exact_max: Some(l),
+            nearest: (pos, Decimal::ZERO),
+        });
+    }
+    // If the closest value is below target its plateau can be arbitrarily
+    // long. Find its first tick too, preserving the lower-income tie rule.
+    let mut nearest = (first_at_least(ctx, lo, pos, value)?, value - target);
+    if pos > lo {
+        let below = ctx.th(pos - 1)?;
+        let tick = first_at_least(ctx, lo, pos - 1, below)?;
+        let diff = below - target;
+        if (diff.abs(), tick) < (nearest.1.abs(), nearest.0) {
+            nearest = (tick, diff);
+        }
+    }
     Ok(RegionResult {
-        exact_min,
-        exact_max,
+        exact_min: None,
+        exact_max: None,
         nearest,
     })
 }
@@ -189,7 +208,12 @@ impl Reverser {
         let target = validate_amount(cfg, take_home)?;
         let ctx = Ctx { cfg };
         let last = self.regions.last().map(|r| r.1).unwrap_or(0);
-        let max_take_home = ctx.th(last)?;
+        let max_take_home = self
+            .regions
+            .iter()
+            .try_fold(Decimal::ZERO, |maximum, &(_, hi)| {
+                Ok::<_, CalcError>(maximum.max(ctx.th(hi)?))
+            })?;
         if target > max_take_home {
             return Err(CalcError::TargetTooLarge {
                 target,
@@ -197,45 +221,43 @@ impl Reverser {
                 max_take_home,
             });
         }
-        let window = i64::from(cfg.reverse.search_window.max(1));
         let mut results = Vec::with_capacity(self.regions.len());
         for &(lo, hi) in &self.regions {
-            results.push(search_region(&ctx, lo, hi, target, window)?);
+            results.push(search_region(&ctx, lo, hi, target)?);
         }
 
-        let exact: Vec<&RegionResult> = results.iter().filter(|r| r.exact_min.is_some()).collect();
+        // Merge all adjacent exact plateaus before selecting a component.
+        // Doing this only while visiting the chosen region misses transitive
+        // adjacency when max_cost selects the final region.
+        let mut exact: Vec<(i64, i64)> = Vec::new();
+        for r in &results {
+            if let (Some(a), Some(b)) = (r.exact_min, r.exact_max) {
+                if let Some(last) = exact.last_mut() {
+                    if a - last.1 <= 1 {
+                        last.1 = b;
+                        continue;
+                    }
+                }
+                exact.push((a, b));
+            }
+        }
         if !exact.is_empty() {
-            let pick = |r: &RegionResult| match cfg.reverse.prefer {
-                Prefer::MinCost => r.exact_min.unwrap_or_default(),
-                Prefer::MaxCost => r.exact_max.unwrap_or_default(),
+            let pick = |r: &(i64, i64)| match cfg.reverse.prefer {
+                Prefer::MinCost => r.0,
+                Prefer::MaxCost => r.1,
             };
             let chosen = match cfg.reverse.prefer {
-                Prefer::MinCost => exact.iter().min_by_key(|r| pick(r)),
-                Prefer::MaxCost => exact.iter().max_by_key(|r| pick(r)),
-            }
-            .copied()
-            .expect("非空");
-            let ticks = pick(chosen);
-            // 相邻分段的精确解若连成一片视为同一解，否则列为其它解
-            let (mut rmin, mut rmax) = (
-                chosen.exact_min.unwrap_or(ticks),
-                chosen.exact_max.unwrap_or(ticks),
-            );
-            let mut others: Vec<Decimal> = Vec::new();
-            let mut sorted = exact.clone();
-            sorted.sort_by_key(|r| r.exact_min);
-            for r in sorted {
-                if std::ptr::eq(r, chosen) {
-                    continue;
-                }
-                let (a, b) = (r.exact_min.unwrap_or(0), r.exact_max.unwrap_or(0));
-                if b + 1 >= rmin && a <= rmax + 1 {
-                    rmin = rmin.min(a);
-                    rmax = rmax.max(b);
-                } else {
-                    others.push(ctx.dec(pick(r)));
-                }
-            }
+                Prefer::MinCost => 0,
+                Prefer::MaxCost => exact.len() - 1,
+            };
+            let (rmin, rmax) = exact[chosen];
+            let ticks = pick(&exact[chosen]);
+            let others = exact
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != chosen)
+                .map(|(_, r)| ctx.dec(pick(r)))
+                .collect();
             let breakdown = ctx.eval(ticks)?;
             debug_assert_eq!(breakdown.take_home, target);
             return Ok(ReverseOutcome {

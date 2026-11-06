@@ -14,8 +14,6 @@
 scale = 2
 # 舍入方式：half_up（四舍五入，远离零，MidpointAwayFromZero）| half_even（银行家舍入）| down（截断）| up（进位）
 mode = "half_up"
-# 附加税费舍入：per_item（各项目分别按分舍入后相加，默认）| total（合计后一次舍入）
-surcharge = "per_item"
 
 [vat]
 # 增值税征收率：当前按 1% 优惠征收率（小规模纳税人 3% 征收率减按 1%，
@@ -93,7 +91,7 @@ quick_deduction = "7000"
 [reverse]
 # 多个不含增值税收入均可精确得到同一税后实发金额时的取值：min_cost（取最小收入，即最小企业总支出）| max_cost
 prefer = "min_cost"
-# 二分定位后在其前后各扫描多少个最小单位（分）做校准
+# 旧配置兼容参数；反算改用分段内二分求完整平台边界，此值不影响结果
 search_window = 20
 # 测算时不含增值税收入的搜索上限
 max_net_income = "10000000000"

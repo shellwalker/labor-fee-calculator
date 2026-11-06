@@ -6,7 +6,6 @@ use labor_fee_core::{
     forward, from_total_cost, Breakdown, CalcError, Config, Decimal, ReverseOutcome, Reverser,
 };
 use std::path::PathBuf;
-use std::str::FromStr;
 
 #[derive(Parser)]
 #[command(
@@ -30,18 +29,18 @@ enum Cmd {
     /// 按不含增值税收入计算：增值税税额、附加税费、企业总支出、应预扣预缴税额、税后实发金额
     #[command(alias = "fwd")]
     Forward {
-        /// 不含增值税收入（元，最多两位小数）
+        /// 不含增值税收入（元，精度由配置决定，默认两位小数）
         net_income: String,
     },
     /// 按企业总支出测算不含增值税收入（金额不可达时报错，并给出原因和两侧最近的有效总支出）
     FromCost {
-        /// 企业总支出（元，最多两位小数）
+        /// 企业总支出（元，精度由配置决定，默认两位小数）
         total_cost: String,
     },
-    /// 按税后实发金额测算不含增值税收入及全部金额（多解时取最小不含增值税收入）
+    /// 按税后实发金额测算不含增值税收入及全部金额（多解时按配置选择，默认取最小不含增值税收入）
     #[command(alias = "rev")]
     Reverse {
-        /// 税后实发金额（元，最多两位小数）
+        /// 税后实发金额（元，精度由配置决定，默认两位小数）
         take_home: String,
     },
     /// 批量测算：读取 xlsx/xls/ods/csv 中的金额列，追加结果列并输出新文件（默认读取“税后实发金额”列）
@@ -59,6 +58,23 @@ enum Cmd {
         /// 读取的列标题（缺省按输入列含义识别：税后实发金额 / 不含增值税收入 / 企业总支出，兼容旧列名）
         #[arg(long)]
         column: Option<String>,
+        /// 仅批量：按人员和日期合并判断增值税起征点
+        #[arg(long)]
+        daily_threshold: bool,
+        /// 人员列标题（启用合并时必填）
+        #[arg(
+            long,
+            requires = "daily_threshold",
+            required_if_eq("daily_threshold", "true")
+        )]
+        person_column: Option<String>,
+        /// 日期列标题（启用合并时必填）
+        #[arg(
+            long,
+            requires = "daily_threshold",
+            required_if_eq("daily_threshold", "true")
+        )]
+        date_column: Option<String>,
         /// 导出列及顺序：逗号分隔的列标识或列标题，如 `source,net_income,iit_tax,take_home`
         /// 或 `原表各列,不含增值税收入,应预扣预缴税额`（缺省导出全部列；可用的列见 --list-columns）
         #[arg(long)]
@@ -89,8 +105,7 @@ fn parse_kind(s: &str) -> std::result::Result<labor_fee_batch::InputKind, String
 }
 
 fn parse_amount(s: &str) -> Result<Decimal> {
-    let cleaned: String = s.chars().filter(|c| *c != ',' && *c != '，').collect();
-    Decimal::from_str(cleaned.trim()).with_context(|| format!("无法解析金额：{s}"))
+    labor_fee_core::parse_amount(s).map_err(anyhow::Error::msg)
 }
 
 fn load_config(path: Option<&PathBuf>) -> Result<Config> {
@@ -237,6 +252,9 @@ fn run() -> Result<()> {
             input_kind,
             column,
             columns,
+            daily_threshold,
+            person_column,
+            date_column,
             list_columns,
             max_rows,
             max_cols,
@@ -270,7 +288,19 @@ fn run() -> Result<()> {
                 max_cell_chars,
                 max_file_bytes,
             };
-            let run = run_batch(&cfg, &input, output, input_kind, column, columns, limits)?;
+            let vat_grouping = daily_threshold.then(|| labor_fee_batch::VatGrouping {
+                person_column: person_column.unwrap_or_default(),
+                date_column: date_column.unwrap_or_default(),
+            });
+            let opts = labor_fee_batch::Options {
+                kind: input_kind,
+                column,
+                columns,
+                limits,
+                vat_grouping,
+                ..Default::default()
+            };
+            let run = run_batch_with_options(&cfg, &input, output, &opts)?;
             let out_path = run.output;
             let s = &run.summary;
             if cli.json {
@@ -326,6 +356,7 @@ fn resolve_batch_paths(
     Ok((input_format, out_path, output_format))
 }
 
+#[cfg(test)]
 fn run_batch(
     cfg: &Config,
     input: &std::path::Path,
@@ -335,17 +366,30 @@ fn run_batch(
     columns: Option<Vec<labor_fee_batch::ExportColumn>>,
     limits: labor_fee_batch::Limits,
 ) -> Result<BatchRun> {
-    let (input_format, out_path, output_format) = resolve_batch_paths(input, output, input_kind)?;
+    run_batch_with_options(
+        cfg,
+        input,
+        output,
+        &labor_fee_batch::Options {
+            kind: input_kind,
+            column,
+            columns,
+            limits,
+            ..Default::default()
+        },
+    )
+}
+
+fn run_batch_with_options(
+    cfg: &Config,
+    input: &std::path::Path,
+    output: Option<PathBuf>,
+    opts: &labor_fee_batch::Options,
+) -> Result<BatchRun> {
+    let (input_format, out_path, output_format) = resolve_batch_paths(input, output, opts.kind)?;
     let name = input.to_string_lossy();
     let bytes = std::fs::read(input).with_context(|| format!("读取文件失败：{name}"))?;
-    let opts = labor_fee_batch::Options {
-        kind: input_kind,
-        column,
-        columns,
-        limits,
-        ..Default::default()
-    };
-    let computed = labor_fee_batch::compute(cfg, &bytes, input_format, &opts)?;
+    let computed = labor_fee_batch::compute(cfg, &bytes, input_format, opts)?;
     let cols = opts
         .columns
         .clone()
@@ -451,5 +495,39 @@ mod tests {
         .is_err());
         assert!(!bad.exists(), "扩展名不支持时不应写出文件");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn shared_amount_formats_and_grouping_flags() {
+        for input in ["￥1,000元", "1 000", "1e3", "", "abc"] {
+            assert_eq!(
+                parse_amount(input).ok(),
+                labor_fee_core::parse_amount(input).ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["labor-fee", "batch", "in.csv", "--daily-threshold"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["labor-fee", "batch", "in.csv", "--person-column", "姓名"])
+                .is_err()
+        );
+        let args = Cli::try_parse_from([
+            "labor-fee",
+            "batch",
+            "in.csv",
+            "--daily-threshold",
+            "--person-column",
+            "姓名",
+            "--date-column",
+            "日期",
+        ])
+        .unwrap();
+        assert!(matches!(
+            args.cmd,
+            Cmd::Batch {
+                daily_threshold: true,
+                ..
+            }
+        ));
     }
 }

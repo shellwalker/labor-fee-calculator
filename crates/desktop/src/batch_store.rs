@@ -48,6 +48,9 @@ pub struct ModePrefs {
     pub path: String,
     /// 读取的列标题（空为默认）。
     pub column: String,
+    pub vat_grouping_enabled: bool,
+    pub person_column: String,
+    pub date_column: String,
     /// 导出列顺序（列标识）；空为默认顺序。
     pub order: Vec<String>,
     /// 不导出的列（列标识）。

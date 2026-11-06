@@ -5,9 +5,8 @@
 use super::widgets::{badge, danger_button, primary_button, secondary_button, small};
 use crate::icons;
 use crate::settings::{
-    key, prefer_text, rounding_mode_text, surcharge_base_text, surcharge_rounding_text,
-    BracketDraft, Dialog, Errors, Group, ItemDraft, Section, SettingsDraft, SettingsWindow,
-    ThemeChoice,
+    key, prefer_text, rounding_mode_text, surcharge_base_text, BracketDraft, Dialog, Errors, Group,
+    ItemDraft, Section, SettingsDraft, SettingsWindow, ThemeChoice,
 };
 use crate::state::AppState;
 use crate::theme::{self, palette};
@@ -15,7 +14,7 @@ use eframe::egui::{
     self, Align, Color32, ComboBox, CornerRadius, Frame, Id, Key, Layout, Margin, Modal, Modifiers,
     Response, RichText, ScrollArea, Stroke, TextEdit, Ui, Vec2,
 };
-use labor_fee_core::{Prefer, RoundingMode, SurchargeBase, SurchargeRounding};
+use labor_fee_core::{Prefer, RoundingMode, SurchargeBase};
 
 /// “未生效”标签（描边样式，与实心的状态标签区分）。
 fn unapplied_badge(ui: &mut Ui) {
@@ -1470,25 +1469,6 @@ fn rounding_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
             )
         },
     );
-    row(
-        ui,
-        f,
-        key::SURCHARGE_ROUNDING,
-        "附加税费舍入方式",
-        "征收多个项目时适用；默认各项目分别按分舍入",
-        surcharge_rounding_text(def.surcharge_rounding),
-        |ui, l| {
-            combo(
-                ui,
-                "surcharge_rounding",
-                l,
-                CTRL_W,
-                &mut d.surcharge_rounding,
-                &[SurchargeRounding::PerItem, SurchargeRounding::Total],
-                surcharge_rounding_text,
-            )
-        },
-    );
 }
 
 fn solving_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
@@ -1526,7 +1506,7 @@ fn solving_section(ui: &mut Ui, d: &mut SettingsDraft, f: &mut Form) {
         f,
         key::SEARCH_WINDOW,
         "逐分校准窗口",
-        "二分定位后向前、向后逐分校准的范围",
+        "旧配置兼容参数，完整平台边界不受此值限制",
         &format!("{} 分", def.search_window),
         |ui, l| text_field(ui, l, &mut d.search_window, "分", bg, true),
     );

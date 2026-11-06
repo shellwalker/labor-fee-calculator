@@ -30,22 +30,30 @@ impl RoundingMode {
     }
 }
 
-/// 增值税附加税费的舍入时点。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SurchargeRounding {
-    /// 每个税目分别舍入后相加。
-    PerItem,
-    /// 各税目先不舍入，合计后一次舍入（明细按比例展示，可能与合计差 1 分）。
-    Total,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "RoundingConfigInput")]
 pub struct RoundingConfig {
     pub scale: u32,
     pub mode: RoundingMode,
-    pub surcharge: SurchargeRounding,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoundingConfigInput {
+    scale: u32,
+    mode: RoundingMode,
+    // Read and discard the removed setting from existing configuration files.
+    #[serde(default, rename = "surcharge")]
+    _legacy_surcharge: Option<serde::de::IgnoredAny>,
+}
+
+impl From<RoundingConfigInput> for RoundingConfig {
+    fn from(input: RoundingConfigInput) -> Self {
+        Self {
+            scale: input.scale,
+            mode: input.mode,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -451,9 +459,13 @@ impl Config {
         if self.vat.threshold < Decimal::ZERO {
             return bad("vat.threshold 不能为负");
         }
+        let mut names = std::collections::HashSet::new();
         for it in &self.surcharge.items {
             if it.rate < Decimal::ZERO || it.rate >= one {
                 return bad("surcharge.items.rate 必须在 [0, 1) 内");
+            }
+            if !names.insert(it.name.trim()) {
+                return bad("surcharge.items.name 不能重复（忽略首尾空白）");
             }
             if it.name.trim().is_empty() {
                 return bad("surcharge.items.name 不能为空");
